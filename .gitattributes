@@ -1,0 +1,5 @@
+# 强制所有文本文件以 LF 行尾检出/提交。
+# 原因：仓库曾以 CRLF 提交，而 squid 启动脚本 / docker-compose 对 CRLF 敏感
+# （CRLF 的 .env 会让变量误带 \r、shell 脚本 shebang/参数异常），导致 proxy-forwarder 无限重启。
+# 见 squid/entrypoint.sh 与 docker-compose.yml 的修复说明。
+* text=auto eol=lf

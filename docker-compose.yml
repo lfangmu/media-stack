@@ -14,7 +14,9 @@ services:
       - ./.env:/opt/media/.env:ro
       - ./squid/squid.conf.template:/etc/squid/squid.conf.template:ro
       - ./squid/entrypoint.sh:/opt/media/entrypoint.sh:ro
-    command: ["sh", "/opt/media/entrypoint.sh"]
+    # 必须用 entrypoint 覆盖 ubuntu/squid 镜像自带的 ENTRYPOINT，
+    # 否则镜像的 entrypoint.sh 会把我们的脚本当成 squid 参数，导致 squid 后台化后父进程退出 0、无限重启。
+    entrypoint: ["sh", "/opt/media/entrypoint.sh"]
     restart: unless-stopped
 
   # ---- 统一控制台（影视下载台）----
