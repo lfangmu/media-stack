@@ -30,4 +30,8 @@ sed "s|__CACHE_PEER_LINES__|$PEER|" /etc/squid/squid.conf.template > /etc/squid/
 squid -z -N 2>/dev/null || true
 
 squid -k parse
+# 清掉残留 pid 文件：容器被 docker daemon 重启（restart 策略）后，旧层里的
+# /run/squid.pid（写着 PID 1）会残留，squid 误判"已在运行"而 FATAL 退出进入重启循环。
+# 启动时先删，使 entrypoint 对容器重启幂等。
+rm -f /run/squid.pid /var/run/squid.pid 2>/dev/null || true
 exec squid -NYC
