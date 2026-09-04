@@ -38,6 +38,16 @@ docker compose up -d
 > 留空 = 仅内网（不出外网，但内网/本地索引器仍可用）。
 > 大多数代理客户端（Clash / v2ray / SS）都提供 HTTP 端口，直接用那个即可。若你只有 SOCKS5，在客户端里额外开一个 HTTP 端口即可。
 
+## 发现墙（搜索 / 筛选 / 一键下载）
+
+「发现」标签页可按 **类型 / 类型 / 国家 / 年代 / 最低评分 / 最长时长** 筛选影片，或直接搜片名，再把选中的片子一键加入 Radarr（电影）或 Sonarr（剧集）。
+
+使用前先在「出网配置 → 媒体库设置」填好：
+- **TMDB API Key**（https://www.themoviedb.org/settings/api 免费申请）—— 发现墙的筛选、海报、简介都来自 TMDB。
+- **Radarr / Sonarr 地址与 API Key**（在各自 WebUI 的 Settings → General 获取）—— 用于一键添加下载。
+
+这些均可留空：不填 TMDB 发现墙不可用，但出网配置与下载栈照常工作。
+
 ## 工作原理（一句话）
 
 所有服务的出网都指向 `proxy-forwarder`(squid)；squid 再把流量转发到你填的代理。
