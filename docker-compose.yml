@@ -1,0 +1,99 @@
+# 影视下载台 · media 栈
+# 用法： cp .env.example .env  &&  docker compose up -d
+# 起来后打开 http://<本机IP>:8787 ，在页面填入你的境外 HTTP 代理即可出外网。
+# 不填 = 仅内网。
+
+services:
+  # ---- 出网出口（HTTP 代理转发器）----
+  proxy-forwarder:
+    image: ubuntu/squid:latest
+    container_name: proxy-forwarder
+    ports:
+      - "3128:3128"
+    volumes:
+      - ./.env:/opt/media/.env:ro
+      - ./squid/squid.conf.template:/etc/squid/squid.conf.template:ro
+      - ./squid/entrypoint.sh:/opt/media/entrypoint.sh:ro
+    command: ["sh", "/opt/media/entrypoint.sh"]
+    restart: unless-stopped
+
+  # ---- 统一控制台（影视下载台）----
+  autopilot:
+    build: ./autopilot
+    container_name: autopilot
+    ports:
+      - "${AUTOPILOT_PORT:-8787}:8787"
+    environment:
+      - AUTOPILOT_PORT=8787
+      - AUTOPILOT_TOKEN=${AUTOPILOT_TOKEN:-}
+      - EGRESS_PROXY=http://proxy-forwarder:3128
+      - MEDIA_ENV=/app/.env
+      - QBITTORRENT_URL=http://media-qbittorrent:8085
+      - QBITTORRENT_USER=${QBITTORRENT_USER:-admin}
+      - QBITTORRENT_PASS=${QBITTORRENT_PASS:-adminadmin}
+    volumes:
+      - ./.env:/app/.env
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - /usr/bin/docker:/usr/bin/docker:ro
+    restart: unless-stopped
+
+  # ---- 索引器 / 媒体管理 ----
+  flaresolverr:
+    image: flaresolverr/flaresolverr:latest
+    container_name: media-flaresolverr
+    environment:
+      - HTTP_PROXY=http://proxy-forwarder:3128
+      - HTTPS_PROXY=http://proxy-forwarder:3128
+    ports:
+      - "8191:8191"
+    restart: unless-stopped
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: media-prowlarr
+    environment:
+      - HTTP_PROXY=http://proxy-forwarder:3128
+      - HTTPS_PROXY=http://proxy-forwarder:3128
+    ports:
+      - "9696:9696"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: media-radarr
+    environment:
+      - HTTP_PROXY=http://proxy-forwarder:3128
+      - HTTPS_PROXY=http://proxy-forwarder:3128
+    ports:
+      - "7878:7878"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: media-sonarr
+    environment:
+      - HTTP_PROXY=http://proxy-forwarder:3128
+      - HTTPS_PROXY=http://proxy-forwarder:3128
+    ports:
+      - "8989:8989"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: media-qbittorrent
+    environment:
+      - WEBUI_PORT=8085
+    ports:
+      - "8085:8085"
+      - "6881:6881"
+      - "6881:6881/udp"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
