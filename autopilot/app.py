@@ -83,7 +83,12 @@ def req(url, params=None, headers=None, method="GET", data=None, timeout=15):
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
     r = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
-    return urllib.request.urlopen(r, timeout=timeout, proxies={"http": EGRESS, "https": EGRESS})
+    # 注意：urllib.request.urlopen 不接受 proxies= 参数（那是 urllib2 旧式写法），
+    # 必须用 ProxyHandler + build_opener 指定出口，否则任何请求都会 TypeError。
+    if EGRESS:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": EGRESS, "https": EGRESS}))
+        return opener.open(r, timeout=timeout)
+    return urllib.request.urlopen(r, timeout=timeout)
 
 
 def tmdb_get(path, params):
@@ -97,6 +102,12 @@ def tmdb_get(path, params):
         with req(TMDB_BASE + path, params) as r:
             return json.loads(r.read().decode("utf-8")), None
     except Exception as e:
+        msg = str(e)
+        # 网络层失败（无外网 / 代理不可用）=> 友好提示，而非原始异常；
+        # 这样「没境外网络」只表现为「无数据 + 一行提示」，配好出口刷新即可。
+        if any(k in msg for k in ("urlopen error", "Connection", "timed out",
+                                  "Name or service", "Network is unreachable", "getaddrinfo", "<urlopen error")):
+            return None, "外网未连通：请在「出网配置」填写境外 HTTP 代理后刷新本页"
         return None, f"TMDB 请求失败：{e}"
 
 
@@ -457,7 +468,7 @@ async function test(){const r=await api('/api/egress/test');document.getElementB
 async function qb(){const r=await api('/api/qb/proxy');document.getElementById('msg').innerHTML=r.ok?'<span class="ok">'+r.msg+'</span>':'<span class="bad">'+(r.msg||'失败')+'</span>';}
 async function loadLib(){const r=await api('/api/library');document.getElementById('radarr_url').placeholder=r.RADARR_URL?'Radarr 已配置':'Radarr 地址 http://media-radarr:7878';document.getElementById('radarr_key').placeholder=r.RADARR_API_KEY?'Radarr 已配置':'Radarr API Key';document.getElementById('sonarr_url').placeholder=r.SONARR_URL?'Sonarr 已配置':'Sonarr 地址 http://media-sonarr:8989';document.getElementById('sonarr_key').placeholder=r.SONARR_API_KEY?'Sonarr 已配置':'Sonarr API Key';document.getElementById('tmdb_key').placeholder=r.TMDB_API_KEY?'TMDB 已配置':'TMDB API Key';}
 async function saveLib(){const d={};['radarr_url','radarr_key','sonarr_url','sonarr_key','tmdb_key'].forEach(id=>{const v=document.getElementById(id).value.trim();if(v)d[id.toUpperCase()]=v;});const r=await api('/api/library',d);document.getElementById('msg2').innerHTML=r.ok?'<span class="ok">已保存</span>':'<span class="bad">失败</span>';['radarr_url','radarr_key','sonarr_url','sonarr_key','tmdb_key'].forEach(id=>document.getElementById(id).value='');loadLib();}
-function card(it){const img=it.poster?('/img?p='+encodeURIComponent(it.poster)):'';const addt=it.type==='movie'?'添加到电影库':'添加到剧集库';return '<div class="movie"><img src="'+img+'" loading="lazy"><div class="m"><div class="t">'+it.title+'</div><div class="m2">'+(it.year||'')+' · ★'+(it.rating||'-')+'</div><div class="m2" style="white-space:normal">'+((it.overview||'').slice(0,80))+'…</div><button onclick="add(\''+it.type+'\','+it.tmdbId+',this)">'+addt+'</button></div></div>';}
+function card(it){const img=it.poster?('/img?p='+encodeURIComponent(it.poster)):'';const addt=it.type==='movie'?'添加到电影库':'添加到剧集库';return '<div class="movie"><img src="'+img+'" loading="lazy" onerror="this.style.visibility=\'hidden\'"><div class="m"><div class="t">'+it.title+'</div><div class="m2">'+(it.year||'')+' · ★'+(it.rating||'-')+'</div><div class="m2" style="white-space:normal">'+((it.overview||'').slice(0,80))+'…</div><button onclick="add(\''+it.type+'\','+it.tmdbId+',this)">'+addt+'</button></div></div>';}
 function render(items){document.getElementById('results').innerHTML=items.map(card).join('')||'<div class="status">无结果</div>';}
 async function discover(){const q={type:f_type.value,genre:f_genre.value,country:f_country.value,decade:f_decade.value,minRating:f_rating.value,maxRuntime:f_runtime.value};const r=await api('/api/discover?'+new URLSearchParams(q).toString());if(r.error)return document.getElementById('msg3').innerHTML='<span class="bad">'+r.error+'</span>';render(r.items||[]);}
 async function search(){const q=document.getElementById('f_q').value.trim();if(!q)return;const r=await api('/api/search?q='+encodeURIComponent(q));if(r.error)return document.getElementById('msg3').innerHTML='<span class="bad">'+r.error+'</span>';render(r.items||[]);}

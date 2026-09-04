@@ -47,6 +47,11 @@ services:
     environment:
       - HTTP_PROXY=http://proxy-forwarder:3128
       - HTTPS_PROXY=http://proxy-forwarder:3128
+      # 本地回环不能走代理：flaresolverr 自检会访问 localhost 会话端口，
+      # 若经 squid（此时可能无上游）= ERR_READ_ERROR → 启动失败 → 崩溃循环。
+      # 无外网时让它稳定 running（外网本就无从可达），配好出口后自然可用。
+      - NO_PROXY=localhost,127.0.0.1
+      - no_proxy=localhost,127.0.0.1
     ports:
       - "8191:8191"
     restart: unless-stopped
