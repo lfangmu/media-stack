@@ -1672,7 +1672,8 @@ def net_test():
 
 
 def config_get():
-    return {"ok": True, "values": {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY}}
+    return {"ok": True, "values": {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
+                                    "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL}}
 
 
 def config_save(body_str):
@@ -1680,29 +1681,45 @@ def config_save(body_str):
         data = json.loads(body_str or "{}")
     except Exception:
         return 400, {"ok": False, "error": "请求体解析失败"}
-    proxy = (data.get("proxy_url") or "").strip()
-    tmdb_key = (data.get("tmdb_key") or "").strip()
+    global PROXY_URL, TMDB_PROXY, TMDB_KEY, TOKEN, WEBHOOK_URL
     updates = {}
-    if proxy:
-        updates["EGRESS_PROXY"] = proxy
-        updates["PROXY_URL"] = proxy
-        updates["TMDB_PROXY"] = proxy
-        parsed = _parse_proxy_url(proxy)
-        if parsed:
-            updates["UPSTREAM_PROXY_HOST"] = parsed["host"]
-            updates["UPSTREAM_PROXY_PORT"] = str(parsed["port"])
-            updates["UPSTREAM_PROXY_AUTH"] = parsed["auth"]
-    else:
-        # 清空代理：显式把代理相关键写成空，使「无代理 = 直连出网」可持久化，
-        # 不再让 compose 写死的 squid 默认值或 .env 里的旧值在重启后回潮。
-        updates["EGRESS_PROXY"] = ""
-        updates["PROXY_URL"] = ""
-        updates["TMDB_PROXY"] = ""
-        updates["UPSTREAM_PROXY_HOST"] = ""
-        updates["UPSTREAM_PROXY_PORT"] = ""
-        updates["UPSTREAM_PROXY_AUTH"] = ""
-    if tmdb_key:
-        updates["TMDB_API_KEY"] = tmdb_key
+    proxy_changed = False
+    # 仅当字段出现在请求体时才处理，避免「部分保存」误清其它设置。
+    if "proxy_url" in data:
+        proxy = (data.get("proxy_url") or "").strip()
+        if proxy:
+            updates["EGRESS_PROXY"] = proxy
+            updates["PROXY_URL"] = proxy
+            updates["TMDB_PROXY"] = proxy
+            parsed = _parse_proxy_url(proxy)
+            if parsed:
+                updates["UPSTREAM_PROXY_HOST"] = parsed["host"]
+                updates["UPSTREAM_PROXY_PORT"] = str(parsed["port"])
+                updates["UPSTREAM_PROXY_AUTH"] = parsed["auth"]
+        else:
+            # 清空代理：显式把代理相关键写成空，使「无代理 = 直连出网」可持久化，
+            # 不再让 compose 写死的 squid 默认值或 .env 里的旧值在重启后回潮。
+            updates["EGRESS_PROXY"] = ""
+            updates["PROXY_URL"] = ""
+            updates["TMDB_PROXY"] = ""
+            updates["UPSTREAM_PROXY_HOST"] = ""
+            updates["UPSTREAM_PROXY_PORT"] = ""
+            updates["UPSTREAM_PROXY_AUTH"] = ""
+        proxy_changed = True
+    if "tmdb_key" in data:
+        tmdb_key = (data.get("tmdb_key") or "").strip()
+        if tmdb_key:
+            updates["TMDB_API_KEY"] = tmdb_key
+    if "auth_token" in data:
+        # 访问令牌：留空=关闭鉴权；填写=开启。写入 AUTOPILOT_TOKEN 并即时更新运行态全局 TOKEN。
+        updates["AUTOPILOT_TOKEN"] = (data.get("auth_token") or "").strip()
+    if "webhook_url" in data:
+        # 抓取完成通知：留空=关闭；填写=开启。写入 AUTOPILOT_WEBHOOK_URL 并即时更新运行态。
+        updates["AUTOPILOT_WEBHOOK_URL"] = (data.get("webhook_url") or "").strip()
+    if not updates:
+        return 200, {"ok": True, "wrote": False,
+                     "values": {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
+                                "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL}}
     wrote = _write_env_file(MEDIA_ENV, updates)
     # squid 与 autopilot 共享宿主 .env：MEDIA_ENV 多半就是它；否则额外写候选路径
     for cand in _SQUID_ENV_CANDIDATES:
@@ -1710,15 +1727,21 @@ def config_save(body_str):
             _write_env_file(cand, {k: v for k, v in updates.items()
                                    if k.startswith("UPSTREAM_PROXY_")})
             break
-    global PROXY_URL, TMDB_PROXY, TMDB_KEY
-    PROXY_URL = proxy
-    TMDB_PROXY = proxy
-    if tmdb_key:
-        TMDB_KEY = tmdb_key
+    if "proxy_url" in data:
+        PROXY_URL = (data.get("proxy_url") or "").strip()
+        TMDB_PROXY = PROXY_URL
+    if "tmdb_key" in data and (data.get("tmdb_key") or "").strip():
+        TMDB_KEY = (data.get("tmdb_key") or "").strip()
+    if "auth_token" in data:
+        TOKEN = (data.get("auth_token") or "").strip()
+    if "webhook_url" in data:
+        WEBHOOK_URL = (data.get("webhook_url") or "").strip()
     # 代理状态变化（设置或清空）都重启 squid，使 never_direct/always_direct 与 .env 一致
-    _restart_container("proxy-forwarder")
+    if proxy_changed:
+        _restart_container("proxy-forwarder")
     return 200, {"ok": True, "wrote": wrote,
-                 "values": {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY}}
+                 "values": {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
+                            "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL}}
 
 
 # 系统状态缓存：探测一次约 10~30s（两次 pageSize=1000 大列表 + 三次外部探测），
@@ -2244,6 +2267,17 @@ PAGE = """<!doctype html>
       <input id="ap_PROXY_URL" style="width:100%;margin-top:4px;padding:8px" placeholder="http://user:pass@host:port（留空=仅内网）"></label>
     <label class="cfg-row" style="display:block;margin:8px 0"><span>TMDB API Key</span>
       <input id="ap_TMDB_KEY" type="password" style="width:100%;margin-top:4px;padding:8px" placeholder="在 themoviedb.org 申请的 v3 API Key"></label>
+    <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
+      <div class="muted" style="margin-bottom:8px">访问鉴权与抓取完成通知</div>
+      <label class="cfg-row" style="display:block;margin:8px 0"><span>访问令牌 AUTOPILOT_TOKEN</span>
+        <input id="ap_AUTH_TOKEN" type="password" style="width:100%;margin-top:4px;padding:8px" placeholder="留空=关闭鉴权（任何能访问 8787 的人均可操作）；填写后访问需在网址追加 ?token=此值"></label>
+      <label class="cfg-row" style="display:block;margin:8px 0"><span>抓取完成通知 Webhook URL</span>
+        <input id="ap_WEBHOOK_URL" style="width:100%;margin-top:4px;padding:8px" placeholder="https://你的接收端（飞书/企业微信/Discord 机器人等）；留空=关闭通知"></label>
+      <div class="row" style="margin-top:8px">
+        <button class="btn ghost" onclick="apTestWebhook()">发送测试通知</button>
+        <span class="muted" id="apWhStatus"></span>
+      </div>
+    </div>
     <div class="row" style="margin-top:12px">
       <button class="btn" id="apCfgSave" onclick="apSaveConfig()">保存</button>
       <button class="btn ghost" onclick="apLoadConfig()">重新加载</button>
@@ -2260,7 +2294,7 @@ PAGE = """<!doctype html>
 <div class="toast" id="toast"></div>
 
 <script>
-const TOKEN=new URLSearchParams(location.search).get("token")||"";
+let TOKEN=new URLSearchParams(location.search).get("token")||"";
 function authHdr(){return TOKEN?{Authorization:"Bearer "+TOKEN}:{}}
 function jget(u){return fetch(u,{headers:authHdr()}).then(r=>r.json())}
 function jpost(u,b){return fetch(u,{method:"POST",headers:Object.assign({"Content-Type":"application/json"},authHdr()),body:JSON.stringify(b)}).then(r=>r.json())}
@@ -2904,29 +2938,9 @@ function loadSeriesLibrary(){
 
 // 各服务的对外端口（用于生成直达链接），与 docker-compose 保持一致
 const SVC_PORTS={radarr:7878,sonarr:8989,prowlarr:9696,qbittorrent:8085,flaresolverr:8191};
-// 一键登录：用统一账号 admin / MediaFn2026 向各 *arr 的 /login 表单发起同源导航提交，
-// 新标签页直接带着会话 cookie 进入已登录状态（无需手动输入）。
-function svcLogin(key,port){
-  const f=document.createElement('form');
-  f.method='POST';
-  f.action='http://'+location.hostname+':'+port+'/login';
-  f.target='_blank';
-  f.style.display='none';
-  f.innerHTML='<input name="username" value="admin">'+
-              '<input name="password" value="MediaFn2026">'+
-              '<input name="rememberMe" value="true">';
-  document.body.appendChild(f); f.submit(); f.remove();
-  toast('已在新标签页用 admin / MediaFn2026 登录 '+key,'ok');
-}
 function loadSystem(){
   jget("/api/system").then(d=>{
     let h='';
-    if(d.authEnabled===false){
-      h+='<div class="queue-item" style="border-color:#5a2b3c;background:#2a1720">'+
-         '<b>⚠️ 未启用访问鉴权</b> '+
-         '<span class="muted">AUTOPILOT_TOKEN 为空，影视下载台当前对任何能访问 8787 端口的人开放。'+
-         '公网/多人环境请在 compose 里设置 AUTOPILOT_TOKEN。</span></div>';
-    }
     const svcs=d.services||[];
     if(svcs.length){
       h+='<div class="muted" style="margin:2px 0 8px">服务总览 · '+
@@ -2937,24 +2951,11 @@ function loadSystem(){
         const scheme='http';
         const link=port?'<a class="slink" href="'+scheme+'://'+location.hostname+':'+port+
                    '" target="_blank" rel="noopener noreferrer">打开 ↗</a>':'';
-        const loginBtn=(s.key==='radarr'||s.key==='sonarr'||s.key==='prowlarr')?
-          '<button class="btn ghost" style="margin-left:6px;padding:2px 8px;font-size:12px" onclick="svcLogin('+JSON.stringify(s.key)+','+port+')">一键登录</button>':'';
+        const loginBtn='';
         return '<div class="queue-item"><div class="top"><b>'+dot+esc(s.name||"")+'</b>'+
           '<span class="muted">'+esc(s.detail||"")+link+loginBtn+'</span></div>'+
           (s.desc?'<div class="svc-desc">'+esc(s.desc)+'</div>':'')+'</div>';
       }).join("");
-    }
-    // 抓取完成 webhook 通知状态
-    if(d.webhook){
-      const wh=d.webhook;
-      const whHost=(wh.url||"").replace(/^https?:\/\//,'').split('/')[0]||"—";
-      const whLine = wh.configured
-        ? ('已开启 → <b>'+esc(whHost)+'</b> · 已发送 '+wh.sent+(wh.last?' · 最近 '+wh.last:''))
-        : '未配置（在 compose 设置 <code>AUTOPILOT_WEBHOOK_URL</code> 开启）';
-      h+='<div class="queue-item" style="border-color:#23304a;background:#141b2b">'+
-         '<div class="top"><b>🔔 抓取完成通知</b>'+
-         '<button class="btn ghost" onclick="testWebhook()">发送测试</button></div>'+
-         '<div class="muted">'+whLine+'</div></div>';
     }
     (d.disks||[]).forEach(x=>{
       const used=x.total-x.free, pct=x.total?Math.round(used/x.total*100):0;
@@ -2973,14 +2974,6 @@ function loadSystem(){
     const d0=(d.disks||[])[0];
     document.getElementById("pilldisk").textContent=d0?("磁盘 "+fmtSize(d0.free)+" 可用"):"";
   }).catch(e=>{document.getElementById("sysbody").innerHTML='<div class="err">加载失败: '+e+'</div>';});
-}
-
-function testWebhook(){
-  fetch("/api/webhook/test",{method:"POST",headers:authHdr()}).then(r=>r.json()).then(d=>{
-    if(d.ok) toast("✅ 测试通知已发送，去接收端确认","ok");
-    else if(d.error && d.error.indexOf("未配置")>=0) toast("⚠️ "+d.error,"err");
-    else toast("❌ 发送失败："+(d.error||"检查 AUTOPILOT_WEBHOOK_URL 与接收端可达性"),"err");
-  }).catch(()=>toast("❌ 请求失败","err"));
 }
 
 // 日历视图（F9）：Radarr 电影上映 + Sonarr 剧集播出，按月网格展示
@@ -3143,6 +3136,8 @@ function apLoadConfig(){
     const v=d.values||{};
     document.getElementById("ap_PROXY_URL").value=v.PROXY_URL||"";
     document.getElementById("ap_TMDB_KEY").value=v.TMDB_KEY||"";
+    const tokEl=document.getElementById("ap_AUTH_TOKEN"); if(tokEl)tokEl.value=v.AUTH_TOKEN||"";
+    const whEl=document.getElementById("ap_WEBHOOK_URL"); if(whEl)whEl.value=v.WEBHOOK_URL||"";
     if(st)st.textContent="已加载";
   }).catch(e=>{ if(st)st.textContent="加载失败："+e; });
 }
@@ -3151,10 +3146,13 @@ function apSaveConfig(){
   if(st)st.textContent="保存中…";
   const payload={
     proxy_url:document.getElementById("ap_PROXY_URL").value.trim(),
-    tmdb_key:document.getElementById("ap_TMDB_KEY").value.trim()
+    tmdb_key:document.getElementById("ap_TMDB_KEY").value.trim(),
+    auth_token:document.getElementById("ap_AUTH_TOKEN").value.trim(),
+    webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim()
   };
   jpost("/api/config", payload).then(d=>{
-    if(d&&d.ok){ if(st)st.textContent="已保存，出口代理重启中…"; toast("配置已写入"); }
+    if(d&&d.ok){ if(st)st.textContent="已保存，出口代理重启中…"; toast("配置已写入");
+      if(d.values&&d.values.AUTH_TOKEN!==undefined){ TOKEN=d.values.AUTH_TOKEN||""; } }
     else { if(st)st.textContent="保存失败："+(d&&d.error||"未知"); toast("保存失败："+(d&&d.error||""),"err"); }
   }).catch(e=>{ if(st)st.textContent="保存失败："+e; toast("保存失败："+e,"err"); });
 }
@@ -3166,6 +3164,15 @@ function apNetTest(){
     if(el)el.textContent=v;
     toast(v);
   }).catch(e=>{ if(el)el.textContent="测试失败："+e; toast("测试失败："+e,"err"); });
+}
+function apTestWebhook(){
+  const el=document.getElementById("apWhStatus");
+  if(el)el.textContent="发送中…";
+  fetch("/api/webhook/test",{method:"POST",headers:authHdr()}).then(r=>r.json()).then(d=>{
+    if(d.ok){ if(el)el.textContent="✅ 已发送，去接收端确认"; toast("✅ 测试通知已发送","ok"); }
+    else if(d.error&&d.error.indexOf("未配置")>=0){ if(el)el.textContent="⚠️ "+d.error; toast("⚠️ "+d.error,"err"); }
+    else { if(el)el.textContent="❌ "+(d.error||"发送失败"); toast("❌ 发送失败："+(d.error||""),"err"); }
+  }).catch(e=>{ if(el)el.textContent="❌ 请求失败"; toast("❌ 请求失败："+e,"err"); });
 }
 
 // init
