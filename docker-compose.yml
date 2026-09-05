@@ -1,7 +1,7 @@
 # 影视下载台 · media 栈
 # 用法： cp .env.example .env  &&  docker compose up -d
 # 起来后打开 http://<本机IP>:8787 ，在页面填入你的境外 HTTP 代理即可出外网。
-# 不填 = 仅内网。
+# 不填 = 直连出网（无需代理）；仅当宿主机本身无法直连外网时，才在此填代理。
 
 services:
   # ---- 出网出口（HTTP 代理转发器）----
@@ -28,7 +28,7 @@ services:
     environment:
       - AUTOPILOT_PORT=8787
       - AUTOPILOT_TOKEN=${AUTOPILOT_TOKEN:-}
-      - EGRESS_PROXY=http://proxy-forwarder:3128
+      - EGRESS_PROXY=${EGRESS_PROXY:-}
       - MEDIA_ENV=/app/.env
       - QBITTORRENT_URL=http://media-qbittorrent:8085
       - QBITTORRENT_USER=${QBITTORRENT_USER:-admin}
@@ -41,8 +41,8 @@ services:
       - PROWLARR_URL=http://media-prowlarr:9696
       - PROWLARR_CONFIG=/prowlarr-config/config.xml
       - FLARESOLVERR_URL=http://media-flaresolverr:8191
-      - PROXY_URL=http://proxy-forwarder:3128
-      - TMDB_PROXY=http://proxy-forwarder:3128
+      - PROXY_URL=${PROXY_URL:-}
+      - TMDB_PROXY=${TMDB_PROXY:-}
     volumes:
       - ./.env:/app/.env
       - ./data:/data

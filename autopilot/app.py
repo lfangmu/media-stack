@@ -63,7 +63,7 @@ QBIT_URL = os.environ.get("QBITTORRENT_URL", "https://qbittorrent:8085")
 QBIT_USER = os.environ.get("QBITTORRENT_USER", "admin")
 QBIT_PASS = os.environ.get("QBITTORRENT_PASS", "MediaFn2026")
 FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://flaresolverr:8191")
-PROXY_URL = os.environ.get("PROXY_URL", "http://proxy-forwarder:3128")
+PROXY_URL = os.environ.get("PROXY_URL", "")
 WEBHOOK_URL = os.environ.get("AUTOPILOT_WEBHOOK_URL", "").strip()
 # 发现墙（🎯 发现 Tab）数据源：TMDB。免费的 v3 API Key 在 https://www.themoviedb.org/ 申请，
 # 在「配置」页的 TMDB API Key 一栏填写即可（落盘到 .env 并热更新，无需重建容器）。出网默认走与 FlareSolverr 相同的代理
@@ -91,11 +91,12 @@ def _apply_env_file_overrides():
     except Exception:
         return
     global TMDB_KEY, PROXY_URL, TMDB_PROXY
-    if kv.get("TMDB_API_KEY"):
+    if "TMDB_API_KEY" in kv:
         TMDB_KEY = kv["TMDB_API_KEY"]
-    if kv.get("PROXY_URL"):
+    if "PROXY_URL" in kv:
+        # .env 里显式留空也视为「无代理 = 直连出网」，不再回退到 squid 默认值
         PROXY_URL = kv["PROXY_URL"]
-    if kv.get("TMDB_PROXY"):
+    if "TMDB_PROXY" in kv:
         TMDB_PROXY = kv["TMDB_PROXY"]
 
 
@@ -1629,6 +1630,47 @@ def _restart_container(name):
         pass
 
 
+def net_test():
+    """网络环境自检：测「直连外网」是否可用（强制不走任何代理），
+    若已配置代理则再测「经代理」链路。用于判断是否需要填代理。"""
+    import time as _t
+    targets = [
+        ("TMDB", "https://api.themoviedb.org/3/configuration"),
+        ("gstatic", "http://www.gstatic.com/generate_204"),
+        ("github", "https://github.com"),
+    ]
+
+    def _probe(use_proxy):
+        for name, url in targets:
+            t0 = _t.monotonic()
+            try:
+                handlers = []
+                if use_proxy and PROXY_URL:
+                    handlers.append(_ureq.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL}))
+                else:
+                    handlers.append(_ureq.ProxyHandler({}))  # 空 dict = 禁用 env 代理，纯直连
+                req = _ureq.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
+                with _ureq.build_opener(*handlers).open(req, timeout=8) as r:
+                    code = getattr(r, "status", None) or r.getcode()
+                dt = int((_t.monotonic() - t0) * 1000)
+                return {"ok": True, "latency_ms": dt, "host": name,
+                        "detail": "%s 可达 (HTTP %s, %dms)" % (name, code, dt)}
+            except Exception as e:
+                last = "%s 失败: %s" % (name, str(e)[:80])
+        return {"ok": False, "latency_ms": None, "host": None, "detail": "全部目标不可达：" + last}
+
+    direct = _probe(False)
+    via = _probe(True) if PROXY_URL else None
+    if direct["ok"]:
+        verdict = "直连外网可用，无需配置代理（留空即可直接出网）"
+    elif via and via["ok"]:
+        verdict = "直连不可用，但代理可用：请确认已在上方填写代理链接"
+    else:
+        verdict = "直连与代理均不可达：请检查宿主机网络，或在上方填写代理链接"
+    return {"ok": True, "direct": direct, "via_proxy": via, "verdict": verdict,
+            "proxy_configured": bool(PROXY_URL)}
+
+
 def config_get():
     return {"ok": True, "values": {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY}}
 
@@ -1650,6 +1692,15 @@ def config_save(body_str):
             updates["UPSTREAM_PROXY_HOST"] = parsed["host"]
             updates["UPSTREAM_PROXY_PORT"] = str(parsed["port"])
             updates["UPSTREAM_PROXY_AUTH"] = parsed["auth"]
+    else:
+        # 清空代理：显式把代理相关键写成空，使「无代理 = 直连出网」可持久化，
+        # 不再让 compose 写死的 squid 默认值或 .env 里的旧值在重启后回潮。
+        updates["EGRESS_PROXY"] = ""
+        updates["PROXY_URL"] = ""
+        updates["TMDB_PROXY"] = ""
+        updates["UPSTREAM_PROXY_HOST"] = ""
+        updates["UPSTREAM_PROXY_PORT"] = ""
+        updates["UPSTREAM_PROXY_AUTH"] = ""
     if tmdb_key:
         updates["TMDB_API_KEY"] = tmdb_key
     wrote = _write_env_file(MEDIA_ENV, updates)
@@ -1660,13 +1711,12 @@ def config_save(body_str):
                                    if k.startswith("UPSTREAM_PROXY_")})
             break
     global PROXY_URL, TMDB_PROXY, TMDB_KEY
-    if proxy:
-        PROXY_URL = proxy
-        TMDB_PROXY = proxy
+    PROXY_URL = proxy
+    TMDB_PROXY = proxy
     if tmdb_key:
         TMDB_KEY = tmdb_key
-    if proxy:
-        _restart_container("proxy-forwarder")
+    # 代理状态变化（设置或清空）都重启 squid，使 never_direct/always_direct 与 .env 一致
+    _restart_container("proxy-forwarder")
     return 200, {"ok": True, "wrote": wrote,
                  "values": {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY}}
 
@@ -2198,6 +2248,10 @@ PAGE = """<!doctype html>
       <button class="btn" id="apCfgSave" onclick="apSaveConfig()">保存</button>
       <button class="btn ghost" onclick="apLoadConfig()">重新加载</button>
       <span class="muted" id="apCfgStatus"></span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn ghost" onclick="apNetTest()">测试网络环境（直连外网是否可用）</button>
+      <span class="muted" id="apNetTest"></span>
     </div>
   </div>
 
@@ -3104,6 +3158,15 @@ function apSaveConfig(){
     else { if(st)st.textContent="保存失败："+(d&&d.error||"未知"); toast("保存失败："+(d&&d.error||""),"err"); }
   }).catch(e=>{ if(st)st.textContent="保存失败："+e; toast("保存失败："+e,"err"); });
 }
+function apNetTest(){
+  const el=document.getElementById("apNetTest");
+  if(el)el.textContent="测试中…";
+  jget("/api/nettest").then(d=>{
+    const v=(d&&d.verdict)||"未知";
+    if(el)el.textContent=v;
+    toast(v);
+  }).catch(e=>{ if(el)el.textContent="测试失败："+e; toast("测试失败："+e,"err"); });
+}
 
 // init
 loadProfiles();loadRootFolders();loadSystem();loadQueue();
@@ -3222,6 +3285,8 @@ class H(BaseHTTPRequestHandler):
                                     "sent": _WEBHOOK_SENT, "last": _WEBHOOK_LAST})
                 elif base == "/api/config":
                     self._send(200, config_get()); return
+                elif base == "/api/nettest":
+                    self._send(200, net_test()); return
                 elif base.startswith("/api/calendar"):
                     cs = (_qs.get("start") or [""])[0]
                     ce = (_qs.get("end") or [""])[0]

@@ -20,11 +20,13 @@ if [ -n "$UP_HOST" ] && [ -n "$UP_PORT" ]; then
   fi
   # 用字面 \n，sed 会解释为换行，避免把真实换行塞进替换串导致 "unterminated s command"
   PEER=$(printf '%s\\ncache_peer_access %s allow all' "$LINE" "$UP_HOST")
+  DIRECTIVE="never_direct allow all"
 else
-  PEER="# no upstream configured: internal-only"
+  PEER="# no upstream configured: allow direct egress"
+  DIRECTIVE="always_direct allow all"
 fi
 
-sed "s|__CACHE_PEER_LINES__|$PEER|" /etc/squid/squid.conf.template > /etc/squid/squid.conf
+sed -e "s|__CACHE_PEER_LINES__|$PEER|" -e "s|__DIRECTIVE__|$DIRECTIVE|" /etc/squid/squid.conf.template > /etc/squid/squid.conf
 
 # 初始化交换目录（幂等，缺失则创建；已存在则忽略）
 squid -z -N 2>/dev/null || true

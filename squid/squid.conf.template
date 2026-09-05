@@ -12,7 +12,8 @@ http_access allow localhost
 http_access allow localnet
 http_access deny all
 
-# 强制所有外网请求走上游代理；无上游则外网不可达（仅内网）
-never_direct allow all
+# 有上游代理时强制走 peer（never_direct）；无上游则允许直连（always_direct），
+# 这样「宿主机本身能上外网、不配代理」时也能直接出网。具体指令由 entrypoint.sh 注入。
+__DIRECTIVE__
 
 __CACHE_PEER_LINES__
