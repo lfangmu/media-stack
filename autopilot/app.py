@@ -80,6 +80,22 @@ TMDB_PROXY = os.environ.get("TMDB_PROXY", PROXY_URL)
 TMDB_BASE = os.environ.get("TMDB_BASE", "https://api.themoviedb.org/3")
 TMDB_IMG = "https://image.tmdb.org/t/p/w342"
 
+# ---------- 反向代理直登（系统状态「打开 ↗」经 autopilot 同源代理，初始化时已建好 *arr 账号）----------
+ARR_ADMIN_USER = (os.environ.get("ARR_ADMIN_USER", "admin") or "admin").strip()
+ARR_ADMIN_PASS = (os.environ.get("ARR_ADMIN_PASS", "") or "").strip()
+# 代理服务定义：service key -> {上游 URL, 鉴权类型}
+_PROXY_DEFS = {
+    "radarr":       {"url": RADARR_URL,       "kind": "arr"},
+    "sonarr":       {"url": SONARR_URL,       "kind": "arr"},
+    "prowlarr":     {"url": PROWLARR_URL,     "kind": "arr"},
+    "qbittorrent":  {"url": QBIT_URL,         "kind": "qb"},
+    "flaresolverr": {"url": FLARESOLVERR_URL, "kind": "none"},
+}
+_arr_tokens = {}                       # service -> (jwt, expires_ts)
+_arr_tokens_lock = threading.Lock()
+_qb_sid = {"sid": None, "exp": 0}
+_qb_sid_lock = threading.Lock()
+
 
 # 启动时从 .env(MEDIA_ENV) 覆盖：使页面保存的 TMDB_API_KEY / 代理在容器重启后仍生效。
 # 容器 env 不含这些键（compose 仅注入固定代理），故以 .env 落盘值为准，保证前端设置可持久化。
@@ -1723,6 +1739,186 @@ def _restart_container(name):
         pass
 
 
+# ---------- *arr 账号初始化 + 反向代理直登 ----------
+def _ensure_arr_admin_pass():
+    """首次运行确保 *arr 管理员密码已生成并落盘到 .env；重启时优先读 .env，避免每次都换新密码导致代理登录失败。"""
+    global ARR_ADMIN_PASS, ARR_ADMIN_USER
+    if ARR_ADMIN_PASS:
+        return
+    # 优先从持久化 .env 读取（MEDIA_ENV 即 bind 挂载的 /opt/media/.env）
+    env_pass = ""
+    try:
+        with open(MEDIA_ENV) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("ARR_ADMIN_PASS="):
+                    env_pass = line.split("=", 1)[1].strip()
+                elif line.startswith("ARR_ADMIN_USER="):
+                    u = line.split("=", 1)[1].strip()
+                    if u:
+                        ARR_ADMIN_USER = u
+    except Exception:
+        pass
+    if env_pass:
+        ARR_ADMIN_PASS = env_pass
+        return
+    import secrets
+    pw = secrets.token_urlsafe(14)
+    ARR_ADMIN_PASS = pw
+    try:
+        _write_env_file(MEDIA_ENV, {"ARR_ADMIN_USER": ARR_ADMIN_USER, "ARR_ADMIN_PASS": pw})
+    except Exception:
+        pass
+
+
+def _arr_api_key(service):
+    if service == "radarr":
+        return get_radarr_key()
+    if service == "sonarr":
+        return get_sonarr_key()
+    if service == "prowlarr":
+        return get_prowlarr_key()
+    return None
+
+
+def _arr_create_account(service):
+    """首次运行经 /api/v3/auth 创建管理员账号（已存在则跳过）。返回 'created'/'exists'/'err'。"""
+    url = _PROXY_DEFS[service]["url"].rstrip("/") + "/api/v3/auth"
+    data = json.dumps({"username": ARR_ADMIN_USER, "password": ARR_ADMIN_PASS}).encode()
+    req = Request(url, data=data,
+                  headers={"Content-Type": "application/json", "Accept": "application/json"},
+                  method="POST")
+    try:
+        with urlopen(req, timeout=30) as r:
+            r.read()
+        return "created"
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 409):
+            return "exists"
+        return "err:%s" % e.code
+    except Exception as e:
+        return "err:%s" % e
+
+
+def _arr_set_config(service):
+    """读全量配置 -> 合并 authenticationMethod=forms 与 BaseUrl=/p/<service> -> 整体写回（PUT 要求完整对象）。"""
+    key = _arr_api_key(service)
+    if not key:
+        return
+    url = _PROXY_DEFS[service]["url"].rstrip("/") + "/api/v3/config"
+    try:
+        with urlopen(Request(url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
+            cfg = json.loads(r.read().decode())
+        cfg["authenticationMethod"] = "forms"
+        cfg["baseUrl"] = "/p/" + service
+        req = Request(url, data=json.dumps(cfg).encode(),
+                      headers={"X-Api-Key": key, "Content-Type": "application/json", "Accept": "application/json"},
+                      method="PUT")
+        with urlopen(req, timeout=30) as r:
+            r.read()
+    except Exception:
+        pass
+
+
+def _arr_bootstrap():
+    """后台线程：等 *arr 就绪 -> 建账号 + 设 BaseUrl（幂等）。"""
+    _ensure_arr_admin_pass()
+    for service in ("radarr", "sonarr", "prowlarr"):
+        for _ in range(90):
+            try:
+                _arr_create_account(service)
+                _arr_set_config(service)
+                print("[autopilot] %s 账号初始化完成 (baseUrl=/p/%s)" % (service, service), flush=True)
+                break
+            except Exception:
+                time.sleep(10)
+
+
+def _ensure_arr_token(service):
+    """登录 *arr 拿 JWT（缓存 1h），供代理注入 Authorization/Cookie。"""
+    with _arr_tokens_lock:
+        t = _arr_tokens.get(service)
+        if t and t[1] > time.time() + 30:
+            return t[0]
+    url = _PROXY_DEFS[service]["url"].rstrip("/") + "/api/v3/auth/login"
+    data = json.dumps({"username": ARR_ADMIN_USER, "password": ARR_ADMIN_PASS}).encode()
+    req = Request(url, data=data,
+                  headers={"Content-Type": "application/json", "Accept": "application/json"},
+                  method="POST")
+    try:
+        with urlopen(req, timeout=30) as r:
+            tok = json.loads(r.read().decode()).get("token")
+        if tok:
+            with _arr_tokens_lock:
+                _arr_tokens[service] = (tok, time.time() + 3600)
+            return tok
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_qb_sid():
+    """登录 qB 拿 SID（缓存 1h）。"""
+    with _qb_sid_lock:
+        if _qb_sid["sid"] and _qb_sid["exp"] > time.time() + 30:
+            return _qb_sid["sid"]
+    try:
+        data = urlencode({"username": QBIT_USER, "password": QBIT_PASS}).encode()
+        req = Request(QBIT_URL.rstrip("/") + "/api/v2/auth/login", data=data,
+                      headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+        with urlopen(req, timeout=30, context=SSL_CTX) as r:
+            sc = r.headers.get("Set-Cookie", "")
+        sid = ""
+        for part in sc.split(";"):
+            if part.strip().startswith("SID="):
+                sid = part.strip()[4:]
+        if sid:
+            with _qb_sid_lock:
+                _qb_sid["sid"] = sid
+                _qb_sid["exp"] = time.time() + 3600
+            return sid
+    except Exception:
+        pass
+    return None
+
+
+def _rewrite_proxy_url(service, v):
+    base = "/p/" + service
+    if v.startswith("http://") or v.startswith("https://"):
+        v = urlparse(v).path
+    if v.startswith("/") and not v.startswith(base):
+        v = base + v
+    return v
+
+
+def _rewrite_set_cookie(service, v):
+    import re
+    base = "/p/" + service
+    v = v.replace("Path=/", "Path=" + base)
+    v = re.sub(r';?\s*Domain=[^;]+', '', v)
+    return v
+
+
+def _rewrite_html_body(base, body):
+    try:
+        s = body.decode("utf-8", "replace")
+    except Exception:
+        return body
+    s = s.replace('href="/', 'href="' + base + "/")
+    s = s.replace('src="/', 'src="' + base + "/")
+    s = s.replace("url(/", "url(" + base + "/")
+    s = s.replace('action="/', 'action="' + base + "/")
+    return s.encode("utf-8")
+
+
+def _rewrite_referer(upstream, referer):
+    if not referer:
+        return None
+    p = urlparse(referer)
+    u = urlparse(upstream)
+    return "%s://%s%s" % (u.scheme, u.netloc, p.path or "/")
+
+
 def _compose_project_name():
     """探测本 autopilot 所属的 compose 项目名（用于 docker compose up -d -p）。
     优先读容器 label com.docker.compose.project，失败回退 media-stack。"""
@@ -3150,10 +3346,7 @@ function loadSystem(){
          svcs.filter(s=>s.ok).length+'/'+svcs.length+' 正常</div>';
       h+=svcs.map(s=>{
         const dot=s.ok?'<span class="sdot ok"></span>':'<span class="sdot err"></span>';
-        const port=SVC_PORTS[s.key];
-        const scheme='http';
-        const link=port?'<a class="slink" href="'+scheme+'://'+location.hostname+':'+port+
-                   '" target="_blank" rel="noopener noreferrer">打开 ↗</a>':'';
+        const link='<a class="slink" href="/p/'+s.key+'/" target="_blank" rel="noopener noreferrer">打开 ↗</a>';
         const loginBtn='';
         return '<div class="queue-item"><div class="top"><b>'+dot+esc(s.name||"")+'</b>'+
           '<span class="muted">'+esc(s.detail||"")+link+loginBtn+'</span></div>'+
@@ -3457,6 +3650,8 @@ class H(BaseHTTPRequestHandler):
             return {"__error__": str(e)}
 
     def do_GET(self):
+        if self.path.startswith("/p/"):
+            self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
         if self.path.startswith("/favicon.ico"):
@@ -3567,6 +3762,8 @@ class H(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path.startswith("/p/"):
+            self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
         p = self.path.rstrip("/")
@@ -3699,6 +3896,8 @@ class H(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_DELETE(self):
+        if self.path.startswith("/p/"):
+            self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
         p, qs = self._q()
@@ -3726,6 +3925,95 @@ class H(BaseHTTPRequestHandler):
             self._send(200, res); return
         self._send(404, {"error": "not found"})
 
+    def do_PUT(self):
+        if self.path.startswith("/p/"):
+            self._proxy_dispatch(); return
+        self._send(405, {"error": "method not allowed"})
+
+    def _proxy_dispatch(self):
+        rest = self.path.split("?", 1)[0]
+        parts = rest.strip("/").split("/", 2)
+        if len(parts) < 2 or parts[0] != "p":
+            self._send(404, {"error": "not found"}); return
+        service = parts[1]
+        svc = _PROXY_DEFS.get(service)
+        if not svc:
+            self._send(404, {"error": "unknown service"}); return
+        subpath = parts[2] if len(parts) > 2 else ""
+        method = self.command
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except Exception:
+            length = 0
+        body = self.rfile.read(length) if length else None
+        self._proxy_pass(service, svc, subpath, method, body)
+
+    def _proxy_pass(self, service, svc, subpath, method, body):
+        upstream = svc["url"].rstrip("/")
+        target = upstream + "/" + subpath if subpath else upstream + "/"
+        kind = svc["kind"]
+        headers = {}
+        ct = self.headers.get("Content-Type")
+        if ct:
+            headers["Content-Type"] = ct
+        accept = self.headers.get("Accept")
+        if accept:
+            headers["Accept"] = accept
+        referer = self.headers.get("Referer")
+        if referer:
+            rw = _rewrite_referer(upstream, referer)
+            if rw:
+                headers["Referer"] = rw
+        if kind == "arr":
+            tok = _ensure_arr_token(service)
+            if tok:
+                headers["Authorization"] = "Bearer " + tok
+                headers["Cookie"] = "auth_token=" + tok
+        elif kind == "qb":
+            sid = _ensure_qb_sid()
+            if sid:
+                headers["Cookie"] = "SID=" + sid
+        if body is None and method not in ("GET", "HEAD"):
+            headers["Content-Length"] = "0"
+        use_ssl = upstream.startswith("https")
+        req = Request(target, data=body if body is not None else None, headers=headers, method=method)
+        try:
+            with urlopen(req, timeout=120, context=SSL_CTX if use_ssl else None) as r:
+                status = r.status
+                resp_headers = r.headers
+                resp_body = r.read()
+        except urllib.error.HTTPError as e:
+            status = e.code
+            resp_headers = e.headers
+            try:
+                resp_body = e.read()
+            except Exception:
+                resp_body = b""
+        except Exception as e:
+            self._send(502, {"error": "upstream error: %s" % e}); return
+        out_headers = {}
+        for k, v in resp_headers.items():
+            lk = k.lower()
+            if lk in ("transfer-encoding", "content-encoding", "connection", "keep-alive"):
+                continue
+            if lk == "location":
+                v = _rewrite_proxy_url(service, v)
+            elif lk == "content-location":
+                v = _rewrite_proxy_url(service, v)
+            elif lk == "set-cookie":
+                v = _rewrite_set_cookie(service, v)
+            out_headers[k] = v
+        ctype = resp_headers.get("Content-Type", "")
+        if kind in ("qb", "none") and "text/html" in ctype:
+            resp_body = _rewrite_html_body("/p/" + service, resp_body)
+        out_headers["Content-Length"] = str(len(resp_body))
+        self.send_response(status)
+        for k, v in out_headers.items():
+            self.send_header(k, v)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(resp_body)
+
 
 def main():
     if WEBHOOK_URL:
@@ -3733,6 +4021,8 @@ def main():
         print("[autopilot] webhook watcher -> %s" % WEBHOOK_URL)
     threading.Thread(target=seed_indexers_loop, kwargs={"max_retries": 20, "wait": 15}, daemon=True).start()
     print("[autopilot] indexer seeder -> 后台幂等补齐 7 个公共索引器", flush=True)
+    threading.Thread(target=_arr_bootstrap, daemon=True).start()
+    print("[autopilot] *arr 账号初始化（后台）：自动建管理员账号 + 设 BaseUrl=/p/<svc>", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), H)
     print("[autopilot] listening on :%d  RADARR_URL=%s" % (LISTEN_PORT, RADARR_URL))
     server.serve_forever()

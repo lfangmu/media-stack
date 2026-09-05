@@ -1,3 +1,12 @@
 # 不提交密钥与本地数据
 .env
 data/
+
+# 调试/临时脚本与产物（不提交，部分含凭据）
+/*.py
+/*.js
+/*.html
+/*.json
+__pycache__/
+*.pyc
+fix_arr_auth.sh
