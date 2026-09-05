@@ -33,11 +33,24 @@ services:
       - QBITTORRENT_URL=http://media-qbittorrent:8085
       - QBITTORRENT_USER=${QBITTORRENT_USER:-admin}
       - QBITTORRENT_PASS=${QBITTORRENT_PASS:-adminadmin}
+      # NAS 完整面板所需的服务地址（WSL 容器名带 media- 前缀，config.xml 挂载进容器）
+      - RADARR_URL=http://media-radarr:7878
+      - RADARR_CONFIG=/radarr-config/config.xml
+      - SONARR_URL=http://media-sonarr:8989
+      - SONARR_CONFIG=/sonarr-config/config.xml
+      - PROWLARR_URL=http://media-prowlarr:9696
+      - PROWLARR_CONFIG=/prowlarr-config/config.xml
+      - FLARESOLVERR_URL=http://media-flaresolverr:8191
+      - PROXY_URL=http://proxy-forwarder:3128
+      - TMDB_PROXY=http://proxy-forwarder:3128
     volumes:
       - ./.env:/app/.env
       - ./data:/data
       - /var/run/docker.sock:/var/run/docker.sock:rw
       - /usr/bin/docker:/usr/bin/docker:ro
+      - ./radarr-config:/radarr-config:ro
+      - ./sonarr-config:/sonarr-config:ro
+      - ./prowlarr-config:/prowlarr-config:ro
     restart: unless-stopped
 
   # ---- 索引器 / 媒体管理 ----
@@ -66,6 +79,7 @@ services:
       - "9696:9696"
     volumes:
       - ./data:/data
+      - ./prowlarr-config:/config
     restart: unless-stopped
 
   radarr:
@@ -78,6 +92,7 @@ services:
       - "7878:7878"
     volumes:
       - ./data:/data
+      - ./radarr-config:/config
     restart: unless-stopped
 
   sonarr:
@@ -90,6 +105,7 @@ services:
       - "8989:8989"
     volumes:
       - ./data:/data
+      - ./sonarr-config:/config
     restart: unless-stopped
 
   qbittorrent:

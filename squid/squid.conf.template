@@ -1,5 +1,5 @@
 # 影视下载台 · squid 模板
-# __CACHE_PEER_LINES__ 由 entrypoint.sh 按 .env 中的 UPSTREAM_PROXY_* 生成。
+# 由 entrypoint.sh 按 .env 中的 UPSTREAM_PROXY_* 生成（注意：本行不能含 __CACHE_PEER_LINES__ 占位符，否则 sed 会把它也替换掉并注入非法指令导致 squid 起不来）。
 # 未配置上游时：never_direct 强制所有外网请求经 peer；无 peer 即“仅内网”。
 
 http_port 3128
