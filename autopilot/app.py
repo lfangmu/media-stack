@@ -66,6 +66,11 @@ FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://flaresolverr:8191"
 PROXY_URL = os.environ.get("PROXY_URL", "")
 WEBHOOK_URL = os.environ.get("AUTOPILOT_WEBHOOK_URL", "").strip()
 QB_SAVE_PATH = os.environ.get("QB_SAVE_PATH", "")
+# 宿主机数据目录（volume 映射源）：容器 /data 在宿主机上对应的真实目录。
+# compose 里 ${DATA_DIR}:/data 用它；改它等于改「下载与媒体库落在宿主机的哪块盘」。
+DATA_DIR = os.environ.get("DATA_DIR", "./data").strip()
+# autopilot 容器内挂载的项目目录（含 docker-compose.yml 与 .env），供改映射后触发重新挂载。
+MEDIA_PROJECT_DIR = os.environ.get("MEDIA_PROJECT_DIR", "/opt/media")
 # 发现墙（🎯 发现 Tab）数据源：TMDB。免费的 v3 API Key 在 https://www.themoviedb.org/ 申请，
 # 在「配置」页的 TMDB API Key 一栏填写即可（落盘到 .env 并热更新，无需重建容器）。出网默认走与 FlareSolverr 相同的代理
 # （本 NAS 容器无直连外网，统一经 OpenClash）；若需直连可设 TMDB_PROXY=（空）。
@@ -1718,6 +1723,40 @@ def _restart_container(name):
         pass
 
 
+def _compose_project_name():
+    """探测本 autopilot 所属的 compose 项目名（用于 docker compose up -d -p）。
+    优先读容器 label com.docker.compose.project，失败回退 media-stack。"""
+    try:
+        import subprocess, json
+        out = subprocess.run(["docker", "inspect", "autopilot"],
+                             capture_output=True, text=True, timeout=15).stdout
+        infos = json.loads(out)
+        lbl = (infos[0].get("Config", {}).get("Labels", {})
+               or {}).get("com.docker.compose.project")
+        if lbl:
+            return lbl
+    except Exception:
+        pass
+    return "media-stack"
+
+
+def _apply_data_dir_remount(data_dir):
+    """后台线程：把 DATA_DIR 生效后重新挂载整个栈（docker compose up -d）。
+    改 volume 映射必须重建容器，故由 orchestrator 自己触发；autopilot 自身也会被重建。"""
+    import time as _t, subprocess
+    _t.sleep(1)  # 等当前 HTTP 响应先发完，再重建容器
+    try:
+        proj = _compose_project_name()
+        compose = os.path.join(MEDIA_PROJECT_DIR, "docker-compose.yml")
+        env = dict(os.environ)
+        env["DATA_DIR"] = data_dir  # 立即可见，不依赖 .env 读取时序
+        subprocess.run(["docker", "compose", "-p", proj, "-f", compose, "up", "-d"],
+                       env=env, timeout=300,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def net_test():
     """网络环境自检：测「直连外网」是否可用（强制不走任何代理），
     若已配置代理则再测「经代理」链路。用于判断是否需要填代理。"""
@@ -1764,7 +1803,8 @@ def _config_values():
     return {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
             "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL,
             "QB_SAVE_PATH": qbit_get_save_path() or QB_SAVE_PATH,
-            "MOVIE_ROOT": ROOT_FOLDER, "TV_ROOT": TV_ROOT}
+            "MOVIE_ROOT": ROOT_FOLDER, "TV_ROOT": TV_ROOT,
+            "DATA_DIR": DATA_DIR}
 
 
 def config_get():
@@ -1777,7 +1817,7 @@ def config_save(body_str):
     except Exception:
         return 400, {"ok": False, "error": "请求体解析失败"}
     global PROXY_URL, TMDB_PROXY, TMDB_KEY, TOKEN, WEBHOOK_URL
-    global QB_SAVE_PATH, ROOT_FOLDER, TV_ROOT
+    global QB_SAVE_PATH, ROOT_FOLDER, TV_ROOT, DATA_DIR
     updates = {}
     notes = []
     proxy_changed = False
@@ -1829,6 +1869,13 @@ def config_save(body_str):
         path = (data.get("tv_root") or "").strip()
         if path:
             updates["TV_ROOT"] = path
+    if "data_dir" in data:
+        # 宿主机映射层：容器 /data 在宿主机对应的真实目录（volume 映射源）。
+        # 写 .env 持久化，并触发 docker compose up -d 重新挂载（改挂载需重建容器）。
+        # 留空=不改动。
+        path = (data.get("data_dir") or "").strip()
+        if path:
+            updates["DATA_DIR"] = path
     if not updates:
         return 200, {"ok": True, "wrote": False, "values": _config_values()}
     wrote = _write_env_file(MEDIA_ENV, updates)
@@ -1867,6 +1914,15 @@ def config_save(body_str):
             TV_ROOT = path
             ok, msg = sonarr_ensure_rootfolder(TV_ROOT)
             notes.append("剧集库根目录: " + msg)
+    if "data_dir" in data:
+        path = (data.get("data_dir") or "").strip()
+        if path and path != DATA_DIR:
+            DATA_DIR = path
+            # 改了宿主机映射：后台触发 docker compose up -d 重新挂载（会重建相关容器，含自身）。
+            # 放线程里跑，先回 HTTP 再重建，避免请求被中断。
+            threading.Thread(target=_apply_data_dir_remount,
+                            args=(DATA_DIR,), daemon=True).start()
+            notes.append("数据目录(映射): 已写入并尝试重新挂载，栈将在数秒内重建（本服务会短暂重启）")
     # 代理状态变化（设置或清空）都重启 squid，使 never_direct/always_direct 与 .env 一致
     if proxy_changed:
         _restart_container("proxy-forwarder")
@@ -2409,6 +2465,12 @@ PAGE = """<!doctype html>
         <button class="btn ghost" onclick="apTestWebhook()">发送测试通知</button>
         <span class="muted" id="apWhStatus"></span>
       </div>
+    </div>
+    <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
+      <div class="muted" style="margin-bottom:8px">数据目录（宿主机映射 · 最上层）</div>
+      <label class="cfg-row" style="display:block;margin:8px 0"><span>宿主机数据目录 DATA_DIR</span>
+        <input id="ap_DATA_DIR" style="width:100%;margin-top:4px;padding:8px" placeholder="容器 /data 在宿主机上对应的真实目录，如 /mnt/media 或 /home/你的用户名/media-stack/data"></label>
+      <div class="muted" style="font-size:12px;margin-top:2px">这是 qB/Radarr/Sonarr 共享数据卷 ./data:/data 的映射源。所有下载与媒体库实际落在这个目录里。修改后栈会重建并重新挂载（本服务会短暂重启），qB 下载目录、*arr 根目录都应落在此目录之内。</div>
     </div>
     <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
       <div class="muted" style="margin-bottom:8px">下载目录（两层）</div>
@@ -3279,6 +3341,7 @@ function apLoadConfig(){
     document.getElementById("ap_TMDB_KEY").value=v.TMDB_KEY||"";
     const tokEl=document.getElementById("ap_AUTH_TOKEN"); if(tokEl)tokEl.value=v.AUTH_TOKEN||"";
     const whEl=document.getElementById("ap_WEBHOOK_URL"); if(whEl)whEl.value=v.WEBHOOK_URL||"";
+    const ddEl=document.getElementById("ap_DATA_DIR"); if(ddEl)ddEl.value=v.DATA_DIR||"";
     const qbEl=document.getElementById("ap_QB_SAVE_PATH"); if(qbEl)qbEl.value=v.QB_SAVE_PATH||"";
     const mvEl=document.getElementById("ap_MOVIE_ROOT"); if(mvEl)mvEl.value=v.MOVIE_ROOT||"";
     const tvEl=document.getElementById("ap_TV_ROOT"); if(tvEl)tvEl.value=v.TV_ROOT||"";
@@ -3293,6 +3356,7 @@ function apSaveConfig(){
     tmdb_key:document.getElementById("ap_TMDB_KEY").value.trim(),
     auth_token:document.getElementById("ap_AUTH_TOKEN").value.trim(),
     webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim(),
+    data_dir:document.getElementById("ap_DATA_DIR").value.trim(),
     qb_save_path:document.getElementById("ap_QB_SAVE_PATH").value.trim(),
     movie_root:document.getElementById("ap_MOVIE_ROOT").value.trim(),
     tv_root:document.getElementById("ap_TV_ROOT").value.trim()

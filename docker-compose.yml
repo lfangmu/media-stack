@@ -49,9 +49,12 @@ services:
       - FLARESOLVERR_URL=http://media-flaresolverr:8191
       - PROXY_URL=${PROXY_URL:-}
       - TMDB_PROXY=${TMDB_PROXY:-}
+      - DATA_DIR=${DATA_DIR:-./data}
+      - MEDIA_PROJECT_DIR=/opt/media
     volumes:
       - ./.env:/app/.env
-      - ./data:/data
+      - .:/opt/media:ro
+      - ${DATA_DIR:-./data}:/data
       - ./autopilot/app.py:/app/app.py:ro
       - /var/run/docker.sock:/var/run/docker.sock:rw
       - /usr/bin/docker:/usr/bin/docker:ro
@@ -87,7 +90,7 @@ services:
     ports:
       - "9696:9696"
     volumes:
-      - ./data:/data
+      - ${DATA_DIR:-./data}:/data
       - ./prowlarr-config:/config
     restart: unless-stopped
 
@@ -102,7 +105,7 @@ services:
     ports:
       - "7878:7878"
     volumes:
-      - ./data:/data
+      - ${DATA_DIR:-./data}:/data
       - ./radarr-config:/config
     restart: unless-stopped
 
@@ -117,7 +120,7 @@ services:
     ports:
       - "8989:8989"
     volumes:
-      - ./data:/data
+      - ${DATA_DIR:-./data}:/data
       - ./sonarr-config:/config
     restart: unless-stopped
 
@@ -136,6 +139,6 @@ services:
       - "6881:6881"
       - "6881:6881/udp"
     volumes:
-      - ./data:/data
+      - ${DATA_DIR:-./data}:/data
       - ./qbittorrent-config:/config
     restart: unless-stopped

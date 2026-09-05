@@ -178,11 +178,12 @@ setup_env() {
 
   echo ""
   log "=== 配置 media 栈（直接回车用默认值；也可先 export 同名环境变量）==="
+  prompt_env DATA_DIR          "宿主机数据目录（容器 /data 映射到这里，下载与媒体库落盘位置；如 /mnt/media）" "./data"
   prompt_env TMDB_API_KEY      "TMDB API Key（发现墙/海报，必填，https://www.themoviedb.org/settings/api）" ""
   prompt_env EGRESS_PROXY      "出网 HTTP 代理（留空=直连；Clash/v2ray/SS 的 HTTP 端口）" ""
   prompt_env AUTOPILOT_TOKEN   "页面访问令牌（留空=不鉴权）" ""
   prompt_env AUTOPILOT_WEBHOOK_URL "抓取完成通知 Webhook（留空=关闭）" ""
-  prompt_env QB_SAVE_PATH      "qB 下载/做种目录（须落在 ./data 挂载内）" "/data/downloads"
+  prompt_env QB_SAVE_PATH      "qB 下载/做种目录（须落在 DATA_DIR 映射的宿主机目录内）" "/data/downloads"
   prompt_env MOVIE_ROOT        "电影库默认根目录" "/data/movies"
   prompt_env TV_ROOT           "剧集库默认根目录" "/data/tv"
   log ".env 配置完成"
