@@ -32,7 +32,7 @@ services:
       - MEDIA_ENV=/app/.env
       - QBITTORRENT_URL=http://media-qbittorrent:8085
       - QBITTORRENT_USER=${QBITTORRENT_USER:-admin}
-      - QBITTORRENT_PASS=${QBITTORRENT_PASS:-adminadmin}
+      - QBITTORRENT_PASS=${QBITTORRENT_PASS:-MediaFn2026}
       # NAS 完整面板所需的服务地址（WSL 容器名带 media- 前缀，config.xml 挂载进容器）
       - RADARR_URL=http://media-radarr:7878
       - RADARR_CONFIG=/radarr-config/config.xml
@@ -46,6 +46,7 @@ services:
     volumes:
       - ./.env:/app/.env
       - ./data:/data
+      - ./autopilot/app.py:/app/app.py:ro
       - /var/run/docker.sock:/var/run/docker.sock:rw
       - /usr/bin/docker:/usr/bin/docker:ro
       - ./radarr-config:/radarr-config:ro
@@ -113,10 +114,14 @@ services:
     container_name: media-qbittorrent
     environment:
       - WEBUI_PORT=8085
+      # 持久化 WebUI 管理员账号，避免匿名 /config 卷重启后丢失密码 → 系统状态红灯
+      - WEBUI_USERNAME=admin
+      - WEBUI_PASSWORD=MediaFn2026
     ports:
       - "8085:8085"
       - "6881:6881"
       - "6881:6881/udp"
     volumes:
       - ./data:/data
+      - ./qbittorrent-config:/config
     restart: unless-stopped

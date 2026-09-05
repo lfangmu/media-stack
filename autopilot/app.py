@@ -1748,20 +1748,20 @@ def system_status():
          "detail": ("v%s · 影片 %d · 已下载 %d"
                     % (rad_ver, out["totalMovies"], out["downloadedMovies"]))
                    if rad_ok else (rad_ver or "不可达"),
-         "desc": "电影管理：监控想看的电影，自动匹配并下载高质量版本"},
+         "desc": "电影管理：监控想看的电影，自动匹配并下载高质量版本 · 账号 admin / MediaFn2026"},
         {"key": "sonarr", "name": "Sonarr", "ok": son_ok,
          "detail": ("v%s · 剧集 %s · 已下载 %s"
                     % (son_ver, out["totalSeries"], out["downloadedSeries"]))
                    if son_ok else "不可达",
-         "desc": "剧集管理：追更电视剧，按季/集自动抓取与整理"},
+         "desc": "剧集管理：追更电视剧，按季/集自动抓取与整理 · 账号 admin / MediaFn2026"},
         {"key": "prowlarr", "name": "Prowlarr", "ok": pro_ok,
          "detail": ("%s · 索引器 %s/%s 启用" % (pro_ver, idx.get("enabled", 0),
                                             idx.get("total", 0)))
                    if (pro_ok and idx) else (pro_ver or "不可达"),
-         "desc": "索引器聚合：汇总各 BT/Usenet 站点资源，供 Radarr/Sonarr 统一检索"},
+         "desc": "索引器聚合：汇总各 BT/Usenet 站点资源，供 Radarr/Sonarr 统一检索 · 账号 admin / MediaFn2026"},
         {"key": "qbittorrent", "name": "qBittorrent", "ok": qb[0],
          "detail": qb[1],
-         "desc": "下载客户端：实际执行 BT/PT 下载，做种并写入媒体库目录"},
+         "desc": "下载客户端：实际执行 BT/PT 下载，做种并写入媒体库目录 · 账号 admin / MediaFn2026"},
         {"key": "flaresolverr", "name": "FlareSolverr", "ok": fla[0],
          "detail": fla[1],
          "desc": "反爬求解：破解 Cloudflare 等站点验证，让索引器能正常抓取"},
@@ -2743,6 +2743,20 @@ function loadSeriesLibrary(){
 
 // 各服务的对外端口（用于生成直达链接），与 docker-compose 保持一致
 const SVC_PORTS={radarr:7878,sonarr:8989,prowlarr:9696,qbittorrent:8085,flaresolverr:8191};
+// 一键登录：用统一账号 admin / MediaFn2026 向各 *arr 的 /login 表单发起同源导航提交，
+// 新标签页直接带着会话 cookie 进入已登录状态（无需手动输入）。
+function svcLogin(key,port){
+  const f=document.createElement('form');
+  f.method='POST';
+  f.action='http://'+location.hostname+':'+port+'/login';
+  f.target='_blank';
+  f.style.display='none';
+  f.innerHTML='<input name="username" value="admin">'+
+              '<input name="password" value="MediaFn2026">'+
+              '<input name="rememberMe" value="true">';
+  document.body.appendChild(f); f.submit(); f.remove();
+  toast('已在新标签页用 admin / MediaFn2026 登录 '+key,'ok');
+}
 function loadSystem(){
   jget("/api/system").then(d=>{
     let h='';
@@ -2759,11 +2773,13 @@ function loadSystem(){
       h+=svcs.map(s=>{
         const dot=s.ok?'<span class="sdot ok"></span>':'<span class="sdot err"></span>';
         const port=SVC_PORTS[s.key];
-        const scheme=(s.key==='qbittorrent')?'https':'http';
+        const scheme='http';
         const link=port?'<a class="slink" href="'+scheme+'://'+location.hostname+':'+port+
                    '" target="_blank" rel="noopener noreferrer">打开 ↗</a>':'';
+        const loginBtn=(s.key==='radarr'||s.key==='sonarr'||s.key==='prowlarr')?
+          '<button class="btn ghost" style="margin-left:6px;padding:2px 8px;font-size:12px" onclick="svcLogin(\''+s.key+'\','+port+')">一键登录</button>':'';
         return '<div class="queue-item"><div class="top"><b>'+dot+esc(s.name||"")+'</b>'+
-          '<span class="muted">'+esc(s.detail||"")+link+'</span></div>'+
+          '<span class="muted">'+esc(s.detail||"")+link+loginBtn+'</span></div>'+
           (s.desc?'<div class="svc-desc">'+esc(s.desc)+'</div>':'')+'</div>';
       }).join("");
     }
