@@ -65,6 +65,7 @@ QBIT_PASS = os.environ.get("QBITTORRENT_PASS", "MediaFn2026")
 FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://flaresolverr:8191")
 PROXY_URL = os.environ.get("PROXY_URL", "")
 WEBHOOK_URL = os.environ.get("AUTOPILOT_WEBHOOK_URL", "").strip()
+QB_SAVE_PATH = os.environ.get("QB_SAVE_PATH", "")
 # 发现墙（🎯 发现 Tab）数据源：TMDB。免费的 v3 API Key 在 https://www.themoviedb.org/ 申请，
 # 在「配置」页的 TMDB API Key 一栏填写即可（落盘到 .env 并热更新，无需重建容器）。出网默认走与 FlareSolverr 相同的代理
 # （本 NAS 容器无直连外网，统一经 OpenClash）；若需直连可设 TMDB_PROXY=（空）。
@@ -1525,6 +1526,93 @@ def qbit_add_magnet(magnet, category=""):
     return False, "添加失败: %s" % last
 
 
+def qbit_get_save_path():
+    """读取 qB 当前默认下载/做种目录（preferences.save_path）。"""
+    try:
+        data = urlencode({"username": QBIT_USER, "password": QBIT_PASS}).encode()
+        req = Request(QBIT_URL + "/api/v2/auth/login", data=data,
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urlopen(req, timeout=10, context=SSL_CTX) as r:
+            ck = r.headers.get("Set-Cookie", "")
+        m = re.search(r"(QBT_SID_\d+=[^;]+)", ck) or re.search(r"(SID=[^;]+)", ck)
+        if not m:
+            return ""
+        cm = re.search(r"(csrftoken=[^;]+)", ck)
+        hdrs = {"Cookie": m.group(1) + ("; " + cm.group(1) if cm else "")}
+        if cm:
+            hdrs["X-Csrftoken"] = cm.group(1).split("=", 1)[1]
+        with urlopen(Request(QBIT_URL + "/api/v2/app/preferences", headers=hdrs),
+                     timeout=10, context=SSL_CTX) as r:
+            pref = json.loads(r.read().decode())
+        return pref.get("save_path", "")
+    except Exception:
+        return ""
+
+
+def qbit_set_save_path(path):
+    """经 qB v5 API 设置默认下载/做种目录（save_path + temp_path）。"""
+    path = (path or "").strip()
+    if not path:
+        return False, "路径为空"
+    try:
+        data = urlencode({"username": QBIT_USER, "password": QBIT_PASS}).encode()
+        req = Request(QBIT_URL + "/api/v2/auth/login", data=data,
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urlopen(req, timeout=10, context=SSL_CTX) as r:
+            ck = r.headers.get("Set-Cookie", "")
+    except Exception as e:
+        return False, "qB 登录失败: %s" % str(e)[:80]
+    m = re.search(r"(QBT_SID_\d+=[^;]+)", ck) or re.search(r"(SID=[^;]+)", ck)
+    if not m:
+        return False, "未拿到 qB 会话"
+    cm = re.search(r"(csrftoken=[^;]+)", ck)
+    hdrs = {"Cookie": m.group(1) + ("; " + cm.group(1) if cm else ""),
+            "Content-Type": "application/x-www-form-urlencoded"}
+    if cm:
+        hdrs["X-Csrftoken"] = cm.group(1).split("=", 1)[1]
+    body = urlencode({"json": json.dumps({"save_path": path, "temp_path": path})}).encode()
+    try:
+        with urlopen(Request(QBIT_URL + "/api/v2/app/setPreferences", data=body, headers=hdrs),
+                     timeout=10, context=SSL_CTX) as r:
+            r.read()
+    except Exception as e:
+        return False, "设置失败: %s" % str(e)[:80]
+    return True, "已设置 qB 下载目录为 " + path
+
+
+def radarr_ensure_rootfolder(path):
+    """尽力在 Radarr 注册根目录；已存在（含 400）则视为已注册，失败返回原因（不阻断主流程）。"""
+    try:
+        rfs = r_req("GET", "/api/v3/rootfolder") or []
+        if any((r.get("path") or "").rstrip("/") == path.rstrip("/") for r in rfs):
+            return True, "已存在"
+        r_req("POST", "/api/v3/rootfolder", {"path": path})
+        return True, "已注册"
+    except urllib.error.HTTPError as ex:
+        # 400 多为「路径已存在」或「路径在容器内不存在」——都视为无需重复注册。
+        if getattr(ex, "code", 0) == 400:
+            return True, "已存在或路径在容器内无效"
+        return False, ("HTTP %s" % getattr(ex, "code", "?"))[:80]
+    except Exception as e:
+        return False, str(e)[:80]
+
+
+def sonarr_ensure_rootfolder(path):
+    """尽力在 Sonarr 注册根目录；已存在（含 400）则视为已注册，失败返回原因（不阻断主流程）。"""
+    try:
+        rfs = s_req("GET", "/api/v3/rootfolder") or []
+        if any((r.get("path") or "").rstrip("/") == path.rstrip("/") for r in rfs):
+            return True, "已存在"
+        s_req("POST", "/api/v3/rootfolder", {"path": path})
+        return True, "已注册"
+    except urllib.error.HTTPError as ex:
+        if getattr(ex, "code", 0) == 400:
+            return True, "已存在或路径在容器内无效"
+        return False, ("HTTP %s" % getattr(ex, "code", "?"))[:80]
+    except Exception as e:
+        return False, str(e)[:80]
+
+
 def _flaresolverr_status():
     if not FLARESOLVERR_URL:
         return False, "未配置"
@@ -1671,9 +1759,16 @@ def net_test():
             "proxy_configured": bool(PROXY_URL)}
 
 
+def _config_values():
+    """汇总当前所有可配置项（含实时读取的 qB 下载目录），供 GET/POST 回显复用。"""
+    return {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
+            "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL,
+            "QB_SAVE_PATH": qbit_get_save_path() or QB_SAVE_PATH,
+            "MOVIE_ROOT": ROOT_FOLDER, "TV_ROOT": TV_ROOT}
+
+
 def config_get():
-    return {"ok": True, "values": {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
-                                    "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL}}
+    return {"ok": True, "values": _config_values()}
 
 
 def config_save(body_str):
@@ -1682,7 +1777,9 @@ def config_save(body_str):
     except Exception:
         return 400, {"ok": False, "error": "请求体解析失败"}
     global PROXY_URL, TMDB_PROXY, TMDB_KEY, TOKEN, WEBHOOK_URL
+    global QB_SAVE_PATH, ROOT_FOLDER, TV_ROOT
     updates = {}
+    notes = []
     proxy_changed = False
     # 仅当字段出现在请求体时才处理，避免「部分保存」误清其它设置。
     if "proxy_url" in data:
@@ -1716,10 +1813,24 @@ def config_save(body_str):
     if "webhook_url" in data:
         # 抓取完成通知：留空=关闭；填写=开启。写入 AUTOPILOT_WEBHOOK_URL 并即时更新运行态。
         updates["AUTOPILOT_WEBHOOK_URL"] = (data.get("webhook_url") or "").strip()
+    if "qb_save_path" in data:
+        # 第一层：qB 实际下载/做种目录。写 .env 持久化意图，并经 qB API 实时生效。
+        # 留空=不改动（避免仅改代理时把已配置的目录清空）。
+        path = (data.get("qb_save_path") or "").strip()
+        if path:
+            updates["QB_SAVE_PATH"] = path
+    if "movie_root" in data:
+        # 第二层：电影库默认根目录。写 .env、热更新运行态，并向 Radarr 注册根目录。
+        path = (data.get("movie_root") or "").strip()
+        if path:
+            updates["MOVIE_ROOT"] = path
+    if "tv_root" in data:
+        # 第二层：剧集库默认根目录。写 .env、热更新运行态，并向 Sonarr 注册根目录。
+        path = (data.get("tv_root") or "").strip()
+        if path:
+            updates["TV_ROOT"] = path
     if not updates:
-        return 200, {"ok": True, "wrote": False,
-                     "values": {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
-                                "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL}}
+        return 200, {"ok": True, "wrote": False, "values": _config_values()}
     wrote = _write_env_file(MEDIA_ENV, updates)
     # squid 与 autopilot 共享宿主 .env：MEDIA_ENV 多半就是它；否则额外写候选路径
     for cand in _SQUID_ENV_CANDIDATES:
@@ -1736,12 +1847,33 @@ def config_save(body_str):
         TOKEN = (data.get("auth_token") or "").strip()
     if "webhook_url" in data:
         WEBHOOK_URL = (data.get("webhook_url") or "").strip()
+    if "qb_save_path" in data:
+        path = (data.get("qb_save_path") or "").strip()
+        if path:
+            QB_SAVE_PATH = path
+            # 经 qB v5 API 实时设置默认下载/做种目录；失败仅记一笔，不阻断整体保存。
+            ok, msg = qbit_set_save_path(QB_SAVE_PATH)
+            notes.append("qB 下载目录: " + msg)
+    if "movie_root" in data:
+        path = (data.get("movie_root") or "").strip()
+        if path:
+            ROOT_FOLDER = path
+            # 向 Radarr 注册根目录（已存在则跳过），失败不阻断。
+            ok, msg = radarr_ensure_rootfolder(ROOT_FOLDER)
+            notes.append("电影库根目录: " + msg)
+    if "tv_root" in data:
+        path = (data.get("tv_root") or "").strip()
+        if path:
+            TV_ROOT = path
+            ok, msg = sonarr_ensure_rootfolder(TV_ROOT)
+            notes.append("剧集库根目录: " + msg)
     # 代理状态变化（设置或清空）都重启 squid，使 never_direct/always_direct 与 .env 一致
     if proxy_changed:
         _restart_container("proxy-forwarder")
-    return 200, {"ok": True, "wrote": wrote,
-                 "values": {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
-                            "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL}}
+    resp = {"ok": True, "wrote": wrote, "values": _config_values()}
+    if notes:
+        resp["notes"] = notes
+    return 200, resp
 
 
 # 系统状态缓存：探测一次约 10~30s（两次 pageSize=1000 大列表 + 三次外部探测），
@@ -2277,6 +2409,15 @@ PAGE = """<!doctype html>
         <button class="btn ghost" onclick="apTestWebhook()">发送测试通知</button>
         <span class="muted" id="apWhStatus"></span>
       </div>
+    </div>
+    <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
+      <div class="muted" style="margin-bottom:8px">下载目录（两层）</div>
+      <label class="cfg-row" style="display:block;margin:8px 0"><span>① qB 下载/做种目录</span>
+        <input id="ap_QB_SAVE_PATH" style="width:100%;margin-top:4px;padding:8px" placeholder="Torrent 实际落盘与做种处，如 /data/下载/media；须落在 qB 挂载内否则硬链接失效"></label>
+      <label class="cfg-row" style="display:block;margin:8px 0"><span>② 电影库默认根目录</span>
+        <input id="ap_MOVIE_ROOT" style="width:100%;margin-top:4px;padding:8px" placeholder="Radarr 导入落盘位置（每次添加的默认选中项），如 /data/影视/电影"></label>
+      <label class="cfg-row" style="display:block;margin:8px 0"><span>③ 剧集库默认根目录</span>
+        <input id="ap_TV_ROOT" style="width:100%;margin-top:4px;padding:8px" placeholder="Sonarr 导入落盘位置，如 /data/影视/剧集"></label>
     </div>
     <div class="row" style="margin-top:12px">
       <button class="btn" id="apCfgSave" onclick="apSaveConfig()">保存</button>
@@ -3138,6 +3279,9 @@ function apLoadConfig(){
     document.getElementById("ap_TMDB_KEY").value=v.TMDB_KEY||"";
     const tokEl=document.getElementById("ap_AUTH_TOKEN"); if(tokEl)tokEl.value=v.AUTH_TOKEN||"";
     const whEl=document.getElementById("ap_WEBHOOK_URL"); if(whEl)whEl.value=v.WEBHOOK_URL||"";
+    const qbEl=document.getElementById("ap_QB_SAVE_PATH"); if(qbEl)qbEl.value=v.QB_SAVE_PATH||"";
+    const mvEl=document.getElementById("ap_MOVIE_ROOT"); if(mvEl)mvEl.value=v.MOVIE_ROOT||"";
+    const tvEl=document.getElementById("ap_TV_ROOT"); if(tvEl)tvEl.value=v.TV_ROOT||"";
     if(st)st.textContent="已加载";
   }).catch(e=>{ if(st)st.textContent="加载失败："+e; });
 }
@@ -3148,11 +3292,15 @@ function apSaveConfig(){
     proxy_url:document.getElementById("ap_PROXY_URL").value.trim(),
     tmdb_key:document.getElementById("ap_TMDB_KEY").value.trim(),
     auth_token:document.getElementById("ap_AUTH_TOKEN").value.trim(),
-    webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim()
+    webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim(),
+    qb_save_path:document.getElementById("ap_QB_SAVE_PATH").value.trim(),
+    movie_root:document.getElementById("ap_MOVIE_ROOT").value.trim(),
+    tv_root:document.getElementById("ap_TV_ROOT").value.trim()
   };
   jpost("/api/config", payload).then(d=>{
-    if(d&&d.ok){ if(st)st.textContent="已保存，出口代理重启中…"; toast("配置已写入");
-      if(d.values&&d.values.AUTH_TOKEN!==undefined){ TOKEN=d.values.AUTH_TOKEN||""; } }
+    if(d&&d.ok){ if(st)st.textContent="已保存"; toast("配置已写入");
+      if(d.values&&d.values.AUTH_TOKEN!==undefined){ TOKEN=d.values.AUTH_TOKEN||""; }
+      if(d.notes&&d.notes.length){ toast(d.notes.join("；"),"ok"); } }
     else { if(st)st.textContent="保存失败："+(d&&d.error||"未知"); toast("保存失败："+(d&&d.error||""),"err"); }
   }).catch(e=>{ if(st)st.textContent="保存失败："+e; toast("保存失败："+e,"err"); });
 }
