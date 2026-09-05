@@ -348,6 +348,21 @@ def search_candidates(term):
 
 
 # ---------- 发现墙（TMDB 热门/热映/即将上映/高分） ----------
+def _friendly_net_err(raw):
+    """把 urllib 底层连接类异常翻译成对用户友好的出网提示，避免甩 raw 报错。
+    命中连接/SSL/超时/DNS 等网络层失败时，统一提示去「出网配置」填代理刷新。"""
+    s = (raw or "").lower()
+    conn_kw = ["remote end closed", "connection reset", "connection refused",
+               "timed out", "timeout", "getaddrinfo", "name or service not known",
+               "nodename nor servname", "errno", "ssl", "certificate", "handshake",
+               "unexpected eof", "urlopen error", "remotedisconnected", "badstatusline",
+               "connection aborted", "network is unreachable", "no route to host",
+               "connection closed", "broken pipe"]
+    if any(k in s for k in conn_kw):
+        return "外网未连通：请在「出网配置」填写境外 HTTP 代理（UPSTREAM_PROXY）后刷新本页；若已填写请确认该代理当前可达。"
+    return "TMDB 请求失败（%s），请稍后重试。" % (raw or "")[:80]
+
+
 def tmdb_get(path, params=None):
     """带 api_key 的 TMDB v3 GET；返回 (data, err)。err 为空表示成功。"""
     if not TMDB_KEY:
@@ -374,7 +389,7 @@ def tmdb_get(path, params=None):
             # 4xx/5xx 是确定错误，不重试
             return None, "TMDB HTTP %s: %s" % (ex.code, ex.reason)
         except Exception as e:
-            last_err = str(e)[:160]
+            last_err = _friendly_net_err(str(e))
             if attempt < 3:
                 time.sleep(0.8)
     return None, last_err
@@ -509,7 +524,7 @@ def tmdb_discover(kind="movie", cat="popular", page=1, genre=None, country=None,
         total_results_list.append(data.get("total_results", 0))
     if not per_type:
         return {"ok": False, "configured": True,
-                "error": "全部子查询失败（电影/剧集 TMDB 请求均失败），可能是出网抖动，请稍后重试或点「刷新」。"}
+                "error": "外网未连通：请在「出网配置」填写境外 HTTP 代理（UPSTREAM_PROXY）后刷新本页；若已填写请确认代理可达。"}
     # 交错合并，避免电影/剧集各自成块
     merged = []
     maxlen = max((len(x) for x in per_type), default=0)
