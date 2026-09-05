@@ -20,11 +20,30 @@
 ```bash
 git clone <本仓库> media-stack
 cd media-stack
+./deploy.sh          # 推荐：自动取宿主 uid/gid、统一目录属主、拉起服务
+```
+
+`deploy.sh` 会自动把 `PUID`/`PGID` 设为「持有本目录的宿主用户」身份，并把整个项目目录 `chown` 成同一身份——这样容器内 Radarr/Sonarr/Prowlarr/QBittorrent 才能正常写库。**换任何机器直接 `./deploy.sh` 即可，无需手改。**
+
+若不想用脚本，也可手动：
+
+```bash
 cp .env.example .env
+# 编辑 .env，把 PUID/PGID 改成你的 `id -u` / `id -g`（默认 1000）
 docker compose up -d
 ```
 
 打开 `http://<本机IP>:8787`。
+
+## 权限（很重要，避免 500 报错）
+
+Radarr / Sonarr / Prowlarr / QBittorrent 是 linuxserver 镜像，以 `PUID`/`PGID` 指定的用户身份运行并写库。
+**必须让 `PUID`/`PGID` 与「持有本项目目录的宿主用户」uid/gid 一致**，否则容器写不进卷 →
+`attempt to write a readonly database` → 添加影片等写操作报 HTTP 500。
+
+- `./deploy.sh` 已自动处理（取宿主 uid/gid + chown），正常不会遇到。
+- 手动部署务必先 `id -u` / `id -g` 填进 `.env` 的 `PUID`/`PGID`；默认 `1000` 仅在宿主用户正好是 uid 1000 时有效。
+- 常见翻车场景：用 `sudo` 跑过 docker、或手动 `chown` 过项目目录，导致卷属主与容器 uid 对不上。统一成同一个 uid 即可恢复。
 
 ## 配置境外外网访问
 

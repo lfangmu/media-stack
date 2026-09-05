@@ -1,7 +1,13 @@
 # 影视下载台 · media 栈
-# 用法： cp .env.example .env  &&  docker compose up -d
+# 用法（推荐）：  ./deploy.sh          # 自动取宿主 uid/gid，避免容器与卷权限不匹配
+# 或手动：       cp .env.example .env  &&  docker compose up -d
 # 起来后打开 http://<本机IP>:8787 ，在页面填入你的境外 HTTP 代理即可出外网。
 # 不填 = 直连出网（无需代理）；仅当宿主机本身无法直连外网时，才在此填代理。
+#
+# ⚠️ 权限（重要）：Radarr/Sonarr/Prowlarr/QBittorrent 是 linuxserver 镜像，以 PUID/PGID
+# 指定的用户身份运行并写库。务必让 PUID/PGID 与「持有本项目目录的宿主用户」一致，
+# 否则会出现 "attempt to write a readonly database" 的 500 报错（容器 uid ≠ 卷属主 uid）。
+# ./deploy.sh 会自动处理；手动部署请先 `id -u` / `id -g` 填入下方 PUID/PGID（默认 1000）。
 
 services:
   # ---- 出网出口（HTTP 代理转发器）----
@@ -74,6 +80,8 @@ services:
     image: lscr.io/linuxserver/prowlarr:latest
     container_name: media-prowlarr
     environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - HTTP_PROXY=http://proxy-forwarder:3128
       - HTTPS_PROXY=http://proxy-forwarder:3128
     ports:
@@ -87,6 +95,8 @@ services:
     image: lscr.io/linuxserver/radarr:latest
     container_name: media-radarr
     environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - HTTP_PROXY=http://proxy-forwarder:3128
       - HTTPS_PROXY=http://proxy-forwarder:3128
     ports:
@@ -100,6 +110,8 @@ services:
     image: lscr.io/linuxserver/sonarr:latest
     container_name: media-sonarr
     environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - HTTP_PROXY=http://proxy-forwarder:3128
       - HTTPS_PROXY=http://proxy-forwarder:3128
     ports:
@@ -113,6 +125,8 @@ services:
     image: lscr.io/linuxserver/qbittorrent:latest
     container_name: media-qbittorrent
     environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - WEBUI_PORT=8085
       # 持久化 WebUI 管理员账号，避免匿名 /config 卷重启后丢失密码 → 系统状态红灯
       - WEBUI_USERNAME=admin
