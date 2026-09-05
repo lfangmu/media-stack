@@ -8,7 +8,7 @@
 #   GITHUB_TOKEN=ghp_xxx bash <(curl -sSL https://raw.githubusercontent.com/lfangmu/media-stack/main/install.sh)
 #
 # 本脚本只负责「把整套 docker-compose 栈拉起来」：
-#   1) 安装 docker 与 docker compose 插件（缺失时，走官方 get.docker.com）
+#   1) 安装 docker 与 docker compose 插件（缺失时，走 https://linuxmirrors.cn/docker.sh 镜像脚本）
 #   2) 安装 git（克隆仓库用）
 #   3) 把仓库克隆到 MEDIA_ROOT（默认 /opt/media）
 #   4) 由 .env.example 生成 .env，并交互填入 TMDB Key / 出网代理 / 访问令牌 / 下载目录
@@ -116,9 +116,9 @@ ensure_docker() {
   if command -v docker >/dev/null 2>&1; then
     log "docker 已存在: $(docker --version 2>/dev/null | head -1)"
   else
-    log "未检测到 docker，安装中（官方 get.docker.com）…"
+    log "未检测到 docker，安装中（linuxmirrors.cn 镜像脚本）…"
     confirm "将安装 docker，继续？" || die "已取消"
-    run "curl -fsSL https://get.docker.com | sh"
+    run "bash <(curl -sSL https://linuxmirrors.cn/docker.sh)"
   fi
   # compose 插件
   if docker compose version >/dev/null 2>&1; then
