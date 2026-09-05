@@ -2777,7 +2777,7 @@ function loadSystem(){
         const link=port?'<a class="slink" href="'+scheme+'://'+location.hostname+':'+port+
                    '" target="_blank" rel="noopener noreferrer">打开 ↗</a>':'';
         const loginBtn=(s.key==='radarr'||s.key==='sonarr'||s.key==='prowlarr')?
-          '<button class="btn ghost" style="margin-left:6px;padding:2px 8px;font-size:12px" onclick="svcLogin(\''+s.key+'\','+port+')">一键登录</button>':'';
+          '<button class="btn ghost" style="margin-left:6px;padding:2px 8px;font-size:12px" onclick="svcLogin('+JSON.stringify(s.key)+','+port+')">一键登录</button>':'';
         return '<div class="queue-item"><div class="top"><b>'+dot+esc(s.name||"")+'</b>'+
           '<span class="muted">'+esc(s.detail||"")+link+loginBtn+'</span></div>'+
           (s.desc?'<div class="svc-desc">'+esc(s.desc)+'</div>':'')+'</div>';
