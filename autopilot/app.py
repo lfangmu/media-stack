@@ -1301,6 +1301,98 @@ def enable_indexer(name):
     return True, "已重新启用「%s」" % name
 
 
+# ---------- 索引器自动播种（幂等） ----------
+SEED_INDEXER_NAMES = [
+    "YTS", "Knaben", "The Pirate Bay", "Uindex",
+    "TorrentsCSV", "LimeTorrents", "Anibt",
+]
+
+
+def seed_indexers():
+    """幂等播种：自动补齐 7 个公共索引器（只加缺失的，已存在的跳过）。
+
+    - 仅当 Prowlarr 一个都没有时才全量播种；已有部分时只补缺失项，
+      因此出口（egress）抖动导致首轮只加上几个时，后续重试会把剩下的补齐。
+    - Prowlarr 加索引器会做连通性测试，站点不可达（如出口暂断/被 Cloudflare 拦）
+      会 400，此时安全跳过并记日志，不阻塞 autopilot 启动、不影响已配置内容。
+    - 返回 (added, skipped, errors, all_present)。
+    """
+    if not (PROWLARR_URL and get_prowlarr_key()):
+        return 0, 0, ["Prowlarr 未配置，跳过播种"], False
+    try:
+        existing = p_req("GET", "/api/v1/indexer") or []
+    except Exception as e:
+        return 0, 0, ["读取现有索引器失败: %s" % e], False
+    existing_names = {(i.get("name") or "").strip().lower() for i in existing}
+    try:
+        schema = p_req("GET", "/api/v1/indexer/schema") or []
+    except Exception as e:
+        return 0, 0, ["读取 schema 失败: %s" % e], False
+    by_name = {}
+    for s in schema:
+        by_name[(s.get("name") or "").strip().lower()] = s
+    added = skipped = 0
+    errors = []
+    for name in SEED_INDEXER_NAMES:
+        key = name.strip().lower()
+        if key in existing_names:
+            continue  # 已配置，跳过
+        entry = by_name.get(key)
+        if not entry:
+            errors.append("schema 中未找到 «%s»" % name)
+            continue
+        payload = dict(entry)
+        payload.pop("id", None)          # 新建索引器不带 id
+        payload["enable"] = True
+        payload["appProfileId"] = 1      # GET /api/v1/appprofile -> id=1 "Standard"
+        try:
+            p_req("POST", "/api/v1/indexer", payload)
+            added += 1
+            existing_names.add(key)
+            print("[seed] 已添加索引器 «%s»" % name, flush=True)
+        except urllib.error.HTTPError as ex:
+            msg = ""
+            try:
+                body = json.loads(ex.read().decode("utf-8"))
+                if isinstance(body, list):
+                    msg = "；".join(x.get("errorMessage", "") for x in body if x.get("errorMessage"))
+                elif isinstance(body, dict):
+                    msg = body.get("message", "")
+            except Exception:
+                pass
+            skipped += 1
+            errors.append("跳过 «%s»（连通性测试未过%s）" % (name, ("：" + msg) if msg else ""))
+            print("[seed] 跳过 «%s»：%s" % (name, msg or "连通性测试未过"), flush=True)
+        except Exception as e:
+            skipped += 1
+            errors.append("添加 «%s» 失败: %s" % (name, e))
+    all_present = all(n.strip().lower() in existing_names for n in SEED_INDEXER_NAMES)
+    if added:
+        print("[seed] 本次新增 %d 个索引器，Prowlarr 会自动同步到 Radarr/Sonarr" % added, flush=True)
+    return added, skipped, errors, all_present
+
+
+def seed_indexers_loop(max_retries=20, wait=15):
+    """后台守护线程：等 Prowlarr 就绪后幂等补齐 7 个公共索引器。
+
+    出口（egress）偶发中断时连通性测试会失败，这里按固定间隔重试，
+    覆盖看门狗自愈窗口；全部补齐或次数用尽后停止（下次 autopilot 重启会再来一遍）。
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            if PROWLARR_URL and get_prowlarr_key():
+                added, skipped, errors, all_present = seed_indexers()
+                for e in errors:
+                    print("[seed] %s" % e, flush=True)
+                if added or all_present:
+                    break
+        except Exception as e:
+            print("[seed] 第 %d 次尝试异常: %s" % (attempt, e), flush=True)
+        if attempt < max_retries:
+            time.sleep(wait)
+    print("[seed] 播种流程结束", flush=True)
+
+
 # ---------- 各服务健康探测 ----------
 def _uptime():
     s = int(time.time() - _START_TS)
@@ -3340,6 +3432,8 @@ def main():
     if WEBHOOK_URL:
         threading.Thread(target=webhook_watcher, args=(30,), daemon=True).start()
         print("[autopilot] webhook watcher -> %s" % WEBHOOK_URL)
+    threading.Thread(target=seed_indexers_loop, kwargs={"max_retries": 20, "wait": 15}, daemon=True).start()
+    print("[autopilot] indexer seeder -> 后台幂等补齐 7 个公共索引器", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), H)
     print("[autopilot] listening on :%d  RADARR_URL=%s" % (LISTEN_PORT, RADARR_URL))
     server.serve_forever()
