@@ -80,6 +80,11 @@ LISTEN_PORT = int(os.environ.get("AUTOPILOT_PORT", "8787"))
 TOKEN = os.environ.get("AUTOPILOT_TOKEN", "").strip()
 ROOT_FOLDER = os.environ.get("MOVIE_ROOT", "/movies")
 TV_ROOT = os.environ.get("TV_ROOT", "/tv")
+# 「配置」页「添加默认设置」：留空=回退到自动逻辑（pick_profile 选首个 1080p/HD 档、radarr_root 选首个已配置根目录）
+DEFAULT_MOVIE_PROFILE_ID = os.environ.get("DEFAULT_MOVIE_PROFILE_ID", "").strip()
+DEFAULT_TV_PROFILE_ID = os.environ.get("DEFAULT_TV_PROFILE_ID", "").strip()
+DEFAULT_MOVIE_ROOT = os.environ.get("DEFAULT_MOVIE_ROOT", "").strip()
+DEFAULT_TV_ROOT = os.environ.get("DEFAULT_TV_ROOT", "").strip()
 # 系统状态里要探测的其余服务（都在同一 compose 网络内，用服务名访问）
 QBIT_URL = os.environ.get("QBITTORRENT_URL", "http://qbittorrent:8085")
 QBIT_USER = os.environ.get("QBITTORRENT_USER", "admin")
@@ -134,7 +139,7 @@ def _apply_env_file_overrides():
                 kv[k.strip()] = v.strip()
     except Exception:
         return
-    global TMDB_KEY, PROXY_URL, TMDB_PROXY, ROOT_FOLDER, TV_ROOT
+    global TMDB_KEY, PROXY_URL, TMDB_PROXY, ROOT_FOLDER, TV_ROOT, DEFAULT_MOVIE_PROFILE_ID, DEFAULT_TV_PROFILE_ID, DEFAULT_MOVIE_ROOT, DEFAULT_TV_ROOT
     if "TMDB_API_KEY" in kv:
         TMDB_KEY = kv["TMDB_API_KEY"]
     if "PROXY_URL" in kv:
@@ -148,6 +153,14 @@ def _apply_env_file_overrides():
         ROOT_FOLDER = kv["MOVIE_ROOT"]
     if "TV_ROOT" in kv and kv["TV_ROOT"]:
         TV_ROOT = kv["TV_ROOT"]
+    if "DEFAULT_MOVIE_PROFILE_ID" in kv:
+        DEFAULT_MOVIE_PROFILE_ID = kv["DEFAULT_MOVIE_PROFILE_ID"].strip()
+    if "DEFAULT_TV_PROFILE_ID" in kv:
+        DEFAULT_TV_PROFILE_ID = kv["DEFAULT_TV_PROFILE_ID"].strip()
+    if "DEFAULT_MOVIE_ROOT" in kv:
+        DEFAULT_MOVIE_ROOT = kv["DEFAULT_MOVIE_ROOT"].strip()
+    if "DEFAULT_TV_ROOT" in kv:
+        DEFAULT_TV_ROOT = kv["DEFAULT_TV_ROOT"].strip()
 
 
 _apply_env_file_overrides()
@@ -248,6 +261,14 @@ def pick_profile(name=None):
         for p in profs:
             if name.lower() in (p.get("name") or "").lower():
                 return p["id"]
+    # 配置页指定的默认电影画质档优先（需确实存在于 profiles，避免指向已删除档）
+    if DEFAULT_MOVIE_PROFILE_ID:
+        try:
+            did = int(DEFAULT_MOVIE_PROFILE_ID)
+            if any(p["id"] == did for p in profs):
+                return did
+        except Exception:
+            pass
     for p in profs:
         n = (p.get("name") or "").lower()
         if "1080" in n:
@@ -294,6 +315,14 @@ def pick_series_profile(name=None):
         for p in profs:
             if name.lower() in (p.get("name") or "").lower():
                 return p["id"]
+    # 配置页指定的默认剧集画质档优先（需确实存在于 profiles）
+    if DEFAULT_TV_PROFILE_ID:
+        try:
+            did = int(DEFAULT_TV_PROFILE_ID)
+            if any(p["id"] == did for p in profs):
+                return did
+        except Exception:
+            pass
     for p in profs:
         if "1080" in (p.get("name") or "").lower():
             return p["id"]
@@ -309,6 +338,12 @@ def sonarr_root():
     try:
         rfs = s_req("GET", "/api/v3/rootfolder") or []
         if rfs:
+            # 配置页指定的默认剧集根目录优先（需确实存在于已配置根目录，否则回退自动逻辑）
+            if DEFAULT_TV_ROOT:
+                d = DEFAULT_TV_ROOT.rstrip("/")
+                for r in rfs:
+                    if (r.get("path") or "").rstrip("/") == d:
+                        return DEFAULT_TV_ROOT
             for r in rfs:
                 if (r.get("path") or "").rstrip("/") == TV_ROOT.rstrip("/"):
                     return TV_ROOT
@@ -325,6 +360,12 @@ def radarr_root():
     try:
         rfs = r_req("GET", "/api/v3/rootfolder") or []
         if rfs:
+            # 配置页指定的默认电影根目录优先（需确实存在于已配置根目录，否则回退自动逻辑）
+            if DEFAULT_MOVIE_ROOT:
+                d = DEFAULT_MOVIE_ROOT.rstrip("/")
+                for r in rfs:
+                    if (r.get("path") or "").rstrip("/") == d:
+                        return DEFAULT_MOVIE_ROOT
             for r in rfs:
                 if (r.get("path") or "").rstrip("/") == ROOT_FOLDER.rstrip("/"):
                     return ROOT_FOLDER
@@ -2194,7 +2235,11 @@ def net_test():
 def _config_values():
     """汇总当前所有可配置项（含实时读取的 qB 下载目录），供 GET/POST 回显复用。"""
     return {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
-            "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL}
+            "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL,
+            "MOVIE_PROFILE_ID": DEFAULT_MOVIE_PROFILE_ID,
+            "TV_PROFILE_ID": DEFAULT_TV_PROFILE_ID,
+            "MOVIE_ROOT": DEFAULT_MOVIE_ROOT,
+            "TV_ROOT_CFG": DEFAULT_TV_ROOT}
 
 
 def config_get():
@@ -2206,7 +2251,7 @@ def config_save(body_str):
         data = json.loads(body_str or "{}")
     except Exception:
         return 400, {"ok": False, "error": "请求体解析失败"}
-    global PROXY_URL, TMDB_PROXY, TMDB_KEY, TOKEN, WEBHOOK_URL
+    global PROXY_URL, TMDB_PROXY, TMDB_KEY, TOKEN, WEBHOOK_URL, DEFAULT_MOVIE_PROFILE_ID, DEFAULT_TV_PROFILE_ID, DEFAULT_MOVIE_ROOT, DEFAULT_TV_ROOT
     updates = {}
     notes = []
     proxy_changed = False
@@ -2242,6 +2287,13 @@ def config_save(body_str):
     if "webhook_url" in data:
         # 抓取完成通知：留空=关闭；填写=开启。写入 AUTOPILOT_WEBHOOK_URL 并即时更新运行态。
         updates["AUTOPILOT_WEBHOOK_URL"] = (data.get("webhook_url") or "").strip()
+    # 添加默认设置：画质档 / 根目录，留空=回退自动逻辑（写入 .env 持久化）
+    for fld, envk in (("movie_profile_id", "DEFAULT_MOVIE_PROFILE_ID"),
+                      ("tv_profile_id", "DEFAULT_TV_PROFILE_ID"),
+                      ("movie_root", "DEFAULT_MOVIE_ROOT"),
+                      ("tv_root", "DEFAULT_TV_ROOT")):
+        if fld in data:
+            updates[envk] = (data.get(fld) or "").strip()
     if not updates:
         return 200, {"ok": True, "wrote": False, "values": _config_values()}
     wrote = _write_env_file(MEDIA_ENV, updates)
@@ -2260,6 +2312,14 @@ def config_save(body_str):
         TOKEN = (data.get("auth_token") or "").strip()
     if "webhook_url" in data:
         WEBHOOK_URL = (data.get("webhook_url") or "").strip()
+    if "movie_profile_id" in data:
+        DEFAULT_MOVIE_PROFILE_ID = (data.get("movie_profile_id") or "").strip()
+    if "tv_profile_id" in data:
+        DEFAULT_TV_PROFILE_ID = (data.get("tv_profile_id") or "").strip()
+    if "movie_root" in data:
+        DEFAULT_MOVIE_ROOT = (data.get("movie_root") or "").strip()
+    if "tv_root" in data:
+        DEFAULT_TV_ROOT = (data.get("tv_root") or "").strip()
     # 代理状态变化（设置或清空）都重启 squid，使 never_direct/always_direct 与 .env 一致
     if proxy_changed:
         _restart_container("proxy-forwarder")
@@ -2837,6 +2897,17 @@ PAGE = """<!doctype html>
         <button class="btn ghost" onclick="apTestWebhook()">发送测试通知</button>
         <span class="muted" id="apWhStatus"></span>
       </div>
+    </div>
+    <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
+      <div class="muted" style="margin-bottom:8px">添加默认设置（留空=自动：画质选首个 1080p/HD 档，根目录选已配置的首个）</div>
+      <label class="cfg-row" style="display:block;margin:8px 0"><span>默认电影画质档</span>
+        <select id="ap_MOVIE_PROFILE_ID" style="width:100%;margin-top:4px;padding:8px"></select></label>
+      <label class="cfg-row" style="display:block;margin:8px 0"><span>默认剧集画质档</span>
+        <select id="ap_TV_PROFILE_ID" style="width:100%;margin-top:4px;padding:8px"></select></label>
+      <label class="cfg-row" style="display:block;margin:8px 0"><span>默认电影根目录</span>
+        <select id="ap_MOVIE_ROOT" style="width:100%;margin-top:4px;padding:8px"></select></label>
+      <label class="cfg-row" style="display:block;margin:8px 0"><span>默认剧集根目录</span>
+        <select id="ap_TV_ROOT" style="width:100%;margin-top:4px;padding:8px"></select></label>
     </div>
     <div class="row" style="margin-top:12px">
       <button class="btn" id="apCfgSave" onclick="apSaveConfig()">保存</button>
@@ -3738,7 +3809,15 @@ function apLoadConfig(){
     document.getElementById("ap_TMDB_KEY").value=v.TMDB_KEY||"";
     const tokEl=document.getElementById("ap_AUTH_TOKEN"); if(tokEl)tokEl.value=v.AUTH_TOKEN||"";
     const whEl=document.getElementById("ap_WEBHOOK_URL"); if(whEl)whEl.value=v.WEBHOOK_URL||"";
+    const mp=document.getElementById("ap_MOVIE_PROFILE_ID"); if(mp)mp.value=v.MOVIE_PROFILE_ID||"";
+    const tp=document.getElementById("ap_TV_PROFILE_ID"); if(tp)tp.value=v.TV_PROFILE_ID||"";
+    const mr=document.getElementById("ap_MOVIE_ROOT"); if(mr)mr.value=v.MOVIE_ROOT||"";
+    const tr=document.getElementById("ap_TV_ROOT"); if(tr)tr.value=v.TV_ROOT_CFG||"";
     if(st)st.textContent="已加载";
+    apFillProfiles("movie","ap_MOVIE_PROFILE_ID",v.MOVIE_PROFILE_ID||"");
+    apFillProfiles("tv","ap_TV_PROFILE_ID",v.TV_PROFILE_ID||"");
+    apFillRoots("movie","ap_MOVIE_ROOT",v.MOVIE_ROOT||"");
+    apFillRoots("tv","ap_TV_ROOT",v.TV_ROOT_CFG||"");
   }).catch(e=>{ if(st)st.textContent="加载失败："+e; });
 }
 function apSaveConfig(){
@@ -3748,7 +3827,11 @@ function apSaveConfig(){
     proxy_url:document.getElementById("ap_PROXY_URL").value.trim(),
     tmdb_key:document.getElementById("ap_TMDB_KEY").value.trim(),
     auth_token:document.getElementById("ap_AUTH_TOKEN").value.trim(),
-    webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim()
+    webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim(),
+    movie_profile_id:document.getElementById("ap_MOVIE_PROFILE_ID").value,
+    tv_profile_id:document.getElementById("ap_TV_PROFILE_ID").value,
+    movie_root:document.getElementById("ap_MOVIE_ROOT").value,
+    tv_root:document.getElementById("ap_TV_ROOT").value
   };
   jpost("/api/config", payload).then(d=>{
     if(d&&d.ok){ if(st)st.textContent="已保存"; toast("配置已写入");
@@ -3756,6 +3839,26 @@ function apSaveConfig(){
       if(d.notes&&d.notes.length){ toast(d.notes.join("；"),"ok"); } }
     else { if(st)st.textContent="保存失败："+(d&&d.error||"未知"); toast("保存失败："+(d&&d.error||""),"err"); }
   }).catch(e=>{ if(st)st.textContent="保存失败："+e; toast("保存失败："+e,"err"); });
+}
+function apFillProfiles(kind, selId, selected){
+  const sel=document.getElementById(selId); if(!sel)return;
+  jget("/api/profiles?kind="+kind).then(d=>{
+    const items=(d&&d.profiles)||[];
+    const cur=sel.value||selected||"";
+    sel.innerHTML='<option value="">自动（首个 1080p/HD 档）</option>'+
+      items.map(p=>'<option value="'+p.id+'">'+esc(p.name)+'</option>').join("");
+    sel.value=cur;
+  }).catch(()=>{});
+}
+function apFillRoots(kind, selId, selected){
+  const sel=document.getElementById(selId); if(!sel)return;
+  jget("/api/rootfolders?kind="+kind).then(d=>{
+    const items=(d&&d.rootfolders)||[];
+    const cur=sel.value||selected||"";
+    sel.innerHTML='<option value="">自动（已配置的首个根目录）</option>'+
+      items.map(r=>'<option value="'+esc(r.path)+'">'+esc(r.path)+'</option>').join("");
+    sel.value=cur;
+  }).catch(()=>{});
 }
 function apNetTest(){
   const el=document.getElementById("apNetTest");
