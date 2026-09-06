@@ -761,25 +761,71 @@ def add_movie(name=None, tmdb_id=None, imdb_id=None, profile=None,
 
 
 def _queue_records(rq, extra=""):
-    """Radarr / Sonarr 的队列结构一致，只是筛选参数不同，故抽出公共解析。"""
-    path = "/api/v3/queue?pageSize=30&sortDirection=descending&sortKey=timeleft" + extra
-    try:
-        q = rq("GET", path)
-    except Exception:
-        return []
+    """Radarr / Sonarr 的队列结构一致，只是筛选参数不同，故抽出公共解析。
+    分页拉取（每页 200），避免 pageSize=30 上限导致截断与总速度统计失真。"""
     out = []
-    for it in (q or {}).get("records", []):
-        dci = it.get("downloadClientInfo") or {}
-        out.append({
-            "id": it.get("id"), "title": it.get("title"), "status": it.get("status"),
-            "size": it.get("size"), "sizeleft": it.get("sizeleft"),
-            "progress": round((it.get("progress") or 0) * 100, 1),
-            "downloadClient": it.get("downloadClient"),
-            "timeleft": it.get("timeleft"),
-            "speed": dci.get("speed") if isinstance(dci, dict) else None,
-            "indexer": it.get("indexer"), "protocol": it.get("protocol"),
-            "eta": it.get("estimatedCompletionTime"),
-        })
+    page = 1
+    fetched = 0
+    while True:
+        path = "/api/v3/queue?page=%d&pageSize=200&sortDirection=descending&sortKey=timeleft%s" % (page, extra)
+        try:
+            q = rq("GET", path)
+        except Exception:
+            break
+        if not isinstance(q, dict):
+            break
+        recs = q.get("records", []) or []
+        for it in recs:
+            dci = it.get("downloadClientInfo") or {}
+            out.append({
+                "id": it.get("id"), "title": it.get("title"), "status": it.get("status"),
+                "size": it.get("size"), "sizeleft": it.get("sizeleft"),
+                "progress": round((it.get("progress") or 0) * 100, 1),
+                "downloadClient": it.get("downloadClient"),
+                "timeleft": it.get("timeleft"),
+                "speed": dci.get("speed") if isinstance(dci, dict) else None,
+                "indexer": it.get("indexer"), "protocol": it.get("protocol"),
+                "eta": it.get("estimatedCompletionTime"),
+            })
+        fetched += len(recs)
+        total = q.get("totalRecords")
+        if not recs or (total is not None and fetched >= total):
+            break
+        page += 1
+        if page > 200:
+            break
+    return out
+
+
+def _all_records(req_fn, base_path, page_size=1000):
+    """分页拉取 Radarr/Sonarr 列表类接口（movie/series/queue 等），直到取完。
+    返回 records 扁平列表，避免 pageSize 上限（通常 1000）导致的静默截断。"""
+    out = []
+    page = 1
+    fetched = 0
+    while True:
+        sep = "&" if "?" in base_path else "?"
+        p = "%s%spage=%d&pageSize=%d" % (base_path, sep, page, page_size)
+        try:
+            data = req_fn("GET", p) or {}
+        except Exception:
+            break
+        if isinstance(data, list):
+            out.extend(data)
+            break
+        recs = data.get("records", []) or []
+        out.extend(recs)
+        fetched += len(recs)
+        total = data.get("totalRecords")
+        if total is not None:
+            if not recs or fetched >= total:
+                break
+        else:
+            # 无 totalRecords 元信息：取一页即止，避免死循环
+            break
+        page += 1
+        if page > 500:
+            break
     return out
 
 
@@ -812,13 +858,13 @@ def remove_from_queue(qid, remove_from_client=True):
 
 def list_movies():
     try:
-        ms = r_req("GET", "/api/v3/movie?pageSize=1000") or []
+        ms = _all_records(r_req, "/api/v3/movie")
     except Exception:
         return []
     # 标记当前正在下载中的影片（避免把"下载中"误标成"待源"）
     downloading_ids = set()
     try:
-        q = r_req("GET", "/api/v3/queue?pageSize=200") or {}
+        q = {"records": _all_records(r_req, "/api/v3/queue")}
         for it in q.get("records", []):
             mid = it.get("movieId")
             if mid:
@@ -850,12 +896,12 @@ def _movie_state_by_tmdb():
     """tmdbId -> 状态(downloaded/downloading/waiting)，用于搜索结果标注"已在库"。"""
     m = {}
     try:
-        ms = r_req("GET", "/api/v3/movie?pageSize=1000") or []
+        ms = _all_records(r_req, "/api/v3/movie")
     except Exception:
         return m
     dl = set()
     try:
-        q = r_req("GET", "/api/v3/queue?pageSize=200") or {}
+        q = {"records": _all_records(r_req, "/api/v3/queue")}
         for it in q.get("records", []):
             if it.get("movieId"):
                 dl.add(it["movieId"])
@@ -874,12 +920,12 @@ def _series_state_by_tvdb():
     """tvdbId -> 状态，用于搜索结果标注"已在库"。"""
     m = {}
     try:
-        ss = s_req("GET", "/api/v3/series?pageSize=1000") or []
+        ss = _all_records(s_req, "/api/v3/series")
     except Exception:
         return m
     dl = set()
     try:
-        q = s_req("GET", "/api/v3/queue?pageSize=200") or {}
+        q = {"records": _all_records(s_req, "/api/v3/queue")}
         for it in q.get("records", []):
             if it.get("seriesId"):
                 dl.add(it["seriesId"])
@@ -1054,7 +1100,7 @@ def add_series(name=None, tvdb_id=None, profile=None, season_mode="all",
 
 def list_series():
     try:
-        ss = s_req("GET", "/api/v3/series?pageSize=1000") or []
+        ss = _all_records(s_req, "/api/v3/series")
     except Exception:
         return []
     downloading_ids = set()
@@ -2323,7 +2369,7 @@ def system_status():
     out["appName"] = rad_status.get("appName", "Radarr")
     ms = []
     try:
-        ms = r_req("GET", "/api/v3/movie?pageSize=1000") or []
+        ms = _all_records(r_req, "/api/v3/movie")
         out["totalMovies"] = len(ms)
         out["downloadedMovies"] = sum(1 for m in ms if m.get("hasFile"))
     except Exception:
@@ -2370,7 +2416,7 @@ def system_status():
     except Exception:
         pass
     try:
-        ss = s_req("GET", "/api/v3/series?pageSize=1000") or []
+        ss = _all_records(s_req, "/api/v3/series")
         out["totalSeries"] = len(ss)
         out["downloadedSeries"] = sum(
             1 for x in ss
@@ -2588,6 +2634,13 @@ PAGE = """<!doctype html>
   .dd-body label input{accent-color:#2f6fed;cursor:pointer}
   .filter-sel{padding:5px 8px;border-radius:6px;background:#171a21;border:1px solid #232a37;color:#aeb6c2;font-size:12px;cursor:pointer;line-height:1.4}
   .filter-sel:focus{outline:1px solid #2f6fed;border-color:#2f6fed}
+  .batchbox{border:1px solid #232a37;border-radius:10px;background:#13171f;padding:10px 14px;margin-bottom:12px}
+  .batchbox>summary{list-style:none;cursor:pointer;color:#cdd4df;font-weight:600;font-size:14px;user-select:none}
+  .batchbox>summary::-webkit-details-marker{display:none}
+  .batchbox>summary:hover{color:#fff}
+  #batchNames{width:100%;box-sizing:border-box;min-height:120px;resize:vertical;line-height:1.5;margin-top:8px;background:#0f1318;border:1px solid #2a3140;color:#e6e6e6;font-family:inherit}
+  #batchNames:focus{outline:1px solid #2f6fed;border-color:#2f6fed}
+  #batchResult .card{padding:10px 12px}
 </style>
 </head>
 <body>
@@ -2629,6 +2682,19 @@ PAGE = """<!doctype html>
       <button class="btn" onclick="doSearch()">搜索</button>
     </div>
     <div id="status"></div>
+    <details class="batchbox" id="batchBox">
+      <summary>📋 批量添加（每行一个片名/剧名，自动选源下载）</summary>
+      <div class="row" style="margin:8px 0">
+        <select id="batchKind">
+          <option value="movie">电影</option>
+          <option value="tv">剧集</option>
+        </select>
+        <button class="btn" onclick="runBatch()">开始批量添加</button>
+        <span class="muted" id="batchHint">逐条搜索并添加，结果见下</span>
+      </div>
+      <textarea id="batchNames" rows="6" placeholder="每行一个，例如：&#10;盗梦空间&#10;星际穿越&#10;权力的游戏"></textarea>
+      <div id="batchResult"></div>
+    </details>
     <div class="grid" id="cands"></div>
   </div>
 
@@ -3157,8 +3223,14 @@ function doSearch(){
       else if(c.inLibrary==="waiting")libBadge='<span class="badge wait">⏳ 待源</span>';
       const extra=(c.overview&&!isTv)?'<div class="s" style="margin-top:5px;line-height:1.4">'+esc(c.overview)+'</div>':"";
       const addLabel=isTv?"追这部剧":"添加并下载";
+      let addBtn;
+      if(c.inLibrary==="downloaded"){
+        addBtn='<button class="btn" disabled style="opacity:.5;cursor:not-allowed">已下载</button>';
+      } else {
+        addBtn='<button class="btn" data-add="'+(isTv?"tv":"movie")+":"+(isTv?c.tvdbId:c.tmdbId)+'">'+addLabel+'</button>';
+      }
       const ch=buildCard({poster:c.poster,title:c.title,kind:c.kind,sub:sub,badges:libBadge?[libBadge]:[],extra:extra,
-        acts:'<button class="btn" data-add="'+(isTv?"tv":"movie")+":"+(isTv?c.tvdbId:c.tmdbId)+'">'+addLabel+'</button>'});
+        acts:addBtn});
       const wrap=document.createElement("div");wrap.innerHTML=ch;grid.appendChild(wrap.firstElementChild);
     });
     grid.querySelectorAll('button[data-add]').forEach(b=>{
@@ -3174,6 +3246,31 @@ function doSearch(){
 }
 
 function esc(s){const d=document.createElement("div");d.textContent=s||"";return d.innerHTML;}
+
+function runBatch(){
+  const names=document.getElementById("batchNames").value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  if(!names.length){setStatus("批量添加：请先粘贴片名","err");return;}
+  const kind=document.getElementById("batchKind").value;
+  const prof=document.getElementById("profile").value;
+  const sm=document.getElementById("seasonMode").value;
+  const box=document.getElementById("batchResult");
+  box.innerHTML='<div class="muted">批量添加中…('+names.length+' 条)</div>';
+  jpost("/api/"+(kind==="tv"?"series":"movies")+"/bulk",{names:names,profile:prof||null,seasonMode:sm})
+   .then(d=>{
+     if(!d||!d.results){box.innerHTML='<div class="muted">无返回</div>';return;}
+     const okN=d.results.filter(r=>r.ok).length;
+     let html='<div class="muted" style="margin:6px 0">完成：成功 '+okN+' / '+d.results.length+'</div><div class="grid" style="margin-top:4px">';
+     d.results.forEach(r=>{
+       const ok=r.ok, title=esc(r.title||r.name||"???");
+       const msg=ok?("已添加 / "+(r.action||"")):("失败："+esc(String(r.error||"")));
+       const cls=ok?"ok":"err";
+       html+='<div class="card"><div class="c-title">'+title+'</div><span class="badge '+cls+'">'+(ok?"✓":"✗")+'</span><div class="s">'+esc(msg)+'</div></div>';
+     });
+     html+='</div>';
+     box.innerHTML=html;
+     toast("批量添加完成：成功 "+okN+" / "+d.results.length,"ok");
+   }).catch(e=>{box.innerHTML='<div class="muted">请求失败 '+e+'</div>';});
+}
 
 let _qFilter="all";   // 队列筛选：all / movie / tv（独立于顶部电影·剧集模式）
 let _spd=[]; const SPD_MAX=40;
