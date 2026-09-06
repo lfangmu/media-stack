@@ -1817,7 +1817,8 @@ def _arr_set_config(service):
     try:
         with urlopen(Request(cfg_url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
             cfg = json.loads(r.read().decode())
-        cfg["authenticationMethod"] = "forms"
+        # 只设 urlBase；不要碰 authenticationMethod（设为 forms 会触发 Username 非空校验，
+        # 且代理已通过 X-Api-Key 鉴权，不需要 forms 登录）。
         cfg["urlBase"] = "/p/" + service
         req = Request(cfg_url, data=json.dumps(cfg).encode(),
                       headers={"X-Api-Key": key, "Content-Type": "application/json", "Accept": "application/json"},
