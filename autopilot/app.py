@@ -3650,7 +3650,7 @@ class H(BaseHTTPRequestHandler):
             return {"__error__": str(e)}
 
     def do_GET(self):
-        if self.path.startswith("/p/"):
+        if self.path.startswith("/p/") or self.path.split("?",1)[0] == "/initialize.json":
             self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
@@ -3762,7 +3762,7 @@ class H(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path.startswith("/p/"):
+        if self.path.startswith("/p/") or self.path.split("?",1)[0] == "/initialize.json":
             self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
@@ -3896,7 +3896,7 @@ class H(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_DELETE(self):
-        if self.path.startswith("/p/"):
+        if self.path.startswith("/p/") or self.path.split("?",1)[0] == "/initialize.json":
             self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
@@ -3926,12 +3926,26 @@ class H(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_PUT(self):
-        if self.path.startswith("/p/"):
+        if self.path.startswith("/p/") or self.path.split("?",1)[0] == "/initialize.json":
             self._proxy_dispatch(); return
         self._send(405, {"error": "method not allowed"})
 
     def _proxy_dispatch(self):
         rest = self.path.split("?", 1)[0]
+        # /initialize.json 是 *arr SPA 顶层 fetch（不在 /p/ 下），按 cookie 记住的 svc 转发
+        if rest == "/initialize.json":
+            for h in self.headers.get("Cookie", "").split(";"):
+                if h.strip().startswith("autopilot_svc="):
+                    svc_name = h.strip().split("=", 1)[1].strip()
+                    if svc_name in _PROXY_DEFS:
+                        try:
+                            length = int(self.headers.get("Content-Length", "0") or "0")
+                        except Exception:
+                            length = 0
+                        body = self.rfile.read(length) if length else None
+                        self._proxy_pass(svc_name, _PROXY_DEFS[svc_name], "initialize.json", self.command, body)
+                        return
+            self._send(404, {"error": "unknown service"}); return
         parts = rest.strip("/").split("/", 2)
         if len(parts) < 2 or parts[0] != "p":
             self._send(404, {"error": "not found"}); return
@@ -4010,6 +4024,8 @@ class H(BaseHTTPRequestHandler):
         # 所有 kind 的 HTML 都要重写绝对路径（arr 是 SPA，漏掉会白屏）
         if "text/html" in ctype:
             resp_body = _rewrite_html_body("/p/" + service, resp_body)
+            # 让 /initialize.json 这类 SPA 顶层 fetch 能按 cookie 路由到当前 svc
+            out_headers["Set-Cookie"] = "autopilot_svc=%s; Path=/; SameSite=Lax" % service
         out_headers["Content-Length"] = str(len(resp_body))
         self.send_response(status)
         for k, v in out_headers.items():
