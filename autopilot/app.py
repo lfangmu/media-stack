@@ -1801,7 +1801,7 @@ def _arr_create_account(service):
 
 
 def _arr_set_config(service):
-    """读全量配置 -> 合并 authenticationMethod=forms 与 BaseUrl=/p/<service> -> 整体写回（PUT 要求完整对象）。"""
+    """读全量配置 -> 合并 authenticationMethod=forms 与 urlBase=/p/<service> -> 整体写回（PUT 要求完整对象）。"""
     key = _arr_api_key(service)
     if not key:
         return
@@ -1810,14 +1810,21 @@ def _arr_set_config(service):
         with urlopen(Request(url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
             cfg = json.loads(r.read().decode())
         cfg["authenticationMethod"] = "forms"
-        cfg["baseUrl"] = "/p/" + service
+        # Sonarr/Radarr/Prowlarr JSON 字段是 camelCase 的 urlBase（不是 baseUrl），
+        # 写错大小写会被静默忽略，表现为 /initialize.json 返回 urlBase=""、SPA chunk 全 404。
+        cfg["urlBase"] = "/p/" + service
         req = Request(url, data=json.dumps(cfg).encode(),
                       headers={"X-Api-Key": key, "Content-Type": "application/json", "Accept": "application/json"},
                       method="PUT")
         with urlopen(req, timeout=30) as r:
             r.read()
-    except Exception:
-        pass
+        # 写后立刻 GET 验证，没生效就报错（之前 except 静默吞错是隐性雷区）
+        with urlopen(Request(url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
+            verify = json.loads(r.read().decode())
+        if verify.get("urlBase") != "/p/" + service:
+            print("[autopilot] %s urlBase 设置失败，当前=%r" % (service, verify.get("urlBase")), flush=True)
+    except Exception as e:
+        print("[autopilot] %s _arr_set_config 异常: %s" % (service, e), flush=True)
 
 
 def _arr_bootstrap():
