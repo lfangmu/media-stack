@@ -3953,6 +3953,8 @@ class H(BaseHTTPRequestHandler):
         target = upstream + "/" + subpath if subpath else upstream + "/"
         kind = svc["kind"]
         headers = {}
+        # 强制上游返回明文，避免 gzip 被我们剥离 content-encoding 后浏览器解析乱码/白屏
+        headers["Accept-Encoding"] = "identity"
         ct = self.headers.get("Content-Type")
         if ct:
             headers["Content-Type"] = ct
@@ -4004,7 +4006,8 @@ class H(BaseHTTPRequestHandler):
                 v = _rewrite_set_cookie(service, v)
             out_headers[k] = v
         ctype = resp_headers.get("Content-Type", "")
-        if kind in ("qb", "none") and "text/html" in ctype:
+        # 所有 kind 的 HTML 都要重写绝对路径（arr 是 SPA，漏掉会白屏）
+        if "text/html" in ctype:
             resp_body = _rewrite_html_body("/p/" + service, resp_body)
         out_headers["Content-Length"] = str(len(resp_body))
         self.send_response(status)
