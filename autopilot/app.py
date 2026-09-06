@@ -786,6 +786,7 @@ def _queue_records(rq, extra=""):
                 "speed": dci.get("speed") if isinstance(dci, dict) else None,
                 "indexer": it.get("indexer"), "protocol": it.get("protocol"),
                 "eta": it.get("estimatedCompletionTime"),
+                "movieId": it.get("movieId"), "seriesId": it.get("seriesId"),
             })
         fetched += len(recs)
         total = q.get("totalRecords")
@@ -3313,7 +3314,11 @@ function loadQueue(){
       // 全部视图下打标签区分电影 / 剧集
       const kTag=(_qFilter==="all"&&it.kind)
         ? '<span class="tag '+(it.kind==="tv"?"warn":"")+'">'+(it.kind==="tv"?"📺 剧集":"🎬 电影")+'</span>' : "";
+      let openHref="";
+      if(it.kind==="movie"&&it.movieId)openHref="/p/radarr/movie/"+it.movieId;
+      else if(it.kind==="tv"&&it.seriesId)openHref="/p/sonarr/series/"+it.seriesId;
       return '<div class="queue-item"><div class="top"><b>'+esc(it.title||"")+'</b>'+
+        (openHref?'<a class="btn ghost" href="'+openHref+'" target="_blank" rel="noopener noreferrer">↗ 打开</a>':"")+
         '<button class="btn danger" data-cid="'+it.id+'" data-ckind="'+(it.kind||"")+'">取消</button></div>'+
         '<div class="sub">'+(it.status?'<span>'+esc(it.status)+'</span>':"")+kTag+
         (it.downloadClient?'<span>'+esc(it.downloadClient)+'</span>':"")+
@@ -3586,6 +3591,7 @@ function prevMonth(){ if(!_calY){_calY=new Date().getFullYear();_calM=new Date()
 function nextMonth(){ if(!_calY){_calY=new Date().getFullYear();_calM=new Date().getMonth();} _calM++; if(_calM>11){_calM=0;_calY++;} loadCalendar(); }
 function calAdd(title,kind){
   if(!title)return;
+  if(!confirm("添加《"+title+"》？\n将在 "+(kind==="tv"?"剧集":"电影")+" 中搜索并下载。"))return;
   if(kind==="tv"&&MODE!=="tv")setMode("tv");
   else if(kind==="movie"&&MODE!=="movie")setMode("movie");
   document.getElementById("term").value=title;
