@@ -39,14 +39,36 @@ import socket
 import time
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
 import urllib.error
-from urllib.parse import urlencode, parse_qs, urlparse, quote
+from urllib.parse import urlencode, parse_qs, urlparse, quote, urljoin
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ssl
 SSL_CTX = ssl._create_unverified_context()  # qBittorrent 现已启用自签 HTTPS
 import threading
 import concurrent.futures as _cf
+
+
+# *arr 设了 urlBase（如 /p/radarr）后会把 /api/v3/* 307 到 /<urlBase>/api/v3/*；
+# 默认 urlopen 在本环境下不跟随该 307，导致真实添加影片失败。这里用专用 opener
+# 显式跟随 3xx，307/308 保留原 method + body，对所有 *arr 的 urlBase 配置通用。
+class _ArrRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        m = req.get_method()
+        if code in (301, 302, 303, 307, 308) and m in ("GET", "HEAD", "POST", "PUT", "DELETE"):
+            if code not in (307, 308) and m != "HEAD":
+                m = "GET"
+            newurl = urljoin(req.full_url, newurl)
+            data = req.data if code in (307, 308) else None
+            nh = {k: v for k, v in req.header_items()
+                  if k.lower() not in ("host", "cookie", "content-length", "connection")}
+            return Request(newurl, data=data, headers=nh, method=m,
+                           origin_req_host=req.origin_req_host, unverifiable=True)
+        return None
+
+
+_ARR_OPENER = build_opener(_ArrRedirectHandler())
+
 
 RADARR_URL = os.environ.get("RADARR_URL", "http://radarr:7878")
 RADARR_CONFIG = os.environ.get("RADARR_CONFIG", "/radarr-config/config.xml")
@@ -59,7 +81,7 @@ TOKEN = os.environ.get("AUTOPILOT_TOKEN", "").strip()
 ROOT_FOLDER = os.environ.get("MOVIE_ROOT", "/movies")
 TV_ROOT = os.environ.get("TV_ROOT", "/tv")
 # 系统状态里要探测的其余服务（都在同一 compose 网络内，用服务名访问）
-QBIT_URL = os.environ.get("QBITTORRENT_URL", "https://qbittorrent:8085")
+QBIT_URL = os.environ.get("QBITTORRENT_URL", "http://qbittorrent:8085")
 QBIT_USER = os.environ.get("QBITTORRENT_USER", "admin")
 QBIT_PASS = os.environ.get("QBITTORRENT_PASS", "MediaFn2026")
 FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://flaresolverr:8191")
@@ -93,7 +115,7 @@ _PROXY_DEFS = {
 }
 _arr_tokens = {}                       # service -> (jwt, expires_ts)
 _arr_tokens_lock = threading.Lock()
-_qb_sid = {"sid": None, "exp": 0}
+_qb_sid = {"sid": None, "exp": 0, "csrf": None}
 _qb_sid_lock = threading.Lock()
 
 
@@ -112,7 +134,7 @@ def _apply_env_file_overrides():
                 kv[k.strip()] = v.strip()
     except Exception:
         return
-    global TMDB_KEY, PROXY_URL, TMDB_PROXY
+    global TMDB_KEY, PROXY_URL, TMDB_PROXY, ROOT_FOLDER, TV_ROOT
     if "TMDB_API_KEY" in kv:
         TMDB_KEY = kv["TMDB_API_KEY"]
     if "PROXY_URL" in kv:
@@ -120,6 +142,12 @@ def _apply_env_file_overrides():
         PROXY_URL = kv["PROXY_URL"]
     if "TMDB_PROXY" in kv:
         TMDB_PROXY = kv["TMDB_PROXY"]
+    # 媒体库根目录以 .env 的 MOVIE_ROOT/TV_ROOT 为准（本栈为 /data/movies、/data/tv）；
+    # 否则回退默认 /movies、/tv，与 Radarr/Sonarr 实际挂载不一致，添加影片会 400。
+    if "MOVIE_ROOT" in kv and kv["MOVIE_ROOT"]:
+        ROOT_FOLDER = kv["MOVIE_ROOT"]
+    if "TV_ROOT" in kv and kv["TV_ROOT"]:
+        TV_ROOT = kv["TV_ROOT"]
 
 
 _apply_env_file_overrides()
@@ -195,7 +223,7 @@ def _req(base, key, method, path, data, timeout):
                "Content-Type": "application/json"}
     body = json.dumps(data).encode() if data is not None else None
     req = Request(url, data=body, headers=headers, method=method)
-    with urlopen(req, timeout=timeout) as r:
+    with _ARR_OPENER.open(req, timeout=timeout) as r:
         raw = r.read().decode()
         return json.loads(raw) if raw else None
 
@@ -1343,11 +1371,87 @@ def enable_indexer(name):
 SEED_INDEXER_NAMES = [
     "YTS", "Knaben", "The Pirate Bay", "Uindex",
     "TorrentsCSV", "LimeTorrents", "Anibt",
+    # 新增：通用 / 剧集 / 动漫 公共索引器（按 Prowlarr schema 名，自动补齐，可达才加）
+    "EZTV", "Nyaa.si", "Torrent Downloads", "kickasstorrents.to",
+    "Internet Archive", "dmhy", "RuTor", "Torrent9", "showRSS", "SubsPlease",
+    "1337x",
 ]
+
+# ---- FlareSolverr 索引器代理（解 Cloudflare 保护的公共索引器，如 1337x / TPB）----
+# Prowlarr 的「索引器代理」是按【标签】匹配的：代理与索引器必须共享同一标签才生效，
+# 空标签的代理 = 对谁都不生效（实测：空标签时 1337x 的添加测试直接走直连被 CF 挡）。
+# 因此这里统一用标签 "cf"：给受 CF 保护的索引器打上它，添加时的连通性测试就会走
+# FlareSolverr 解 CF，从而能正常添加；搜索阶段也自动走 FlareSolverr。
+FLARE_TAG = "cf"
+CF_INDEXER_NAMES = {
+    "1337x", "the pirate bay", "torrent9", "limetorrents", "kickasstorrents.to", "eztv", "uindex",
+}
+
+
+def _ensure_flare_proxy():
+    """幂等：确保 Prowlarr 已注册 FlareSolverr 索引器代理，并挂上统一标签 FLARE_TAG。
+
+    返回 cf 标签的 Prowlarr tag id（失败返回 None）。
+    这样每次 autopilot 启动都会自愈：新装 / 重置后也能自动接上 FlareSolverr。
+    """
+    try:
+        if not get_prowlarr_key():
+            return None
+        # 1) 标签
+        try:
+            tags = p_req("GET", "/api/v1/tag") or []
+        except Exception:
+            tags = []
+        cf = next((t for t in tags if (t.get("label") or "").lower() == FLARE_TAG), None)
+        if cf:
+            cf_id = cf.get("id")
+        else:
+            try:
+                nt = p_req("POST", "/api/v1/tag", {"label": FLARE_TAG})
+                cf_id = nt.get("id") if isinstance(nt, dict) else None
+            except Exception as e:
+                print("[flare] 创建标签 %s 失败: %s" % (FLARE_TAG, e), flush=True)
+                cf_id = None
+        # 2) 代理
+        try:
+            proxies = p_req("GET", "/api/v1/indexerproxy") or []
+        except Exception:
+            proxies = []
+        fs = next((p for p in proxies if (p.get("implementation") or "").lower() == "flaresolverr"), None)
+        if fs:
+            ftags = set(fs.get("tags", []) or [])
+            if cf_id is not None:
+                ftags.add(cf_id)
+            fs["tags"] = sorted(ftags)
+            try:
+                p_req("PUT", "/api/v1/indexerproxy/%d" % fs["id"], fs)
+            except Exception as e:
+                print("[flare] 更新 FlareSolverr 代理标签失败: %s" % e, flush=True)
+        else:
+            payload = {
+                "name": "FlareSolverr",
+                "implementation": "FlareSolverr",
+                "configContract": "FlareSolverrSettings",
+                "protocol": "torrent",
+                "tags": [cf_id] if cf_id is not None else [],
+                "fields": [
+                    {"name": "host", "value": FLARESOLVERR_URL},
+                    {"name": "requestTimeout", "value": 60},
+                ],
+            }
+            try:
+                p_req("POST", "/api/v1/indexerproxy", payload)
+                print("[flare] 已注册 FlareSolverr 索引器代理（标签 %s）" % FLARE_TAG, flush=True)
+            except Exception as e:
+                print("[flare] 注册 FlareSolverr 代理失败: %s" % e, flush=True)
+        return cf_id
+    except Exception as e:
+        print("[flare] 初始化 FlareSolverr 代理异常: %s" % e, flush=True)
+        return None
 
 
 def seed_indexers():
-    """幂等播种：自动补齐 7 个公共索引器（只加缺失的，已存在的跳过）。
+    """幂等播种：自动补齐 SEED_INDEXER_NAMES 中的公共索引器（只加缺失的，已存在的跳过）。
 
     - 仅当 Prowlarr 一个都没有时才全量播种；已有部分时只补缺失项，
       因此出口（egress）抖动导致首轮只加上几个时，后续重试会把剩下的补齐。
@@ -1362,6 +1466,7 @@ def seed_indexers():
     except Exception as e:
         return 0, 0, ["读取现有索引器失败: %s" % e], False
     existing_names = {(i.get("name") or "").strip().lower() for i in existing}
+    cf_id = _ensure_flare_proxy()   # 确保 FlareSolverr 代理就绪，供 CF 类索引器使用
     try:
         schema = p_req("GET", "/api/v1/indexer/schema") or []
     except Exception as e:
@@ -1383,6 +1488,8 @@ def seed_indexers():
         payload.pop("id", None)          # 新建索引器不带 id
         payload["enable"] = True
         payload["appProfileId"] = 1      # GET /api/v1/appprofile -> id=1 "Standard"
+        if name.strip().lower() in CF_INDEXER_NAMES and cf_id is not None:
+            payload["tags"] = [cf_id]   # 受 Cloudflare 保护的索引器挂 cf 标签 → 添加测试走 FlareSolverr 解 CF
         try:
             p_req("POST", "/api/v1/indexer", payload)
             added += 1
@@ -1411,7 +1518,7 @@ def seed_indexers():
 
 
 def seed_indexers_loop(max_retries=20, wait=15):
-    """后台守护线程：等 Prowlarr 就绪后幂等补齐 7 个公共索引器。
+    """后台守护线程：等 Prowlarr 就绪后幂等补齐 SEED_INDEXER_NAMES 中的公共索引器。
 
     出口（egress）偶发中断时连通性测试会失败，这里按固定间隔重试，
     覆盖看门狗自愈窗口；全部补齐或次数用尽后停止（下次 autopilot 重启会再来一遍）。
@@ -1422,7 +1529,9 @@ def seed_indexers_loop(max_retries=20, wait=15):
                 added, skipped, errors, all_present = seed_indexers()
                 for e in errors:
                     print("[seed] %s" % e, flush=True)
-                if added or all_present:
+                # 只在「全部补齐」时停止；否则继续重试（CF 类索引器需等 FlareSolverr 代理就绪后才加得进）。
+                # 若已尝试多次且本轮无任何新增，说明剩余项受出口限制暂时不可达，提前收尾避免空转。
+                if all_present or (added == 0 and attempt >= 4):
                     break
         except Exception as e:
             print("[seed] 第 %d 次尝试异常: %s" % (attempt, e), flush=True)
@@ -1807,7 +1916,7 @@ def _arr_create_account(service):
 
 
 def _arr_set_config(service):
-    """读 host 配置 -> 设 urlBase=/p/<service> + authenticationMethod=forms -> 写回。
+    """读 host 配置 -> 确保 urlBase=/p/<svc>(与代理「保留完整前缀转发」一致，SPA chunk 才能挂载) + 重断言鉴权绕过(disabledForLocalAddresses) -> 写回。
     Sonarr v4 / Radarr v5 已把 /api/v3/config 拆为 /api/v3/config/host（统一端点 404）。"""
     key = _arr_api_key(service)
     if not key:
@@ -1817,9 +1926,14 @@ def _arr_set_config(service):
     try:
         with urlopen(Request(cfg_url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
             cfg = json.loads(r.read().decode())
-        # 只设 urlBase；不要碰 authenticationMethod（设为 forms 会触发 Username 非空校验，
-        # 且代理已通过 X-Api-Key 鉴权，不需要 forms 登录）。
+        # 设 urlBase=/p/<svc>：*arr 据此把 window.Sonarr.urlBase 注入页面，
+        # Vite 运行时 publicPath = urlBase + "/"，所有 JS chunk / API / 静态资源都走 /p/<svc>/，
+        # 与代理「保留完整 /p/<svc>/ 前缀转发」一致，SPA 才能正常挂载
+        # （否则 chunk 走根绝对路径 404 白屏）。鉴权绕过靠 config.xml 的 LocalAddresses
+        # （API 无此字段）：把 autopilot 容器来源(172.18.0.0/16) 视为本地，SPA 不再弹登录页。
         cfg["urlBase"] = "/p/" + service
+        cfg["authenticationRequired"] = "disabledForLocalAddresses"
+        cfg["authenticationMethod"] = "forms"
         req = Request(cfg_url, data=json.dumps(cfg).encode(),
                       headers={"X-Api-Key": key, "Content-Type": "application/json", "Accept": "application/json"},
                       method="PUT")
@@ -1831,7 +1945,7 @@ def _arr_set_config(service):
         if verify.get("urlBase") != "/p/" + service:
             print("[autopilot] %s urlBase 设置失败，当前=%r" % (service, verify.get("urlBase")), flush=True)
         else:
-            print("[autopilot] %s urlBase 验证通过 (/p/%s)" % (service, service), flush=True)
+            print("[autopilot] %s 配置就绪 (urlBase=/p/%s, auth=disabledForLocalAddresses)" % (service, service), flush=True)
     except Exception as e:
         print("[autopilot] %s _arr_set_config 异常: %s" % (service, e), flush=True)
 
@@ -1874,28 +1988,29 @@ def _ensure_arr_token(service):
 
 
 def _ensure_qb_sid():
-    """登录 qB 拿 SID（缓存 1h）。"""
+    """登录 qB 拿会话 Cookie + CSRF（缓存 1h）。qB v5 会话 Cookie 名为 QBT_SID_<port>。"""
     with _qb_sid_lock:
         if _qb_sid["sid"] and _qb_sid["exp"] > time.time() + 30:
-            return _qb_sid["sid"]
+            return _qb_sid["sid"], _qb_sid["csrf"]
     try:
         data = urlencode({"username": QBIT_USER, "password": QBIT_PASS}).encode()
         req = Request(QBIT_URL.rstrip("/") + "/api/v2/auth/login", data=data,
                       headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
         with urlopen(req, timeout=30, context=SSL_CTX) as r:
             sc = r.headers.get("Set-Cookie", "")
-        sid = ""
-        for part in sc.split(";"):
-            if part.strip().startswith("SID="):
-                sid = part.strip()[4:]
-        if sid:
-            with _qb_sid_lock:
-                _qb_sid["sid"] = sid
-                _qb_sid["exp"] = time.time() + 3600
-            return sid
+        m = re.search(r"(QBT_SID_\d+=[^;]+)", sc) or re.search(r"(SID=[^;]+)", sc)
+        if not m:
+            return None, None
+        sid = m.group(1)
+        cm = re.search(r"(csrftoken=[^;]+)", sc)
+        csrf = cm.group(1).split("=", 1)[1] if cm else None
+        with _qb_sid_lock:
+            _qb_sid["sid"] = sid
+            _qb_sid["csrf"] = csrf
+            _qb_sid["exp"] = time.time() + 3600
+        return sid, csrf
     except Exception:
-        pass
-    return None
+        return None, None
 
 
 def _rewrite_proxy_url(service, v):
@@ -1910,7 +2025,8 @@ def _rewrite_proxy_url(service, v):
 def _rewrite_set_cookie(service, v):
     import re
     base = "/p/" + service
-    v = v.replace("Path=/", "Path=" + base)
+    # 仅当 Path=/ 后不是 base 路径时才替换，避免 urlBase 已设时 *arr 输出 Path=/p/<svc> 导致双重前缀
+    v = re.sub(r'Path=/(?!' + re.escape(base.lstrip("/")) + r')', 'Path=' + base, v)
     v = re.sub(r';?\s*Domain=[^;]+', '', v)
     return v
 
@@ -1920,10 +2036,11 @@ def _rewrite_html_body(base, body):
         s = body.decode("utf-8", "replace")
     except Exception:
         return body
-    s = s.replace('href="/', 'href="' + base + "/")
-    s = s.replace('src="/', 'src="' + base + "/")
-    s = s.replace("url(/", "url(" + base + "/")
-    s = s.replace('action="/', 'action="' + base + "/")
+    import re
+    bp = base.lstrip("/")  # p/sonarr
+    # 仅给「根绝对路径且尚未带 base 前缀」加前缀，避免 urlBase 已设时 *arr 自己输出 /p/<svc>/ 导致双重前缀
+    s = re.sub(r'((?:href|src|action)=")/(?!' + re.escape(bp) + r')(?!/)(?![A-Za-z][A-Za-z0-9+.\-]*:)', r'\1' + base + "/", s)
+    s = re.sub(r'(url\()/(?!' + re.escape(bp) + r')(?!/)(?![A-Za-z][A-Za-z0-9+.\-]*:)', r'\1' + base + "/", s)
     return s.encode("utf-8")
 
 
@@ -1974,9 +2091,9 @@ def net_test():
     若已配置代理则再测「经代理」链路。用于判断是否需要填代理。"""
     import time as _t
     targets = [
-        ("TMDB", "https://api.themoviedb.org/3/configuration"),
-        ("gstatic", "http://www.gstatic.com/generate_204"),
-        ("github", "https://github.com"),
+        ("themoviedb.org", "https://api.themoviedb.org/3/configuration"),
+        ("gstatic.com", "http://www.gstatic.com/generate_204"),
+        ("github.com", "https://github.com"),
     ]
 
     def _probe(use_proxy):
@@ -2006,17 +2123,15 @@ def net_test():
         verdict = "直连不可用，但代理可用：请确认已在上方填写代理链接"
     else:
         verdict = "直连与代理均不可达：请检查宿主机网络，或在上方填写代理链接"
+    target_hosts = [n for n, _ in targets]
     return {"ok": True, "direct": direct, "via_proxy": via, "verdict": verdict,
-            "proxy_configured": bool(PROXY_URL)}
+            "proxy_configured": bool(PROXY_URL), "targets": target_hosts}
 
 
 def _config_values():
     """汇总当前所有可配置项（含实时读取的 qB 下载目录），供 GET/POST 回显复用。"""
     return {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
-            "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL,
-            "QB_SAVE_PATH": qbit_get_save_path() or QB_SAVE_PATH,
-            "MOVIE_ROOT": ROOT_FOLDER, "TV_ROOT": TV_ROOT,
-            "DATA_DIR": DATA_DIR}
+            "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL}
 
 
 def config_get():
@@ -2029,7 +2144,6 @@ def config_save(body_str):
     except Exception:
         return 400, {"ok": False, "error": "请求体解析失败"}
     global PROXY_URL, TMDB_PROXY, TMDB_KEY, TOKEN, WEBHOOK_URL
-    global QB_SAVE_PATH, ROOT_FOLDER, TV_ROOT, DATA_DIR
     updates = {}
     notes = []
     proxy_changed = False
@@ -2065,29 +2179,6 @@ def config_save(body_str):
     if "webhook_url" in data:
         # 抓取完成通知：留空=关闭；填写=开启。写入 AUTOPILOT_WEBHOOK_URL 并即时更新运行态。
         updates["AUTOPILOT_WEBHOOK_URL"] = (data.get("webhook_url") or "").strip()
-    if "qb_save_path" in data:
-        # 第一层：qB 实际下载/做种目录。写 .env 持久化意图，并经 qB API 实时生效。
-        # 留空=不改动（避免仅改代理时把已配置的目录清空）。
-        path = (data.get("qb_save_path") or "").strip()
-        if path:
-            updates["QB_SAVE_PATH"] = path
-    if "movie_root" in data:
-        # 第二层：电影库默认根目录。写 .env、热更新运行态，并向 Radarr 注册根目录。
-        path = (data.get("movie_root") or "").strip()
-        if path:
-            updates["MOVIE_ROOT"] = path
-    if "tv_root" in data:
-        # 第二层：剧集库默认根目录。写 .env、热更新运行态，并向 Sonarr 注册根目录。
-        path = (data.get("tv_root") or "").strip()
-        if path:
-            updates["TV_ROOT"] = path
-    if "data_dir" in data:
-        # 宿主机映射层：容器 /data 在宿主机对应的真实目录（volume 映射源）。
-        # 写 .env 持久化，并触发 docker compose up -d 重新挂载（改挂载需重建容器）。
-        # 留空=不改动。
-        path = (data.get("data_dir") or "").strip()
-        if path:
-            updates["DATA_DIR"] = path
     if not updates:
         return 200, {"ok": True, "wrote": False, "values": _config_values()}
     wrote = _write_env_file(MEDIA_ENV, updates)
@@ -2106,35 +2197,6 @@ def config_save(body_str):
         TOKEN = (data.get("auth_token") or "").strip()
     if "webhook_url" in data:
         WEBHOOK_URL = (data.get("webhook_url") or "").strip()
-    if "qb_save_path" in data:
-        path = (data.get("qb_save_path") or "").strip()
-        if path:
-            QB_SAVE_PATH = path
-            # 经 qB v5 API 实时设置默认下载/做种目录；失败仅记一笔，不阻断整体保存。
-            ok, msg = qbit_set_save_path(QB_SAVE_PATH)
-            notes.append("qB 下载目录: " + msg)
-    if "movie_root" in data:
-        path = (data.get("movie_root") or "").strip()
-        if path:
-            ROOT_FOLDER = path
-            # 向 Radarr 注册根目录（已存在则跳过），失败不阻断。
-            ok, msg = radarr_ensure_rootfolder(ROOT_FOLDER)
-            notes.append("电影库根目录: " + msg)
-    if "tv_root" in data:
-        path = (data.get("tv_root") or "").strip()
-        if path:
-            TV_ROOT = path
-            ok, msg = sonarr_ensure_rootfolder(TV_ROOT)
-            notes.append("剧集库根目录: " + msg)
-    if "data_dir" in data:
-        path = (data.get("data_dir") or "").strip()
-        if path and path != DATA_DIR:
-            DATA_DIR = path
-            # 改了宿主机映射：后台触发 docker compose up -d 重新挂载（会重建相关容器，含自身）。
-            # 放线程里跑，先回 HTTP 再重建，避免请求被中断。
-            threading.Thread(target=_apply_data_dir_remount,
-                            args=(DATA_DIR,), daemon=True).start()
-            notes.append("数据目录(映射): 已写入并尝试重新挂载，栈将在数秒内重建（本服务会短暂重启）")
     # 代理状态变化（设置或清空）都重启 squid，使 never_direct/always_direct 与 .env 一致
     if proxy_changed:
         _restart_container("proxy-forwarder")
@@ -2321,33 +2383,33 @@ def system_status():
         fla = f_f.result()
         prx = f_p.result()
     svcs = [
-        {"key": "autopilot", "name": "autopilot", "ok": True,
+        {"key": "autopilot", "name": "autopilot", "ok": True, "web": False,
          "detail": "已运行 " + _uptime(),
          "desc": "统一入口：搜索片名并自动选源下载，管理电影/剧集与下载队列"},
-        {"key": "radarr", "name": "Radarr", "ok": rad_ok,
+        {"key": "radarr", "name": "Radarr", "ok": rad_ok, "web": True,
          "detail": ("v%s · 影片 %d · 已下载 %d"
                     % (rad_ver, out["totalMovies"], out["downloadedMovies"]))
                    if rad_ok else (rad_ver or "不可达"),
          "desc": "电影管理：监控想看的电影，自动匹配并下载高质量版本 · 账号 admin / MediaFn2026"},
-        {"key": "sonarr", "name": "Sonarr", "ok": son_ok,
+        {"key": "sonarr", "name": "Sonarr", "ok": son_ok, "web": True,
          "detail": ("v%s · 剧集 %s · 已下载 %s"
                     % (son_ver, out["totalSeries"], out["downloadedSeries"]))
                    if son_ok else "不可达",
          "desc": "剧集管理：追更电视剧，按季/集自动抓取与整理 · 账号 admin / MediaFn2026"},
-        {"key": "prowlarr", "name": "Prowlarr", "ok": pro_ok,
+        {"key": "prowlarr", "name": "Prowlarr", "ok": pro_ok, "web": True,
          "detail": ("%s · 索引器 %s/%s 启用" % (pro_ver, idx.get("enabled", 0),
                                             idx.get("total", 0)))
                    if (pro_ok and idx) else (pro_ver or "不可达"),
          "desc": "索引器聚合：汇总各 BT/Usenet 站点资源，供 Radarr/Sonarr 统一检索 · 账号 admin / MediaFn2026"},
-        {"key": "qbittorrent", "name": "qBittorrent", "ok": qb[0],
+        {"key": "qbittorrent", "name": "qBittorrent", "ok": qb[0], "web": True,
          "detail": qb[1],
          "desc": "下载客户端：实际执行 BT/PT 下载，做种并写入媒体库目录 · 账号 admin / MediaFn2026"},
-        {"key": "flaresolverr", "name": "FlareSolverr", "ok": fla[0],
+        {"key": "flaresolverr", "name": "FlareSolverr", "ok": fla[0], "web": False,
          "detail": fla[1],
-         "desc": "反爬求解：破解 Cloudflare 等站点验证，让索引器能正常抓取"},
-        {"key": "proxy", "name": "转发代理 (Squid)", "ok": prx[0],
+         "desc": "反爬求解：破解 Cloudflare 等站点验证，让索引器能正常抓取（仅 API，无 Web 界面）"},
+        {"key": "proxy", "name": "转发代理 (Squid)", "ok": prx[0], "web": False,
          "detail": prx[1],
-         "desc": "网络出口：为下载/抓取提供代理转发，绕过访问限制"},
+         "desc": "网络出口：为下载/抓取提供代理转发，绕过访问限制（仅代理端口，无 Web 界面）"},
     ]
     out["services"] = svcs
     out["webhook"] = {"configured": bool(WEBHOOK_URL), "url": WEBHOOK_URL,
@@ -2531,9 +2593,9 @@ PAGE = """<!doctype html>
     <div class="tab" data-p="discover">🎯 发现</div>
     <div class="tab" data-p="queue">⬇️ 下载队列</div>
     <div class="tab" data-p="library">🎞️ 媒体库</div>
+    <div class="tab" data-p="calendar">📅 日历</div>
     <div class="tab" data-p="history">📜 抓取历史</div>
     <div class="tab" data-p="indexers">🛰️ 索引器</div>
-    <div class="tab" data-p="calendar">📅 日历</div>
     <div class="tab" data-p="status">📊 系统状态</div>
     <div class="tab" data-p="config">🛠 配置</div>
   </div>
@@ -2662,6 +2724,15 @@ PAGE = """<!doctype html>
 
   <!-- 配置（单一代理出口 + TMDB） -->
   <div class="panel" id="p-config">
+    <!-- 外网连通性自检（置顶） -->
+    <div class="cfg-sec" style="margin-bottom:16px;border-top:none;padding-top:0">
+      <div class="muted" style="margin-bottom:8px">外网连通性自检：直连出网是否可用，决定要不要填代理。</div>
+      <div class="row">
+        <button class="btn" onclick="apNetTest()">测试外网连通性</button>
+        <span class="muted" id="apNetTargets"></span>
+      </div>
+      <div id="apNetTest" style="margin-top:8px"></div>
+    </div>
     <div class="muted" style="margin-bottom:10px">外网出口与 TMDB 配置。保存后即时生效（自动写入 <code>.env</code> 并重启出口代理）。</div>
     <label class="cfg-row" style="display:block;margin:8px 0"><span>代理链接 Proxy URL</span>
       <input id="ap_PROXY_URL" style="width:100%;margin-top:4px;padding:8px" placeholder="http://user:pass@host:port（留空=仅内网）"></label>
@@ -2678,29 +2749,10 @@ PAGE = """<!doctype html>
         <span class="muted" id="apWhStatus"></span>
       </div>
     </div>
-    <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
-      <div class="muted" style="margin-bottom:8px">数据目录（宿主机映射 · 最上层）</div>
-      <label class="cfg-row" style="display:block;margin:8px 0"><span>宿主机数据目录 DATA_DIR</span>
-        <input id="ap_DATA_DIR" style="width:100%;margin-top:4px;padding:8px" placeholder="容器 /data 在宿主机上对应的真实目录，如 /mnt/media 或 /home/你的用户名/media-stack/data"></label>
-      <div class="muted" style="font-size:12px;margin-top:2px">这是 qB/Radarr/Sonarr 共享数据卷 ./data:/data 的映射源。所有下载与媒体库实际落在这个目录里。修改后栈会重建并重新挂载（本服务会短暂重启），qB 下载目录、*arr 根目录都应落在此目录之内。</div>
-    </div>
-    <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
-      <div class="muted" style="margin-bottom:8px">下载目录（两层）</div>
-      <label class="cfg-row" style="display:block;margin:8px 0"><span>① qB 下载/做种目录</span>
-        <input id="ap_QB_SAVE_PATH" style="width:100%;margin-top:4px;padding:8px" placeholder="Torrent 实际落盘与做种处，如 /data/下载/media；须落在 qB 挂载内否则硬链接失效"></label>
-      <label class="cfg-row" style="display:block;margin:8px 0"><span>② 电影库默认根目录</span>
-        <input id="ap_MOVIE_ROOT" style="width:100%;margin-top:4px;padding:8px" placeholder="Radarr 导入落盘位置（每次添加的默认选中项），如 /data/影视/电影"></label>
-      <label class="cfg-row" style="display:block;margin:8px 0"><span>③ 剧集库默认根目录</span>
-        <input id="ap_TV_ROOT" style="width:100%;margin-top:4px;padding:8px" placeholder="Sonarr 导入落盘位置，如 /data/影视/剧集"></label>
-    </div>
     <div class="row" style="margin-top:12px">
       <button class="btn" id="apCfgSave" onclick="apSaveConfig()">保存</button>
       <button class="btn ghost" onclick="apLoadConfig()">重新加载</button>
       <span class="muted" id="apCfgStatus"></span>
-    </div>
-    <div class="row" style="margin-top:10px">
-      <button class="btn ghost" onclick="apNetTest()">测试网络环境（直连外网是否可用）</button>
-      <span class="muted" id="apNetTest"></span>
     </div>
   </div>
 
@@ -2825,26 +2877,22 @@ function renderDiscDropdowns(){
     updateGenreSummary();
   }
   // 5 个单选下拉：年代/国别/评分/时长/排序
-  _fillSel("discYearSel", YEARS, discYear, "", true);
-  _fillSel("discCountrySel", COUNTRIES, discCountry, "国别 ", true);
-  _fillSel("discRatingSel", RATINGS, discRating, "评分 ", true);
-  _fillSel("discRuntimeSel", RUNTIMES, discRuntime, "时长 ", true);
-  _fillSel("discSortSel", SORTS, discSort, "排序 ", false);
+  _fillSel("discYearSel", YEARS, discYear, "年代", true);
+  _fillSel("discCountrySel", COUNTRIES, discCountry, "国别", true);
+  _fillSel("discRatingSel", RATINGS, discRating, "评分", true);
+  _fillSel("discRuntimeSel", RUNTIMES, discRuntime, "时长", true);
+  _fillSel("discSortSel", SORTS, discSort, "排序", false);
   const rt=document.getElementById("discRuntimeSel");
   if(rt) rt.style.display=(discKind==="tv")?"none":"";
 }
-function _fillSel(id, list, currentVal, prefix, allowAll){
+function _fillSel(id, list, currentVal, ph, allowAll){
   const el=document.getElementById(id);
   if(!el)return;
   let opts=[];
-  if(allowAll && list.length>0 && list[0][0]!==""){
-    opts.push('<option value="">'+escAttr(prefix+"全部")+'</option>');
+  if(allowAll){
+    opts.push('<option value="">'+escAttr(ph||"全部")+'</option>');
   }
-  opts=opts.concat(list.map(x=>{
-    const isEmpty=(x[0]===""||x[0]==null);
-    const txt=isEmpty?x[1]:(prefix?prefix+x[1]:x[1]);
-    return '<option value="'+escAttr(x[0])+'">'+escAttr(txt)+'</option>';
-  }));
+  opts=opts.concat(list.map(x=>'<option value="'+escAttr(x[0])+'">'+escAttr(x[1])+'</option>'));
   el.innerHTML=opts.join("");
   el.value=currentVal||"";
 }
@@ -3052,8 +3100,7 @@ function handleAddResult(res, btn){
       if(btn){btn.textContent="已预览";btn.disabled=false;}
     }else{
       toast("✅ "+res.title+" 已添加，正在搜索资源…","ok");
-      if(btn)btn.textContent="✓ 已添加";
-      switchTo("queue"); loadQueue(); if(res.title)watchAdded(res.title);
+      if(btn){btn.textContent="✓ 已添加";btn.disabled=false;}
     }
   }else{
     toast("❌ "+(res.error||"添加失败"),"err");
@@ -3362,7 +3409,8 @@ function loadSystem(){
          svcs.filter(s=>s.ok).length+'/'+svcs.length+' 正常</div>';
       h+=svcs.map(s=>{
         const dot=s.ok?'<span class="sdot ok"></span>':'<span class="sdot err"></span>';
-        const link='<a class="slink" href="/p/'+s.key+'/" target="_blank" rel="noopener noreferrer">打开 ↗</a>';
+        const link = s.web ? '<a class="slink" href="/p/'+s.key+'/" target="_blank" rel="noopener noreferrer">打开 ↗</a>'
+                           : '<span class="muted" style="font-size:12px">无 Web 界面</span>';
         const loginBtn='';
         return '<div class="queue-item"><div class="top"><b>'+dot+esc(s.name||"")+'</b>'+
           '<span class="muted">'+esc(s.detail||"")+link+loginBtn+'</span></div>'+
@@ -3550,10 +3598,6 @@ function apLoadConfig(){
     document.getElementById("ap_TMDB_KEY").value=v.TMDB_KEY||"";
     const tokEl=document.getElementById("ap_AUTH_TOKEN"); if(tokEl)tokEl.value=v.AUTH_TOKEN||"";
     const whEl=document.getElementById("ap_WEBHOOK_URL"); if(whEl)whEl.value=v.WEBHOOK_URL||"";
-    const ddEl=document.getElementById("ap_DATA_DIR"); if(ddEl)ddEl.value=v.DATA_DIR||"";
-    const qbEl=document.getElementById("ap_QB_SAVE_PATH"); if(qbEl)qbEl.value=v.QB_SAVE_PATH||"";
-    const mvEl=document.getElementById("ap_MOVIE_ROOT"); if(mvEl)mvEl.value=v.MOVIE_ROOT||"";
-    const tvEl=document.getElementById("ap_TV_ROOT"); if(tvEl)tvEl.value=v.TV_ROOT||"";
     if(st)st.textContent="已加载";
   }).catch(e=>{ if(st)st.textContent="加载失败："+e; });
 }
@@ -3564,11 +3608,7 @@ function apSaveConfig(){
     proxy_url:document.getElementById("ap_PROXY_URL").value.trim(),
     tmdb_key:document.getElementById("ap_TMDB_KEY").value.trim(),
     auth_token:document.getElementById("ap_AUTH_TOKEN").value.trim(),
-    webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim(),
-    data_dir:document.getElementById("ap_DATA_DIR").value.trim(),
-    qb_save_path:document.getElementById("ap_QB_SAVE_PATH").value.trim(),
-    movie_root:document.getElementById("ap_MOVIE_ROOT").value.trim(),
-    tv_root:document.getElementById("ap_TV_ROOT").value.trim()
+    webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim()
   };
   jpost("/api/config", payload).then(d=>{
     if(d&&d.ok){ if(st)st.textContent="已保存"; toast("配置已写入");
@@ -3579,12 +3619,19 @@ function apSaveConfig(){
 }
 function apNetTest(){
   const el=document.getElementById("apNetTest");
-  if(el)el.textContent="测试中…";
+  const tg=document.getElementById("apNetTargets");
+  if(el)el.innerHTML="测试中…";
+  if(tg)tg.textContent="";
   jget("/api/nettest").then(d=>{
     const v=(d&&d.verdict)||"未知";
-    if(el)el.textContent=v;
+    const hosts=(d&&d.targets)||[];
+    if(tg)tg.textContent=hosts.length?("本次测试："+hosts.join(" · ")):"";
+    let html='<div style="margin-top:4px">'+esc(v)+'</div>';
+    const dr=(d&&d.direct&&d.direct.detail)||"";
+    if(dr)html+='<div class="muted" style="margin-top:4px">首达：'+esc(dr)+'</div>';
+    if(el)el.innerHTML=html;
     toast(v);
-  }).catch(e=>{ if(el)el.textContent="测试失败："+e; toast("测试失败："+e,"err"); });
+  }).catch(e=>{ if(el)el.innerHTML="测试失败："+esc(""+e); toast("测试失败："+e,"err"); });
 }
 function apTestWebhook(){
   const el=document.getElementById("apWhStatus");
@@ -3959,7 +4006,7 @@ class H(BaseHTTPRequestHandler):
                         except Exception:
                             length = 0
                         body = self.rfile.read(length) if length else None
-                        self._proxy_pass(svc_name, _PROXY_DEFS[svc_name], "initialize.json", self.command, body)
+                        self._proxy_pass(svc_name, _PROXY_DEFS[svc_name], "initialize.json", self.command, body, upstream_path="/p/" + svc_name + "/initialize.json")
                         return
             self._send(404, {"error": "unknown service"}); return
         parts = rest.strip("/").split("/", 2)
@@ -3978,9 +4025,19 @@ class H(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else None
         self._proxy_pass(service, svc, subpath, method, body)
 
-    def _proxy_pass(self, service, svc, subpath, method, body):
+    def _proxy_pass(self, service, svc, subpath, method, body, upstream_path=None):
         upstream = svc["url"].rstrip("/")
-        target = upstream + "/" + subpath if subpath else upstream + "/"
+        # 保留完整 /p/<svc>/ 前缀转发：urlBase=/p/<svc> 时 *arr 在 /p/<svc>/ 下服务全部资源与 API，
+        # 前缀不能剥掉，否则 *arr 收不到 /p/<svc>/ 路径而 404。
+        if upstream_path is None:
+            if svc["kind"] in ("qb", "none"):
+                # qB / FlareSolverr 在根路径服务（无 urlBase 概念），必须剥掉 /p/<svc>/ 前缀转发到根；
+                # 其前端用相对路径，剥离前缀后相对 URL 自动落在 /p/<svc>/ 下，不会出现 404。
+                upstream_path = "/" + subpath if subpath else "/"
+            else:
+                # *arr 已设 urlBase=/p/<svc>，必须保留完整 /p/<svc>/ 前缀转发
+                upstream_path = self.path.split("?", 1)[0]
+        target = upstream + upstream_path
         kind = svc["kind"]
         headers = {}
         # 强制上游返回明文，避免 gzip 被我们剥离 content-encoding 后浏览器解析乱码/白屏
@@ -4003,9 +4060,11 @@ class H(BaseHTTPRequestHandler):
             if key:
                 headers["X-Api-Key"] = key
         elif kind == "qb":
-            sid = _ensure_qb_sid()
+            sid, csrf = _ensure_qb_sid()
             if sid:
-                headers["Cookie"] = "SID=" + sid
+                headers["Cookie"] = sid
+                if csrf:
+                    headers["X-Csrftoken"] = csrf
         if body is None and method not in ("GET", "HEAD"):
             headers["Content-Length"] = "0"
         use_ssl = upstream.startswith("https")
@@ -4056,7 +4115,7 @@ def main():
         threading.Thread(target=webhook_watcher, args=(30,), daemon=True).start()
         print("[autopilot] webhook watcher -> %s" % WEBHOOK_URL)
     threading.Thread(target=seed_indexers_loop, kwargs={"max_retries": 20, "wait": 15}, daemon=True).start()
-    print("[autopilot] indexer seeder -> 后台幂等补齐 7 个公共索引器", flush=True)
+    print("[autopilot] indexer seeder -> 后台幂等补齐 SEED_INDEXER_NAMES 中的公共索引器", flush=True)
     threading.Thread(target=_arr_bootstrap, daemon=True).start()
     print("[autopilot] *arr 账号初始化（后台）：自动建管理员账号 + 设 BaseUrl=/p/<svc>", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), H)
