@@ -3967,10 +3967,11 @@ class H(BaseHTTPRequestHandler):
             if rw:
                 headers["Referer"] = rw
         if kind == "arr":
-            tok = _ensure_arr_token(service)
-            if tok:
-                headers["Authorization"] = "Bearer " + tok
-                headers["Cookie"] = "auth_token=" + tok
+            # 用稳定的 API Key 直接鉴权（注入 X-Api-Key），不依赖管理员账号密码，
+            # 避免 bootstrap 生成的密码与 *arr 实际账号不一致导致 JWT 登录 401、SPA 白屏。
+            key = _arr_api_key(service)
+            if key:
+                headers["X-Api-Key"] = key
         elif kind == "qb":
             sid = _ensure_qb_sid()
             if sid:
