@@ -1144,11 +1144,13 @@ def remove_from_series_queue(qid, remove_from_client=True):
 
 
 # ---------- 抓取历史（Radarr / Sonarr history） ----------
-def _history_records(rq, kind_label, limit=20):
-    """取某服务的抓取历史记录；返回统一字段，便于前后端合并渲染。"""
+def _history_records(rq, kind_label, limit=20, offset=0):
+    """取某服务的抓取历史记录；返回统一字段，便于前后端合并渲染。
+    offset 用于分页（Radarr/Sonarr history API 的 page 从 1 起）。"""
     try:
-        h = rq("GET", "/api/v3/history?pageSize=%d&sortDirection=descending&sortKey=date"
-               % limit) or {}
+        page = offset // limit + 1
+        h = rq("GET", "/api/v3/history?page=%d&pageSize=%d&sortDirection=descending&sortKey=date"
+               % (page, limit)) or {}
     except Exception:
         return []
     out = []
@@ -1168,13 +1170,13 @@ def _history_records(rq, kind_label, limit=20):
     return out
 
 
-def recent_history(kind="all", limit=20):
+def recent_history(kind="all", limit=20, offset=0):
     """电影 / 剧集抓取历史合并，按时间倒序。kind=movie|tv|all。"""
     out = []
     if kind in ("movie", "all"):
-        out += _history_records(r_req, "movie", limit)
+        out += _history_records(r_req, "movie", limit, offset)
     if kind in ("tv", "all"):
-        out += _history_records(s_req, "tv", limit)
+        out += _history_records(s_req, "tv", limit, offset)
     out.sort(key=lambda x: x.get("date") or "", reverse=True)
     return out[:limit]
 
@@ -2326,9 +2328,15 @@ def _tmdb_cache_put(key, data):
         with _tmdb_db_lock:
             conn = _tmdb_cache_conn()
             try:
+                now = time.time()
                 conn.execute(
                     "INSERT OR REPLACE INTO tmdb_cache (key, data, fetched_at) VALUES (?,?,?)",
-                    (k, blob, time.time()))
+                    (k, blob, now))
+                # 顺带清理已过期条目，避免 discover.db 无限膨胀
+                # （读路径虽已按 TTL 判失效，但旧行若不删会一直占空间）
+                conn.execute(
+                    "DELETE FROM tmdb_cache WHERE fetched_at < ?",
+                    (now - _TMDB_CACHE_TTL,))
                 conn.commit()
             finally:
                 conn.close()
@@ -3615,14 +3623,22 @@ const HIST_LABEL={
 function _fmtDate(s){return s?esc(String(s).replace("T"," ").replace("Z","")):"";}
 
 let _histKind="all";
-function loadHistory(){
-  jget("/api/history?kind="+_histKind).then(d=>{
-    const box=document.getElementById("history");
+let _histOffset=0, _histItems=[], _histLoading=false;
+function loadHistory(reset){
+  const box=document.getElementById("history");
+  if(reset){_histOffset=0;_histItems=[];}
+  if(_histLoading)return;
+  _histLoading=true;
+  jget("/api/history?kind="+_histKind+"&limit=20&offset="+_histOffset).then(d=>{
     const items=d.history||[];
-    if(!items.length){box.innerHTML='<div class="muted">暂无抓取记录。</div>';return;}
+    if(_histOffset===0)_histItems=[];
+    // 去重（按 title+date），避免跨页重复
+    const seen=new Set(_histItems.map(x=>x.title+"|"+x.date));
+    items.forEach(it=>{const k=it.title+"|"+it.date; if(!seen.has(k)){_histItems.push(it);seen.add(k);}});
+    if(!_histItems.length){box.innerHTML='<div class="muted">暂无抓取记录。</div>';_histLoading=false;return;}
     const filt=(k,l)=>'<button class="fbtn'+( _histKind===k?' active':'')+'" data-h="'+k+'">'+l+'</button>';
     let h='<div class="qrow"><div class="filters" id="hFilters">'+filt("all","全部")+filt("movie","🎬 电影")+filt("tv","📺 剧集")+'</div></div>';
-    h+=items.map(it=>{
+    h+=_histItems.map(it=>{
       const ev=HIST_LABEL[it.eventType]||{t:(it.eventType||"未知"),c:"off"};
       const evTag='<span class="tag '+(ev.c==="ok"?"ok":(ev.c==="err"?"off":"off"))+'">'+esc(ev.t)+'</span>';
       const kTag=(_histKind==="all"&&it.kind)?'<span class="tag '+(it.kind==="tv"?"warn":"")+'">'+(it.kind==="tv"?"📺 剧集":"🎬 电影")+'</span>':"";
@@ -3632,11 +3648,18 @@ function loadHistory(){
       return '<div class="queue-item"><div class="top"><b>'+esc(it.title||"")+'</b>'+evTag+'</div>'+
         '<div class="sub">'+kTag+idx+q+(sz?'<span>'+sz+'</span>':"")+(it.date?'<span>'+_fmtDate(it.date)+'</span>':"")+'</div></div>';
     }).join("");
+    // 若本页满 20 条，说明可能还有更多
+    if(items.length>=20){
+      h+='<div class="qrow" style="justify-content:center;margin-top:10px"><button class="btn" id="histMore">加载更多…</button></div>';
+    }
     box.innerHTML=h;
     box.querySelectorAll("#hFilters .fbtn").forEach(b=>{b.onclick=()=>{
-      _histKind=b.getAttribute("data-h");loadHistory();
+      _histKind=b.getAttribute("data-h");loadHistory(true);
     };});
-  }).catch(e=>{document.getElementById("history").innerHTML='<div class="err">加载失败: '+e+'</div>';});
+    const more=document.getElementById("histMore");
+    if(more)more.onclick=()=>{_histOffset+=20;loadHistory(false);};
+    _histLoading=false;
+  }).catch(e=>{document.getElementById("history").innerHTML='<div class="err">加载失败: '+e+'</div>';_histLoading=false;});
 }
 
 function _localTime(iso){
@@ -3868,7 +3891,16 @@ class H(BaseHTTPRequestHandler):
                     self._send(200, system_status())
                 elif base.startswith("/api/history"):
                     hkind = (_qs.get("kind") or ["all"])[0]
-                    self._send(200, {"history": recent_history(hkind)})
+                    try:
+                        hlimit = int((_qs.get("limit") or ["20"])[0])
+                    except Exception:
+                        hlimit = 20
+                    try:
+                        hoff = int((_qs.get("offset") or ["0"])[0])
+                    except Exception:
+                        hoff = 0
+                    self._send(200, {"history": recent_history(hkind, hlimit, hoff),
+                                     "limit": hlimit, "offset": hoff})
                 elif base.startswith("/api/indexers"):
                     self._send(200, indexer_health())
                 elif base.startswith("/api/rootfolders"):
