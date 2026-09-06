@@ -1771,6 +1771,12 @@ def _ensure_arr_admin_pass():
         pass
 
 
+def _arr_api_ver(service):
+    # Prowlarr 的 API 是 v1，Radarr/Sonarr 是 v3，且 v4 的 Sonarr/Radarr 把 config
+    # 拆成了 /config/host（旧版统一 /api/v3/config 在新版本已 404）。
+    return "v1" if service == "prowlarr" else "v3"
+
+
 def _arr_api_key(service):
     if service == "radarr":
         return get_radarr_key()
@@ -1782,8 +1788,8 @@ def _arr_api_key(service):
 
 
 def _arr_create_account(service):
-    """首次运行经 /api/v3/auth 创建管理员账号（已存在则跳过）。返回 'created'/'exists'/'err'。"""
-    url = _PROXY_DEFS[service]["url"].rstrip("/") + "/api/v3/auth"
+    """首次运行经 /api/<ver>/auth 创建管理员账号（已存在则跳过）。返回 'created'/'exists'/'err'。"""
+    url = _PROXY_DEFS[service]["url"].rstrip("/") + f"/api/{_arr_api_ver(service)}/auth"
     data = json.dumps({"username": ARR_ADMIN_USER, "password": ARR_ADMIN_PASS}).encode()
     req = Request(url, data=data,
                   headers={"Content-Type": "application/json", "Accept": "application/json"},
@@ -1801,28 +1807,30 @@ def _arr_create_account(service):
 
 
 def _arr_set_config(service):
-    """读全量配置 -> 合并 authenticationMethod=forms 与 urlBase=/p/<service> -> 整体写回（PUT 要求完整对象）。"""
+    """读 host 配置 -> 设 urlBase=/p/<service> + authenticationMethod=forms -> 写回。
+    Sonarr v4 / Radarr v5 已把 /api/v3/config 拆为 /api/v3/config/host（统一端点 404）。"""
     key = _arr_api_key(service)
     if not key:
         return
-    url = _PROXY_DEFS[service]["url"].rstrip("/") + "/api/v3/config"
+    base = _PROXY_DEFS[service]["url"].rstrip("/") + f"/api/{_arr_api_ver(service)}"
+    cfg_url = base + "/config/host"
     try:
-        with urlopen(Request(url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
+        with urlopen(Request(cfg_url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
             cfg = json.loads(r.read().decode())
         cfg["authenticationMethod"] = "forms"
-        # Sonarr/Radarr/Prowlarr JSON 字段是 camelCase 的 urlBase（不是 baseUrl），
-        # 写错大小写会被静默忽略，表现为 /initialize.json 返回 urlBase=""、SPA chunk 全 404。
         cfg["urlBase"] = "/p/" + service
-        req = Request(url, data=json.dumps(cfg).encode(),
+        req = Request(cfg_url, data=json.dumps(cfg).encode(),
                       headers={"X-Api-Key": key, "Content-Type": "application/json", "Accept": "application/json"},
                       method="PUT")
         with urlopen(req, timeout=30) as r:
             r.read()
         # 写后立刻 GET 验证，没生效就报错（之前 except 静默吞错是隐性雷区）
-        with urlopen(Request(url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
+        with urlopen(Request(cfg_url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
             verify = json.loads(r.read().decode())
         if verify.get("urlBase") != "/p/" + service:
             print("[autopilot] %s urlBase 设置失败，当前=%r" % (service, verify.get("urlBase")), flush=True)
+        else:
+            print("[autopilot] %s urlBase 验证通过 (/p/%s)" % (service, service), flush=True)
     except Exception as e:
         print("[autopilot] %s _arr_set_config 异常: %s" % (service, e), flush=True)
 
@@ -1847,7 +1855,7 @@ def _ensure_arr_token(service):
         t = _arr_tokens.get(service)
         if t and t[1] > time.time() + 30:
             return t[0]
-    url = _PROXY_DEFS[service]["url"].rstrip("/") + "/api/v3/auth/login"
+    url = _PROXY_DEFS[service]["url"].rstrip("/") + f"/api/{_arr_api_ver(service)}/auth/login"
     data = json.dumps({"username": ARR_ADMIN_USER, "password": ARR_ADMIN_PASS}).encode()
     req = Request(url, data=data,
                   headers={"Content-Type": "application/json", "Accept": "application/json"},
