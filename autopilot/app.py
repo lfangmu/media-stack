@@ -2552,7 +2552,10 @@ def system_status():
 
 
 # ---------- HTTP ----------
-PAGE = """<!doctype html>
+# 注意：PAGE 必须是 raw 字符串(r""")。HTML 内联 JS 含正则 /\r?\n/ 与 "...\n..."，
+# 若用普通字符串，Python 会把 \r \n 解释成真实控制字符，导致浏览器端 JS 正则
+# 字面量被换行截断、整段脚本 SyntaxError、页面"点不动"。raw 让反斜杠原样留给 JS。
+PAGE = r"""<!doctype html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
