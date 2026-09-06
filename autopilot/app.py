@@ -1368,13 +1368,26 @@ def enable_indexer(name):
 
 
 # ---------- 索引器自动播种（幂等） ----------
+# 公共索引器清单（2026-09-06 全量探测后固化）：
+# - 对 Prowlarr 全部 torrent 定义做连通性探测，仅保留「能用」的（直连可用 + 经 FlareSolverr 解 CF 可用的）。
+# - 幂等补齐：新装 / 重置后 autopilot 启动会自动补齐这些；站点临时不可达时按 seed_indexers_loop 重试。
+# - 名称即 Prowlarr schema 的索引器显示名（大小写不敏感匹配）。
 SEED_INDEXER_NAMES = [
-    "YTS", "Knaben", "The Pirate Bay", "Uindex",
-    "TorrentsCSV", "LimeTorrents", "Anibt",
-    # 新增：通用 / 剧集 / 动漫 公共索引器（按 Prowlarr schema 名，自动补齐，可达才加）
-    "EZTV", "Nyaa.si", "Torrent Downloads", "kickasstorrents.to",
-    "Internet Archive", "dmhy", "RuTor", "Torrent9", "showRSS", "SubsPlease",
-    "1337x",
+    # ---- 受 Cloudflare 保护（需 FlareSolverr 代理，自动打 cf 标签）----
+    "1337x", "BT.etree", "DaMagNet", "EZTV", "Torrent[CORE]", "Torrenttip",
+    # ---- 直连可用的公共索引器 ----
+    "0Magnet", "ACG.RIP", "Anibt", "AnimeTosho", "ArabTorrents", "Bangumi Moe",
+    "BigFANGroup", "Byrutor", "Catorrent", "CrackingPatching", "E-Hentai", "EZTVL",
+    "FileMood", "Free JAV Torrent", "GamesTorrents", "Internet Archive", "Knaben",
+    "LimeTorrents", "Mac Torrents Download", "MagnetDownload", "MegaPeer", "Metal Tracker",
+    "Mikan", "MioBT", "MixtapeTorrent", "MyPornClub", "NewStudio", "NewStudioL",
+    "Nipponsei", "NoNaMe Club", "NoNaMe ClubL", "Nyaa.si", "PC-torrent", "Polskie-Torrenty",
+    "PornRips", "PornXLab", "PornoTorrent", "RuTor", "Sexy-Pics", "Shana Project",
+    "SubsPlease", "The Pirate Bay", "Tokyo Toshokan", "Torrent Downloads", "Torrent9",
+    "TorrentDownload", "TorrentKitty", "TorrentsCSV", "Torrentsome", "U3C3", "Uindex",
+    "VST Torrentz", "VSTHouse", "World-torrent", "XXXClub", "YTS", "comicat", "dmhy",
+    "kickasstorrents.ws", "nekoBT", "showRSS", "sosulki", "sukebei.nyaa.si",
+    "torrent-pirat", "xxxtor",
 ]
 
 # ---- FlareSolverr 索引器代理（解 Cloudflare 保护的公共索引器，如 1337x / TPB）----
@@ -1384,7 +1397,8 @@ SEED_INDEXER_NAMES = [
 # FlareSolverr 解 CF，从而能正常添加；搜索阶段也自动走 FlareSolverr。
 FLARE_TAG = "cf"
 CF_INDEXER_NAMES = {
-    "1337x", "the pirate bay", "torrent9", "limetorrents", "kickasstorrents.to", "eztv", "uindex",
+    # 实测需经 FlareSolverr 解 Cloudflare 才能添加/搜索的公共索引器（与 Prowlarr 中 cf 标签一致）
+    "1337x", "bt.etree", "damagnet", "eztv", "torrent[core]", "torrenttip",
 }
 
 
