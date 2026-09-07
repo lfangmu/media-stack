@@ -3036,7 +3036,8 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="muted" style="margin-bottom:10px">外网出口与 TMDB 配置。保存后即时生效（自动写入 <code>.env</code> 并重启出口代理）。</div>
     <label class="cfg-row" style="display:block;margin:8px 0"><span>代理链接 Proxy URL</span>
-      <input id="ap_PROXY_URL" style="width:100%;margin-top:4px;padding:8px" placeholder="http://user:pass@host:port（留空=仅内网）"></label>
+      <input id="ap_PROXY_URL" style="width:100%;margin-top:4px;padding:8px" placeholder="http://user:pass@host:port"></label>
+    <div class="muted" style="margin-top:6px;font-size:12px;line-height:1.5">留空 = 所有容器经 Squid 直连当前环境网络（WSL 下即直连公网）；填写 = 出网统一经 Squid 上行到此代理。保存后只重启出口代理 proxy-forwarder，*arr/qB/FlareSolverr 无需重启。</div>
     <label class="cfg-row" style="display:block;margin:8px 0"><span>TMDB API Key</span>
       <input id="ap_TMDB_KEY" type="password" style="width:100%;margin-top:4px;padding:8px" placeholder="在 themoviedb.org 申请的 v3 API Key"></label>
     <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
