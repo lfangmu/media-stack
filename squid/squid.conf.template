@@ -1,6 +1,7 @@
 # 影视下载台 · squid 模板
-# 由 entrypoint.sh 按 .env 中的 UPSTREAM_PROXY_* 生成（注意：本行不能含 __CACHE_PEER_LINES__ 占位符，否则 sed 会把它也替换掉并注入非法指令导致 squid 起不来）。
-# 未配置上游时：never_direct 强制所有外网请求经 peer；无 peer 即“仅内网”。
+# 由 entrypoint.sh 按 .env 中的 UPSTREAM_PROXY_* 生成。
+# 本模板不要手写 cache_peer / never_direct 行；相关指令由 entrypoint.sh 注入，
+# 手写会被 squid 当成非法指令导致解析失败（FATAL: Bungled）。
 
 http_port 3128
 
@@ -14,6 +15,7 @@ http_access deny all
 
 # 有上游代理时强制走 peer（never_direct）；无上游则允许直连（always_direct），
 # 这样「宿主机本身能上外网、不配代理」时也能直接出网。具体指令由 entrypoint.sh 注入。
+
 __DIRECTIVE__
 
 __CACHE_PEER_LINES__
