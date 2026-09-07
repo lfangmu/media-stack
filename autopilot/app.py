@@ -4543,6 +4543,20 @@ class H(BaseHTTPRequestHandler):
                 v = _rewrite_set_cookie(service, v)
             out_headers[k] = v
         ctype = resp_headers.get("Content-Type", "")
+        # SPA 启动时拉 /p/<svc>/initialize.json，里面的 urlBase 决定 React Router basename。
+        # 上游 urlBase="" → basename=/ → /p/<svc>/ 被当无效路由 → 永远 "You must be lost"。
+        # 在响应里把 urlBase 改写成 /p/<svc>，basename 对齐路由即匹配。
+        # apiRoot 保持原样(/api/v3|1 根绝对)：仍由 /api/v3|1 入口守卫 + Referer 承接，行为不变。
+        _init_path = self.path.split("?", 1)[0]
+        if _init_path.endswith("/initialize.json") and "json" in ctype.lower():
+            try:
+                import json as _j
+                _d = _j.loads(resp_body.decode("utf-8", "replace"))
+                if isinstance(_d, dict) and _d.get("urlBase", "") == "":
+                    _d["urlBase"] = "/p/" + service
+                    resp_body = _j.dumps(_d, ensure_ascii=False).encode("utf-8")
+            except Exception:
+                pass
         # 所有 kind 的 HTML 都要重写绝对路径（arr 是 SPA，漏掉会白屏）
         if "text/html" in ctype:
             resp_body = _rewrite_html_body("/p/" + service, resp_body)
