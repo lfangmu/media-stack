@@ -2030,12 +2030,12 @@ def _arr_set_config(service):
     try:
         with urlopen(Request(cfg_url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
             cfg = json.loads(r.read().decode())
-        # 设 urlBase=/p/<svc>：*arr 据此把 window.Sonarr.urlBase 注入页面，
-        # Vite 运行时 publicPath = urlBase + "/"，所有 JS chunk / API / 静态资源都走 /p/<svc>/，
-        # 与代理「保留完整 /p/<svc>/ 前缀转发」一致，SPA 才能正常挂载
-        # （否则 chunk 走根绝对路径 404 白屏）。鉴权绕过靠 config.xml 的 LocalAddresses
+        # 设 urlBase=""（根路径服务）：与代理「剥掉 /p/<svc>/ 前缀转发到根」+ 响应里根绝对路径
+        # 由 _rewrite_* 统一加回 /p/<svc>/ 前缀的策略一致（见 _proxy_pass / _rewrite_html_body）。
+        # 若设成 /p/<svc>，*arr 会把 API 挪到 /p/<svc>/api/v3，既让本函数自己的 API 调用 404，
+        # 又与重写函数冲突导致白屏。鉴权绕过靠 config.xml 的 LocalAddresses
         # （API 无此字段）：把 autopilot 容器来源(172.18.0.0/16) 视为本地，SPA 不再弹登录页。
-        cfg["urlBase"] = "/p/" + service
+        cfg["urlBase"] = ""
         cfg["authenticationRequired"] = "disabledForLocalAddresses"
         cfg["authenticationMethod"] = "forms"
         req = Request(cfg_url, data=json.dumps(cfg).encode(),
@@ -2046,23 +2046,133 @@ def _arr_set_config(service):
         # 写后立刻 GET 验证，没生效就报错（之前 except 静默吞错是隐性雷区）
         with urlopen(Request(cfg_url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
             verify = json.loads(r.read().decode())
-        if verify.get("urlBase") != "/p/" + service:
+        if verify.get("urlBase") != "":
             print("[autopilot] %s urlBase 设置失败，当前=%r" % (service, verify.get("urlBase")), flush=True)
         else:
-            print("[autopilot] %s 配置就绪 (urlBase=/p/%s, auth=disabledForLocalAddresses)" % (service, service), flush=True)
+            print("[autopilot] %s 配置就绪 (urlBase=\"\", auth=disabledForLocalAddresses)" % service, flush=True)
     except Exception as e:
         print("[autopilot] %s _arr_set_config 异常: %s" % (service, e), flush=True)
 
 
+def _arr_fix_config_xml(service):
+    """把 *arr 的 config.xml 强制修正为「可信代理」模式：
+    AuthenticationRequired=disabledForLocalAddresses + LocalAddresses 含 172.18.0.0/16 + UrlBase=\"\"。
+    原因：LocalAddresses/UrlBase 这类字段只能落 config.xml（*arr 只读启动加载，API 改了不持久），
+    而 autopilot 代理来源(172.18.0.0/16) 必须被 *arr 视为本地才免登录。否则全新 *arr 容器
+    默认 LocalAddresses=127.0.0.1,::1 -> autopilot 被当远程 -> SPA 弹登录/白屏。
+    关键坑：*arr 容器无 python3，且优雅关闭会回写 config.xml，故「exec python3 改 + restart」
+    会失败/被覆盖。改用 stop -> 宿主侧临时容器(media-autopilot 自带 python3)改写 bind 挂载的
+    config.xml -> start。已正确则跳过，避免每次自启都重启。"""
+    container = "media-" + service
+    cfg_host = "/opt/media/%s-config" % service
+    try:
+        import subprocess
+        # 1) 幂等：先读当前 config.xml（best-effort），已含白名单+可信代理就跳过
+        try:
+            cur = subprocess.run(["docker", "exec", container, "cat", "/config/config.xml"],
+                                 capture_output=True, text=True, timeout=30).stdout
+            if "172.18.0.0/16" in cur and "disabledForLocalAddresses" in cur:
+                return
+        except Exception:
+            pass
+        # 2) 停 *arr（让其把内存配置回写，文件稳定后再改，避免被覆盖）
+        subprocess.run(["docker", "stop", container], capture_output=True, text=True, timeout=90)
+        # 3) 宿主侧临时容器(media-autopilot 自带 python3)改写 bind 挂载的 config.xml
+        script = (
+            "import re\n"
+            "p='/cfg/config.xml'\n"
+            "s=open(p,encoding='utf-8').read()\n"
+            "s=re.sub(r'<AuthenticationRequired>.*?</AuthenticationRequired>','<AuthenticationRequired>disabledForLocalAddresses</AuthenticationRequired>',s)\n"
+            "if '<LocalAddresses>' in s:\n"
+            " s=re.sub(r'<LocalAddresses>.*?</LocalAddresses>','<LocalAddresses>127.0.0.1,::1,172.18.0.0/16</LocalAddresses>',s)\n"
+            "else:\n"
+            " s=s.replace('</AuthenticationRequired>','</AuthenticationRequired>\\n  <LocalAddresses>127.0.0.1,::1,172.18.0.0/16</LocalAddresses>',1)\n"
+            "s=re.sub(r'<UrlBase>.*?</UrlBase>','<UrlBase></UrlBase>',s)\n"
+            "open(p,'w',encoding='utf-8').write(s)\n"
+        )
+        subprocess.run(["docker", "run", "--rm", "-v", cfg_host + ":/cfg",
+                       "media-autopilot", "python3", "-c", script],
+                      capture_output=True, text=True, timeout=120, check=True)
+        # 4) 起 *arr，读回修正后的 config.xml
+        subprocess.run(["docker", "start", container], capture_output=True, text=True, timeout=90, check=True)
+        print("[autopilot] %s config.xml 已修正(可信代理)并重启" % service, flush=True)
+    except Exception as e:
+        try:
+            subprocess.run(["docker", "start", container], capture_output=True, text=True, timeout=90)
+        except Exception:
+            pass
+        print("[autopilot] %s config.xml 修正失败(可手动修): %s" % (service, e), flush=True)
+
+
+def _qb_fix_config():
+    """qB 直登：docker 子网(172.18.0.0/16)内免认证。
+    机制=WebUI\\AuthSubnetWhitelist(等价于 *arr 的 disabledForLocalAddresses)。
+    关键坑：qB 优雅关闭会把内存配置回写 conf，故「运行中 exec 改文件 + restart」会被覆盖
+    （之前因此白忙一场）。必须在 STOP 状态改宿主 bind 文件，再 START 让它读回。
+    autopilot 的 /opt/media 是 ro，无法直接写；用自身镜像起临时容器挂载宿主 conf 目录改写。"""
+    container = "media-qbittorrent"
+    try:
+        import subprocess
+        # 1) 幂等：先确认 qB 起来且 conf 已生成，已含白名单就直接返回（避免每次自启都重启 qB）
+        subprocess.run(["docker", "start", container], capture_output=True, text=True, timeout=60)
+        for _ in range(30):
+            cur = subprocess.run(["docker", "exec", container, "cat",
+                                  "/config/qBittorrent/qBittorrent.conf"],
+                                 capture_output=True, text=True, timeout=20).stdout
+            if "AuthSubnetWhitelist" in cur:
+                return
+            if cur.strip():
+                break  # conf 已生成但无白名单，进入修正
+            time.sleep(2)
+        # 2) 停 qB（让其把当前内存配置回写，文件稳定后再改，避免被覆盖）
+        subprocess.run(["docker", "stop", container], capture_output=True, text=True, timeout=90)
+        # 3) 宿主侧临时容器改写 bind 挂载的 conf（插入到 [Preferences] 段内）
+        script = (
+            "import os\n"
+            "p='/cfg/qBittorrent/qBittorrent.conf'\n"
+            "os.makedirs(os.path.dirname(p), exist_ok=True)\n"
+            "raw=open(p,'rb').read() if os.path.exists(p) else b''\n"
+            "crlf=b'\\r\\n' in raw\n"
+            "nl='\\r\\n' if crlf else '\\n'\n"
+            "t=raw.decode('utf-8')\n"
+            "if 'AuthSubnetWhitelist' in t:\n"
+            " print('present'); raise SystemExit(0)\n"
+            "if t.strip():\n"
+            " lines=t.split('\\n'); lines=[l.rstrip('\\r') for l in lines]\n"
+            " idx=lines.index('[Preferences]')+1 if '[Preferences]' in lines else len(lines)\n"
+            " lines[idx:idx]=['WebUI\\AuthSubnetWhitelistEnabled=true','WebUI\\AuthSubnetWhitelist=172.18.0.0/16']\n"
+            " open(p,'wb').write(nl.join(lines).encode('utf-8'))\n"
+            "else:\n"
+            " open(p,'wb').write(('[Preferences]'+nl+'WebUI\\AuthSubnetWhitelistEnabled=true'+nl+'WebUI\\AuthSubnetWhitelist=172.18.0.0/16'+nl).encode('utf-8'))\n"
+            "print('patched')\n"
+        )
+        subprocess.run(["docker", "run", "--rm", "-v",
+                       "/opt/media/qbittorrent-config:/cfg",
+                       "media-autopilot", "python3", "-c", script],
+                      capture_output=True, text=True, timeout=120, check=True)
+        # 4) 起 qB，读回修正后的 conf
+        subprocess.run(["docker", "start", container], capture_output=True, text=True, timeout=90, check=True)
+        print("[autopilot] qB 配置已修正(子网白名单)并重启", flush=True)
+    except Exception as e:
+        try:
+            subprocess.run(["docker", "start", container], capture_output=True, text=True, timeout=90)
+        except Exception:
+            pass
+        print("[autopilot] qB 自愈失败(可手动给 %s 的 conf 加 WebUI\\AuthSubnetWhitelist=172.18.0.0/16): %s"
+              % (container, e), flush=True)
+
+
 def _arr_bootstrap():
-    """后台线程：等 *arr 就绪 -> 建账号 + 设 BaseUrl（幂等）。"""
+    """后台线程：等 *arr 就绪 -> 建账号 + 设 config(host) + 修正 config.xml（幂等）。"""
     _ensure_arr_admin_pass()
+    _qb_fix_config()  # qB 直登自愈（docker 子网白名单，免登录）
     for service in ("radarr", "sonarr", "prowlarr"):
         for _ in range(90):
             try:
                 _arr_create_account(service)
                 _arr_set_config(service)
-                print("[autopilot] %s 账号初始化完成 (baseUrl=/p/%s)" % (service, service), flush=True)
+                _arr_fix_config_xml(service)
+                print("[autopilot] %s 账号初始化完成 (urlBase=\"\", auth=disabledForLocalAddresses)" % service, flush=True)
                 break
             except Exception:
                 time.sleep(10)
@@ -4290,8 +4400,9 @@ class H(BaseHTTPRequestHandler):
                 # 其前端用相对路径，剥离前缀后相对 URL 自动落在 /p/<svc>/ 下，不会出现 404。
                 upstream_path = "/" + subpath if subpath else "/"
             else:
-                # *arr 已设 urlBase=/p/<svc>，必须保留完整 /p/<svc>/ 前缀转发
-                upstream_path = self.path.split("?", 1)[0]
+                # *arr 以 urlBase=""（根路径）服务，必须剥掉 /p/<svc>/ 前缀转发到根；
+                # 响应里的根绝对路径由 _rewrite_html_body/_rewrite_proxy_url 统一加回 /p/<svc>/ 前缀。
+                upstream_path = "/" + subpath if subpath else "/"
         target = upstream + upstream_path
         kind = svc["kind"]
         headers = {}
