@@ -4074,17 +4074,18 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         _rest0 = self.path.split("?", 1)[0]
-        # *arr SPA（urlBase=""）运行时以根绝对路径加载代码分割 chunk（/*.js、/Content/*.css）与版本化
-        # API（/api/v1|v3/），浏览器在 /p/<svc>/ 页面下把它们解析到 origin 根、丢掉 /p/<svc>/ 前缀 ->
-        # 绕过 /p/ 代理分支 -> 404 -> SPA 白屏/资源缺失。这里按 Referer(优先)/cookie(回退) 还原 svc 并
-        # 代理转发；解析不出 svc 则交回 autopilot 自身逻辑。autopilot 自身 API 是无版本号 /api/<noun>，
-        # 与 *arr 版本化路径不冲突。
-        if not _rest0.startswith("/p/"):
+        # 代理路由：只有 *arr/qB 请求才进代理，绝不动 autopilot 自身 /api/<noun>
+        #  - /p/<svc>/、/initialize.json、/api/v1/、/api/v3/ 必来自 *arr SPA -> 进代理
+        #  - 其它根绝对非 /api/ 路径（chunk/Content/signalr）按 Referer/cookie 还原 svc 进代理
+        #  - autopilot 自身无版本号 /api/<noun>（如 /api/system）一律交回自身逻辑，避免被
+        #    访问 /p/ 后留下的 cookie 误路由到 *arr -> 404 Not Found（2026-09-07 修复）
+        if _rest0.startswith("/p/") or _rest0 == "/initialize.json" \
+           or _rest0.startswith("/api/v1/") or _rest0.startswith("/api/v3/"):
+            self._proxy_dispatch(); return
+        if not _rest0.startswith("/api/"):
             svc = self._proxy_svc_via_request()
             if svc and svc in _PROXY_DEFS:
                 self._proxy_dispatch(); return
-        if _rest0.startswith("/p/") or _rest0 == "/initialize.json":
-            self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
         if self.path.startswith("/favicon.ico"):
@@ -4205,17 +4206,18 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         _rest0 = self.path.split("?", 1)[0]
-        # *arr SPA（urlBase=""）运行时以根绝对路径加载代码分割 chunk（/*.js、/Content/*.css）与版本化
-        # API（/api/v1|v3/），浏览器在 /p/<svc>/ 页面下把它们解析到 origin 根、丢掉 /p/<svc>/ 前缀 ->
-        # 绕过 /p/ 代理分支 -> 404 -> SPA 白屏/资源缺失。这里按 Referer(优先)/cookie(回退) 还原 svc 并
-        # 代理转发；解析不出 svc 则交回 autopilot 自身逻辑。autopilot 自身 API 是无版本号 /api/<noun>，
-        # 与 *arr 版本化路径不冲突。
-        if not _rest0.startswith("/p/"):
+        # 代理路由：只有 *arr/qB 请求才进代理，绝不动 autopilot 自身 /api/<noun>
+        #  - /p/<svc>/、/initialize.json、/api/v1/、/api/v3/ 必来自 *arr SPA -> 进代理
+        #  - 其它根绝对非 /api/ 路径（chunk/Content/signalr）按 Referer/cookie 还原 svc 进代理
+        #  - autopilot 自身无版本号 /api/<noun>（如 /api/system）一律交回自身逻辑，避免被
+        #    访问 /p/ 后留下的 cookie 误路由到 *arr -> 404 Not Found（2026-09-07 修复）
+        if _rest0.startswith("/p/") or _rest0 == "/initialize.json" \
+           or _rest0.startswith("/api/v1/") or _rest0.startswith("/api/v3/"):
+            self._proxy_dispatch(); return
+        if not _rest0.startswith("/api/"):
             svc = self._proxy_svc_via_request()
             if svc and svc in _PROXY_DEFS:
                 self._proxy_dispatch(); return
-        if _rest0.startswith("/p/") or _rest0 == "/initialize.json":
-            self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
         p = self.path.rstrip("/")
@@ -4349,17 +4351,18 @@ class H(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         _rest0 = self.path.split("?", 1)[0]
-        # *arr SPA（urlBase=""）运行时以根绝对路径加载代码分割 chunk（/*.js、/Content/*.css）与版本化
-        # API（/api/v1|v3/），浏览器在 /p/<svc>/ 页面下把它们解析到 origin 根、丢掉 /p/<svc>/ 前缀 ->
-        # 绕过 /p/ 代理分支 -> 404 -> SPA 白屏/资源缺失。这里按 Referer(优先)/cookie(回退) 还原 svc 并
-        # 代理转发；解析不出 svc 则交回 autopilot 自身逻辑。autopilot 自身 API 是无版本号 /api/<noun>，
-        # 与 *arr 版本化路径不冲突。
-        if not _rest0.startswith("/p/"):
+        # 代理路由：只有 *arr/qB 请求才进代理，绝不动 autopilot 自身 /api/<noun>
+        #  - /p/<svc>/、/initialize.json、/api/v1/、/api/v3/ 必来自 *arr SPA -> 进代理
+        #  - 其它根绝对非 /api/ 路径（chunk/Content/signalr）按 Referer/cookie 还原 svc 进代理
+        #  - autopilot 自身无版本号 /api/<noun>（如 /api/system）一律交回自身逻辑，避免被
+        #    访问 /p/ 后留下的 cookie 误路由到 *arr -> 404 Not Found（2026-09-07 修复）
+        if _rest0.startswith("/p/") or _rest0 == "/initialize.json" \
+           or _rest0.startswith("/api/v1/") or _rest0.startswith("/api/v3/"):
+            self._proxy_dispatch(); return
+        if not _rest0.startswith("/api/"):
             svc = self._proxy_svc_via_request()
             if svc and svc in _PROXY_DEFS:
                 self._proxy_dispatch(); return
-        if _rest0.startswith("/p/") or _rest0 == "/initialize.json":
-            self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
         p, qs = self._q()
@@ -4389,21 +4392,31 @@ class H(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         _rest0 = self.path.split("?", 1)[0]
-        # *arr SPA（urlBase=""）运行时以根绝对路径加载代码分割 chunk（/*.js、/Content/*.css）与版本化
-        # API（/api/v1|v3/），浏览器在 /p/<svc>/ 页面下把它们解析到 origin 根、丢掉 /p/<svc>/ 前缀 ->
-        # 绕过 /p/ 代理分支 -> 404 -> SPA 白屏/资源缺失。这里按 Referer(优先)/cookie(回退) 还原 svc 并
-        # 代理转发；解析不出 svc 则交回 autopilot 自身逻辑。autopilot 自身 API 是无版本号 /api/<noun>，
-        # 与 *arr 版本化路径不冲突。
-        if not _rest0.startswith("/p/"):
+        # 代理路由：只有 *arr/qB 请求才进代理，绝不动 autopilot 自身 /api/<noun>
+        #  - /p/<svc>/、/initialize.json、/api/v1/、/api/v3/ 必来自 *arr SPA -> 进代理
+        #  - 其它根绝对非 /api/ 路径（chunk/Content/signalr）按 Referer/cookie 还原 svc 进代理
+        #  - autopilot 自身无版本号 /api/<noun>（如 /api/system）一律交回自身逻辑，避免被
+        #    访问 /p/ 后留下的 cookie 误路由到 *arr -> 404 Not Found（2026-09-07 修复）
+        if _rest0.startswith("/p/") or _rest0 == "/initialize.json" \
+           or _rest0.startswith("/api/v1/") or _rest0.startswith("/api/v3/"):
+            self._proxy_dispatch(); return
+        if not _rest0.startswith("/api/"):
             svc = self._proxy_svc_via_request()
             if svc and svc in _PROXY_DEFS:
                 self._proxy_dispatch(); return
-        if _rest0.startswith("/p/") or _rest0 == "/initialize.json":
-            self._proxy_dispatch(); return
         self._send(405, {"error": "method not allowed"})
 
     def _proxy_dispatch(self):
-        rest = self.path.split("?", 1)[0]
+        # 保留原始 query string：*arr 大量 API（搜索 / 详情 / signalR 协商）依赖 query 参数，
+        # 此前 self.path.split("?")[0] 把 query 整个丢掉 -> 转发成无参路径 -> *arr 返回
+        # ASP.NET 默认 404 文本 "Not Found" -> 前端 JSON.parse 抛 SyntaxError（即页面报
+        # "请求失败: Unexpected token 'N', Not Found"）。这里把 query 抽出来拼回 upstream_path。
+        full = self.path
+        if "?" in full:
+            rest, _qs = full.split("?", 1)
+            qs = "?" + _qs
+        else:
+            rest, qs = full, ""
         # SPA（urlBase=""）发出的「根绝对路径」/api/... 与 /initialize.json：
         # 浏览器把它们解析到 origin 根，丢掉 /p/<svc>/ 前缀 -> 绕过 /p/ 代理分支 -> 404 -> SPA 白屏。
         # 这里按 Referer(优先, 每请求精确) 或 cookie(回退, 同源共享) 还原 svc，转发到 *arr 根路径
@@ -4416,8 +4429,8 @@ class H(BaseHTTPRequestHandler):
                 except Exception:
                     length = 0
                 body = self.rfile.read(length) if length else None
-                # upstream_path=None -> "/" + subpath，转发到 *arr 根（urlBase=""）
-                self._proxy_pass(svc_name, _PROXY_DEFS[svc_name], rest.lstrip("/"), self.command, body)
+                # upstream_path=None -> "/" + subpath，转发到 *arr 根（urlBase=""）；qs 一并带回去
+                self._proxy_pass(svc_name, _PROXY_DEFS[svc_name], rest.lstrip("/") + qs, self.command, body)
                 return
             self._send(404, {"error": "unknown service"}); return
         parts = rest.strip("/").split("/", 2)
@@ -4434,11 +4447,13 @@ class H(BaseHTTPRequestHandler):
         except Exception:
             length = 0
         body = self.rfile.read(length) if length else None
-        self._proxy_pass(service, svc, subpath, method, body)
+        self._proxy_pass(service, svc, subpath + qs, method, body)
 
-    def _proxy_svc_via_request(self):
-        """从 Referer 或 cookie 还原当前 SPA 所属 svc（用于根绝对路径 /api/... 的路由）。
-        Referer 优先：每请求精确反映来源页面 /p/<svc>/，多标签不串；cookie 作为回退。"""
+    def _proxy_svc_via_request(self, allow_cookie=True):
+        """从 Referer 或 cookie 还原当前 SPA 所属 svc（用于根绝对路径请求的路由）。
+        Referer 优先：每请求精确反映来源页面 /p/<svc>/，多标签不串；cookie 作为回退。
+        allow_cookie=False 时只用 Referer：用于「非 /api/ 资源」分支，避免主页面自身
+        /api/* 被访问 /p/ 后留下的 cookie 误路由到 *arr（见入口守卫注释）。"""
         ref = self.headers.get("Referer", "")
         if ref:
             seg = [s for s in ref.rstrip("/").split("/") if s != ""]
@@ -4446,6 +4461,8 @@ class H(BaseHTTPRequestHandler):
                 i = seg.index("p")
                 if i + 1 < len(seg) and seg[i + 1] in _PROXY_DEFS:
                     return seg[i + 1]
+        if not allow_cookie:
+            return None
         for h in self.headers.get("Cookie", "").split(";"):
             if h.strip().startswith("autopilot_svc="):
                 v = h.strip().split("=", 1)[1].strip()
