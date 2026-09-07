@@ -2067,12 +2067,16 @@ def _arr_fix_config_xml(service):
     cfg_host = "/opt/media/%s-config" % service
     try:
         import subprocess
-        # 1) 幂等：先读当前 config.xml（best-effort），已含白名单+可信代理就跳过
+        # 1) 幂等：先读当前 config.xml（best-effort）。仅当「白名单+可信代理+UrlBase 为空」三者都满足才跳过；
+        #    否则仍可能 urlBase=/p/<svc> —— 代理会剥掉 /p/<svc>/ 前缀转发到根，*arr 实际只在
+        #    /p/<svc>/ 下服务资源 → 404 白屏。这是之前直登链接空白的根因，必须一并修正。
         try:
             cur = subprocess.run(["docker", "exec", container, "cat", "/config/config.xml"],
                                  capture_output=True, text=True, timeout=30).stdout
             if "172.18.0.0/16" in cur and "disabledForLocalAddresses" in cur:
-                return
+                import re as _re
+                if not _re.search(r'<UrlBase>\s*[^<]\S*?</UrlBase>', cur):
+                    return
         except Exception:
             pass
         # 2) 停 *arr（让其把内存配置回写，文件稳定后再改，避免被覆盖）
@@ -4069,7 +4073,17 @@ class H(BaseHTTPRequestHandler):
             return {"__error__": str(e)}
 
     def do_GET(self):
-        if self.path.startswith("/p/") or self.path.split("?",1)[0] == "/initialize.json":
+        _rest0 = self.path.split("?", 1)[0]
+        # *arr SPA（urlBase=""）运行时以根绝对路径加载代码分割 chunk（/*.js、/Content/*.css）与版本化
+        # API（/api/v1|v3/），浏览器在 /p/<svc>/ 页面下把它们解析到 origin 根、丢掉 /p/<svc>/ 前缀 ->
+        # 绕过 /p/ 代理分支 -> 404 -> SPA 白屏/资源缺失。这里按 Referer(优先)/cookie(回退) 还原 svc 并
+        # 代理转发；解析不出 svc 则交回 autopilot 自身逻辑。autopilot 自身 API 是无版本号 /api/<noun>，
+        # 与 *arr 版本化路径不冲突。
+        if not _rest0.startswith("/p/"):
+            svc = self._proxy_svc_via_request()
+            if svc and svc in _PROXY_DEFS:
+                self._proxy_dispatch(); return
+        if _rest0.startswith("/p/") or _rest0 == "/initialize.json":
             self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
@@ -4190,7 +4204,17 @@ class H(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path.startswith("/p/") or self.path.split("?",1)[0] == "/initialize.json":
+        _rest0 = self.path.split("?", 1)[0]
+        # *arr SPA（urlBase=""）运行时以根绝对路径加载代码分割 chunk（/*.js、/Content/*.css）与版本化
+        # API（/api/v1|v3/），浏览器在 /p/<svc>/ 页面下把它们解析到 origin 根、丢掉 /p/<svc>/ 前缀 ->
+        # 绕过 /p/ 代理分支 -> 404 -> SPA 白屏/资源缺失。这里按 Referer(优先)/cookie(回退) 还原 svc 并
+        # 代理转发；解析不出 svc 则交回 autopilot 自身逻辑。autopilot 自身 API 是无版本号 /api/<noun>，
+        # 与 *arr 版本化路径不冲突。
+        if not _rest0.startswith("/p/"):
+            svc = self._proxy_svc_via_request()
+            if svc and svc in _PROXY_DEFS:
+                self._proxy_dispatch(); return
+        if _rest0.startswith("/p/") or _rest0 == "/initialize.json":
             self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
@@ -4324,7 +4348,17 @@ class H(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_DELETE(self):
-        if self.path.startswith("/p/") or self.path.split("?",1)[0] == "/initialize.json":
+        _rest0 = self.path.split("?", 1)[0]
+        # *arr SPA（urlBase=""）运行时以根绝对路径加载代码分割 chunk（/*.js、/Content/*.css）与版本化
+        # API（/api/v1|v3/），浏览器在 /p/<svc>/ 页面下把它们解析到 origin 根、丢掉 /p/<svc>/ 前缀 ->
+        # 绕过 /p/ 代理分支 -> 404 -> SPA 白屏/资源缺失。这里按 Referer(优先)/cookie(回退) 还原 svc 并
+        # 代理转发；解析不出 svc 则交回 autopilot 自身逻辑。autopilot 自身 API 是无版本号 /api/<noun>，
+        # 与 *arr 版本化路径不冲突。
+        if not _rest0.startswith("/p/"):
+            svc = self._proxy_svc_via_request()
+            if svc and svc in _PROXY_DEFS:
+                self._proxy_dispatch(); return
+        if _rest0.startswith("/p/") or _rest0 == "/initialize.json":
             self._proxy_dispatch(); return
         if not self._auth_ok():
             self._send(401, {"error": "unauthorized"}); return
@@ -4354,25 +4388,37 @@ class H(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_PUT(self):
-        if self.path.startswith("/p/") or self.path.split("?",1)[0] == "/initialize.json":
+        _rest0 = self.path.split("?", 1)[0]
+        # *arr SPA（urlBase=""）运行时以根绝对路径加载代码分割 chunk（/*.js、/Content/*.css）与版本化
+        # API（/api/v1|v3/），浏览器在 /p/<svc>/ 页面下把它们解析到 origin 根、丢掉 /p/<svc>/ 前缀 ->
+        # 绕过 /p/ 代理分支 -> 404 -> SPA 白屏/资源缺失。这里按 Referer(优先)/cookie(回退) 还原 svc 并
+        # 代理转发；解析不出 svc 则交回 autopilot 自身逻辑。autopilot 自身 API 是无版本号 /api/<noun>，
+        # 与 *arr 版本化路径不冲突。
+        if not _rest0.startswith("/p/"):
+            svc = self._proxy_svc_via_request()
+            if svc and svc in _PROXY_DEFS:
+                self._proxy_dispatch(); return
+        if _rest0.startswith("/p/") or _rest0 == "/initialize.json":
             self._proxy_dispatch(); return
         self._send(405, {"error": "method not allowed"})
 
     def _proxy_dispatch(self):
         rest = self.path.split("?", 1)[0]
-        # /initialize.json 是 *arr SPA 顶层 fetch（不在 /p/ 下），按 cookie 记住的 svc 转发
-        if rest == "/initialize.json":
-            for h in self.headers.get("Cookie", "").split(";"):
-                if h.strip().startswith("autopilot_svc="):
-                    svc_name = h.strip().split("=", 1)[1].strip()
-                    if svc_name in _PROXY_DEFS:
-                        try:
-                            length = int(self.headers.get("Content-Length", "0") or "0")
-                        except Exception:
-                            length = 0
-                        body = self.rfile.read(length) if length else None
-                        self._proxy_pass(svc_name, _PROXY_DEFS[svc_name], "initialize.json", self.command, body, upstream_path="/p/" + svc_name + "/initialize.json")
-                        return
+        # SPA（urlBase=""）发出的「根绝对路径」/api/... 与 /initialize.json：
+        # 浏览器把它们解析到 origin 根，丢掉 /p/<svc>/ 前缀 -> 绕过 /p/ 代理分支 -> 404 -> SPA 白屏。
+        # 这里按 Referer(优先, 每请求精确) 或 cookie(回退, 同源共享) 还原 svc，转发到 *arr 根路径
+        # （与 /p/ 分支一致：urlBase="" 时 *arr 在根服务）。这是直登 SPA 白屏的根因修复。
+        if not rest.startswith("/p/"):
+            svc_name = self._proxy_svc_via_request()
+            if svc_name and svc_name in _PROXY_DEFS:
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or "0")
+                except Exception:
+                    length = 0
+                body = self.rfile.read(length) if length else None
+                # upstream_path=None -> "/" + subpath，转发到 *arr 根（urlBase=""）
+                self._proxy_pass(svc_name, _PROXY_DEFS[svc_name], rest.lstrip("/"), self.command, body)
+                return
             self._send(404, {"error": "unknown service"}); return
         parts = rest.strip("/").split("/", 2)
         if len(parts) < 2 or parts[0] != "p":
@@ -4390,10 +4436,28 @@ class H(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else None
         self._proxy_pass(service, svc, subpath, method, body)
 
+    def _proxy_svc_via_request(self):
+        """从 Referer 或 cookie 还原当前 SPA 所属 svc（用于根绝对路径 /api/... 的路由）。
+        Referer 优先：每请求精确反映来源页面 /p/<svc>/，多标签不串；cookie 作为回退。"""
+        ref = self.headers.get("Referer", "")
+        if ref:
+            seg = [s for s in ref.rstrip("/").split("/") if s != ""]
+            if "p" in seg:
+                i = seg.index("p")
+                if i + 1 < len(seg) and seg[i + 1] in _PROXY_DEFS:
+                    return seg[i + 1]
+        for h in self.headers.get("Cookie", "").split(";"):
+            if h.strip().startswith("autopilot_svc="):
+                v = h.strip().split("=", 1)[1].strip()
+                if v in _PROXY_DEFS:
+                    return v
+        return None
+
     def _proxy_pass(self, service, svc, subpath, method, body, upstream_path=None):
         upstream = svc["url"].rstrip("/")
-        # 保留完整 /p/<svc>/ 前缀转发：urlBase=/p/<svc> 时 *arr 在 /p/<svc>/ 下服务全部资源与 API，
-        # 前缀不能剥掉，否则 *arr 收不到 /p/<svc>/ 路径而 404。
+        # Mode A：线上 *arr 实际 urlBase=""（在根 / 服务全部资源与 API）。无论 arr/qb 都剥掉
+        # /p/<svc>/ 前缀、把 subpath 拼到上游根路径转发；响应里的根绝对路径由
+        # _rewrite_html_body/_rewrite_proxy_url 统一加回 /p/<svc>/ 前缀，浏览器侧才能正确加载。
         if upstream_path is None:
             if svc["kind"] in ("qb", "none"):
                 # qB / FlareSolverr 在根路径服务（无 urlBase 概念），必须剥掉 /p/<svc>/ 前缀转发到根；
