@@ -236,9 +236,24 @@ def _req(base, key, method, path, data, timeout):
                "Content-Type": "application/json"}
     body = json.dumps(data).encode() if data is not None else None
     req = Request(url, data=body, headers=headers, method=method)
-    with _ARR_OPENER.open(req, timeout=timeout) as r:
-        raw = r.read().decode()
-        return json.loads(raw) if raw else None
+    try:
+        with _ARR_OPENER.open(req, timeout=timeout) as r:
+            raw = r.read().decode()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as ex:
+        # 把 *arr 返回的字段级校验错误体透出（否则只剩 "HTTP Error 400: Bad Request"），
+        # 同时保留 HTTPError 类型，确保 ensure_rootfolder 的 except HTTPError 兜底仍生效。
+        detail = ""
+        try:
+            detail = ex.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        if detail:
+            raise urllib.error.HTTPError(
+                getattr(ex, "url", url), ex.code,
+                "HTTP %s: %s" % (ex.code, detail[:300]),
+                ex.headers, ex.fp) from None
+        raise
 
 
 def get_profiles():
@@ -781,9 +796,16 @@ def add_movie(name=None, tmdb_id=None, imdb_id=None, profile=None,
         return {"ok": True, "movieId": mid, "tmdbId": tmdb, "title": title,
                 "year": year, "action": "已存在，重新触发搜索", "profileId": prof_id}
 
+    mroot = root_folder or radarr_root()
+    # 自愈：Radarr 若未注册该下载根目录，POST 影片会 400（RootFolderExistsValidator）。
+    # 先 ensure 注册；容器内路径确实不存在时给出明确环境错误，不再只报 "Bad Request"。
+    ok, msg = radarr_ensure_rootfolder(mroot)
+    if not ok:
+        return {"ok": False, "error": "Radarr 无法注册下载根目录 %s: %s" % (mroot, msg)}
+
     payload = {
         "tmdbId": tmdb, "title": title, "qualityProfileId": prof_id,
-        "rootFolderPath": root_folder or radarr_root(), "monitored": True,
+        "rootFolderPath": mroot, "monitored": True,
         "minimumAvailability": "released", "addOptions": {"searchForMovie": True},
     }
     try:
@@ -1089,6 +1111,10 @@ def add_series(name=None, tvdb_id=None, profile=None, season_mode="all",
     year = chosen.get("year")
     prof_id = pick_series_profile(profile)
     root = root_folder or sonarr_root()
+    # 自愈：Sonarr 若未注册该下载根目录，POST 剧集会 400；先 ensure 注册。
+    ok, msg = sonarr_ensure_rootfolder(root)
+    if not ok:
+        return {"ok": False, "error": "Sonarr 无法注册下载根目录 %s: %s" % (root, msg)}
 
     # 已存在则只重新触发搜索，避免重复添加
     existing = None
@@ -1815,36 +1841,45 @@ def qbit_set_save_path(path):
 
 
 def radarr_ensure_rootfolder(path):
-    """尽力在 Radarr 注册根目录；已存在（含 400）则视为已注册，失败返回原因（不阻断主流程）。"""
+    """尽力在 Radarr 注册根目录；已存在则视为已注册，容器内路径不存在则明确报错（不静默吞掉）。"""
     try:
         rfs = r_req("GET", "/api/v3/rootfolder") or []
         if any((r.get("path") or "").rstrip("/") == path.rstrip("/") for r in rfs):
             return True, "已存在"
-        r_req("POST", "/api/v3/rootfolder", {"path": path})
-        return True, "已注册"
+        try:
+            r_req("POST", "/api/v3/rootfolder", {"path": path})
+            return True, "已注册"
+        except urllib.error.HTTPError as ex:
+            body = str(ex)
+            # 400 且体内指明路径不存在 => 真正的环境缺口（容器未挂该目录），明确报出
+            if getattr(ex, "code", 0) == 400 and ("does not exist" in body or "RootFolder" in body):
+                return False, "路径在容器内不存在: %s（请确认挂载/目录已建立）" % path
+            # 其余 400 多为「路径已存在」，视为无需重复注册
+            return True, "已存在（重复）"
     except urllib.error.HTTPError as ex:
-        # 400 多为「路径已存在」或「路径在容器内不存在」——都视为无需重复注册。
-        if getattr(ex, "code", 0) == 400:
-            return True, "已存在或路径在容器内无效"
-        return False, ("HTTP %s" % getattr(ex, "code", "?"))[:80]
+        return False, ("HTTP %s" % getattr(ex, "code", "?"))[:120]
     except Exception as e:
-        return False, str(e)[:80]
+        return False, str(e)[:120]
 
 
 def sonarr_ensure_rootfolder(path):
-    """尽力在 Sonarr 注册根目录；已存在（含 400）则视为已注册，失败返回原因（不阻断主流程）。"""
+    """尽力在 Sonarr 注册根目录；已存在则视为已注册，容器内路径不存在则明确报错（不静默吞掉）。"""
     try:
         rfs = s_req("GET", "/api/v3/rootfolder") or []
         if any((r.get("path") or "").rstrip("/") == path.rstrip("/") for r in rfs):
             return True, "已存在"
-        s_req("POST", "/api/v3/rootfolder", {"path": path})
-        return True, "已注册"
+        try:
+            s_req("POST", "/api/v3/rootfolder", {"path": path})
+            return True, "已注册"
+        except urllib.error.HTTPError as ex:
+            body = str(ex)
+            if getattr(ex, "code", 0) == 400 and ("does not exist" in body or "RootFolder" in body):
+                return False, "路径在容器内不存在: %s（请确认挂载/目录已建立）" % path
+            return True, "已存在（重复）"
     except urllib.error.HTTPError as ex:
-        if getattr(ex, "code", 0) == 400:
-            return True, "已存在或路径在容器内无效"
-        return False, ("HTTP %s" % getattr(ex, "code", "?"))[:80]
+        return False, ("HTTP %s" % getattr(ex, "code", "?"))[:120]
     except Exception as e:
-        return False, str(e)[:80]
+        return False, str(e)[:120]
 
 
 def _flaresolverr_status():
