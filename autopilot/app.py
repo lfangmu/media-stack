@@ -4082,7 +4082,10 @@ class H(BaseHTTPRequestHandler):
         if _rest0.startswith("/p/") or _rest0 == "/initialize.json" \
            or _rest0.startswith("/api/v1/") or _rest0.startswith("/api/v3/"):
             self._proxy_dispatch(); return
-        if not _rest0.startswith("/api/"):
+        # 根导航 "/" 是 autopilot 自身入口页（PAGE），绝不可被 cookie 劫持到 *arr；
+        # 否则访问过 /p/<svc>/ 留下的全局 autopilot_svc cookie 会让 "/" 直跳 Radarr/Sonarr…
+        # chunk/Content/signalr 等根绝对资源仍走此分支（靠 Referer/cookie 还原 svc）。
+        if not _rest0.startswith("/api/") and _rest0 != "/":
             svc = self._proxy_svc_via_request()
             if svc and svc in _PROXY_DEFS:
                 self._proxy_dispatch(); return
@@ -4214,7 +4217,10 @@ class H(BaseHTTPRequestHandler):
         if _rest0.startswith("/p/") or _rest0 == "/initialize.json" \
            or _rest0.startswith("/api/v1/") or _rest0.startswith("/api/v3/"):
             self._proxy_dispatch(); return
-        if not _rest0.startswith("/api/"):
+        # 根导航 "/" 是 autopilot 自身入口页（PAGE），绝不可被 cookie 劫持到 *arr；
+        # 否则访问过 /p/<svc>/ 留下的全局 autopilot_svc cookie 会让 "/" 直跳 Radarr/Sonarr…
+        # chunk/Content/signalr 等根绝对资源仍走此分支（靠 Referer/cookie 还原 svc）。
+        if not _rest0.startswith("/api/") and _rest0 != "/":
             svc = self._proxy_svc_via_request()
             if svc and svc in _PROXY_DEFS:
                 self._proxy_dispatch(); return
@@ -4359,7 +4365,10 @@ class H(BaseHTTPRequestHandler):
         if _rest0.startswith("/p/") or _rest0 == "/initialize.json" \
            or _rest0.startswith("/api/v1/") or _rest0.startswith("/api/v3/"):
             self._proxy_dispatch(); return
-        if not _rest0.startswith("/api/"):
+        # 根导航 "/" 是 autopilot 自身入口页（PAGE），绝不可被 cookie 劫持到 *arr；
+        # 否则访问过 /p/<svc>/ 留下的全局 autopilot_svc cookie 会让 "/" 直跳 Radarr/Sonarr…
+        # chunk/Content/signalr 等根绝对资源仍走此分支（靠 Referer/cookie 还原 svc）。
+        if not _rest0.startswith("/api/") and _rest0 != "/":
             svc = self._proxy_svc_via_request()
             if svc and svc in _PROXY_DEFS:
                 self._proxy_dispatch(); return
@@ -4400,7 +4409,10 @@ class H(BaseHTTPRequestHandler):
         if _rest0.startswith("/p/") or _rest0 == "/initialize.json" \
            or _rest0.startswith("/api/v1/") or _rest0.startswith("/api/v3/"):
             self._proxy_dispatch(); return
-        if not _rest0.startswith("/api/"):
+        # 根导航 "/" 是 autopilot 自身入口页（PAGE），绝不可被 cookie 劫持到 *arr；
+        # 否则访问过 /p/<svc>/ 留下的全局 autopilot_svc cookie 会让 "/" 直跳 Radarr/Sonarr…
+        # chunk/Content/signalr 等根绝对资源仍走此分支（靠 Referer/cookie 还原 svc）。
+        if not _rest0.startswith("/api/") and _rest0 != "/":
             svc = self._proxy_svc_via_request()
             if svc and svc in _PROXY_DEFS:
                 self._proxy_dispatch(); return
