@@ -2668,20 +2668,20 @@ def system_status():
          "detail": ("v%s · 影片 %d · 已下载 %d"
                     % (rad_ver, out["totalMovies"], out["downloadedMovies"]))
                    if rad_ok else (rad_ver or "不可达"),
-         "desc": "电影管理：监控想看的电影，自动匹配并下载高质量版本 · 账号 admin / MediaFn2026"},
+         "desc": "电影管理：监控想看的电影，自动匹配并下载高质量版本"},
         {"key": "sonarr", "name": "Sonarr", "ok": son_ok, "web": True,
          "detail": ("v%s · 剧集 %s · 已下载 %s"
                     % (son_ver, out["totalSeries"], out["downloadedSeries"]))
                    if son_ok else "不可达",
-         "desc": "剧集管理：追更电视剧，按季/集自动抓取与整理 · 账号 admin / MediaFn2026"},
+         "desc": "剧集管理：追更电视剧，按季/集自动抓取与整理"},
         {"key": "prowlarr", "name": "Prowlarr", "ok": pro_ok, "web": True,
          "detail": ("%s · 索引器 %s/%s 启用" % (pro_ver, idx.get("enabled", 0),
                                             idx.get("total", 0)))
                    if (pro_ok and idx) else (pro_ver or "不可达"),
-         "desc": "索引器聚合：汇总各 BT/Usenet 站点资源，供 Radarr/Sonarr 统一检索 · 账号 admin / MediaFn2026"},
+         "desc": "索引器聚合：汇总各 BT/Usenet 站点资源，供 Radarr/Sonarr 统一检索"},
         {"key": "qbittorrent", "name": "qBittorrent", "ok": qb[0], "web": True,
          "detail": qb[1],
-         "desc": "下载客户端：实际执行 BT/PT 下载，做种并写入媒体库目录 · 账号 admin / MediaFn2026"},
+         "desc": "下载客户端：实际执行 BT/PT 下载，做种并写入媒体库目录"},
         {"key": "flaresolverr", "name": "FlareSolverr", "ok": fla[0], "web": False,
          "detail": fla[1],
          "desc": "反爬求解：破解 Cloudflare 等站点验证，让索引器能正常抓取（仅 API，无 Web 界面）"},
@@ -3027,12 +3027,12 @@ PAGE = r"""<!doctype html>
   <div class="panel" id="p-config">
     <!-- 外网连通性自检（置顶） -->
     <div class="cfg-sec" style="margin-bottom:16px;border-top:none;padding-top:0">
-      <div class="muted" style="margin-bottom:8px">外网连通性自检：直连出网是否可用，决定要不要填代理。</div>
+      <div class="muted" style="margin-bottom:8px">外网连通性自检：测当前「直连出网」是否可用；若上方已填代理，会一并测「经代理」链路。</div>
       <div class="row">
         <button class="btn" onclick="apNetTest()">测试外网连通性</button>
         <span class="muted" id="apNetTargets"></span>
       </div>
-      <div id="apNetTest" style="margin-top:8px"></div>
+      <div id="apNetTest" style="margin-top:10px"></div>
     </div>
     <div class="muted" style="margin-bottom:10px">外网出口与 TMDB 配置。保存后即时生效（自动写入 <code>.env</code> 并重启出口代理）。</div>
     <label class="cfg-row" style="display:block;margin:8px 0"><span>代理链接 Proxy URL</span>
@@ -3050,17 +3050,6 @@ PAGE = r"""<!doctype html>
         <button class="btn ghost" onclick="apTestWebhook()">发送测试通知</button>
         <span class="muted" id="apWhStatus"></span>
       </div>
-    </div>
-    <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
-      <div class="muted" style="margin-bottom:8px">添加默认设置（留空=自动：画质选首个 1080p/HD 档，根目录选已配置的首个）</div>
-      <label class="cfg-row" style="display:block;margin:8px 0"><span>默认电影画质档</span>
-        <select id="ap_MOVIE_PROFILE_ID" style="width:100%;margin-top:4px;padding:8px"></select></label>
-      <label class="cfg-row" style="display:block;margin:8px 0"><span>默认剧集画质档</span>
-        <select id="ap_TV_PROFILE_ID" style="width:100%;margin-top:4px;padding:8px"></select></label>
-      <label class="cfg-row" style="display:block;margin:8px 0"><span>默认电影根目录</span>
-        <select id="ap_MOVIE_ROOT" style="width:100%;margin-top:4px;padding:8px"></select></label>
-      <label class="cfg-row" style="display:block;margin:8px 0"><span>默认剧集根目录</span>
-        <select id="ap_TV_ROOT" style="width:100%;margin-top:4px;padding:8px"></select></label>
     </div>
     <div class="row" style="margin-top:12px">
       <button class="btn" id="apCfgSave" onclick="apSaveConfig()">保存</button>
@@ -3962,15 +3951,7 @@ function apLoadConfig(){
     document.getElementById("ap_TMDB_KEY").value=v.TMDB_KEY||"";
     const tokEl=document.getElementById("ap_AUTH_TOKEN"); if(tokEl)tokEl.value=v.AUTH_TOKEN||"";
     const whEl=document.getElementById("ap_WEBHOOK_URL"); if(whEl)whEl.value=v.WEBHOOK_URL||"";
-    const mp=document.getElementById("ap_MOVIE_PROFILE_ID"); if(mp)mp.value=v.MOVIE_PROFILE_ID||"";
-    const tp=document.getElementById("ap_TV_PROFILE_ID"); if(tp)tp.value=v.TV_PROFILE_ID||"";
-    const mr=document.getElementById("ap_MOVIE_ROOT"); if(mr)mr.value=v.MOVIE_ROOT||"";
-    const tr=document.getElementById("ap_TV_ROOT"); if(tr)tr.value=v.TV_ROOT_CFG||"";
     if(st)st.textContent="已加载";
-    apFillProfiles("movie","ap_MOVIE_PROFILE_ID",v.MOVIE_PROFILE_ID||"");
-    apFillProfiles("tv","ap_TV_PROFILE_ID",v.TV_PROFILE_ID||"");
-    apFillRoots("movie","ap_MOVIE_ROOT",v.MOVIE_ROOT||"");
-    apFillRoots("tv","ap_TV_ROOT",v.TV_ROOT_CFG||"");
   }).catch(e=>{ if(st)st.textContent="加载失败："+e; });
 }
 function apSaveConfig(){
@@ -3980,11 +3961,7 @@ function apSaveConfig(){
     proxy_url:document.getElementById("ap_PROXY_URL").value.trim(),
     tmdb_key:document.getElementById("ap_TMDB_KEY").value.trim(),
     auth_token:document.getElementById("ap_AUTH_TOKEN").value.trim(),
-    webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim(),
-    movie_profile_id:document.getElementById("ap_MOVIE_PROFILE_ID").value,
-    tv_profile_id:document.getElementById("ap_TV_PROFILE_ID").value,
-    movie_root:document.getElementById("ap_MOVIE_ROOT").value,
-    tv_root:document.getElementById("ap_TV_ROOT").value
+    webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim()
   };
   jpost("/api/config", payload).then(d=>{
     if(d&&d.ok){ if(st)st.textContent="已保存"; toast("配置已写入");
@@ -4013,21 +3990,33 @@ function apFillRoots(kind, selId, selected){
     sel.value=cur;
   }).catch(()=>{});
 }
+function netRow(label, res){
+  if(!res) return "";
+  const ok = !!res.ok;
+  const badge = ok ? '<span style="color:#5fd38a">● 可达</span>' : '<span style="color:#ff7a7a">● 不可达</span>';
+  const lat = (res.latency_ms!=null) ? (" · "+res.latency_ms+"ms") : "";
+  const det = res.detail ? (" · "+esc(res.detail)) : "";
+  return '<div style="display:flex;gap:8px;align-items:center;font-size:13px;padding:6px 0;border-bottom:1px solid #1c2740">'
+       + '<span style="min-width:80px;color:#9fb3d1">'+esc(label)+'</span>'
+       + badge + lat + det + '</div>';
+}
 function apNetTest(){
   const el=document.getElementById("apNetTest");
   const tg=document.getElementById("apNetTargets");
-  if(el)el.innerHTML="测试中…";
+  if(el)el.innerHTML='<div class="muted">测试中…</div>';
   if(tg)tg.textContent="";
   jget("/api/nettest").then(d=>{
-    const v=(d&&d.verdict)||"未知";
     const hosts=(d&&d.targets)||[];
-    if(tg)tg.textContent=hosts.length?("本次测试："+hosts.join(" · ")):"";
-    let html='<div style="margin-top:4px">'+esc(v)+'</div>';
-    const dr=(d&&d.direct&&d.direct.detail)||"";
-    if(dr)html+='<div class="muted" style="margin-top:4px">首达：'+esc(dr)+'</div>';
+    if(tg)tg.textContent=hosts.length?("目标："+hosts.join(" · ")):"";
+    const v=(d&&d.verdict)||"未知";
+    let rows="";
+    rows+=netRow("直连出网", d&&d.direct);
+    if(d&&d.via_proxy) rows+=netRow("经代理", d.via_proxy);
+    let html='<div style="margin-top:4px;font-weight:600">'+esc(v)+'</div>'
+            +'<div style="margin-top:6px">'+rows+'</div>';
     if(el)el.innerHTML=html;
     toast(v);
-  }).catch(e=>{ if(el)el.innerHTML="测试失败："+esc(""+e); toast("测试失败："+e,"err"); });
+  }).catch(e=>{ if(el)el.innerHTML='<div style="color:#ff7a7a">测试失败：'+esc(""+e)+'</div>'; toast("测试失败："+e,"err"); });
 }
 function apTestWebhook(){
   const el=document.getElementById("apWhStatus");
