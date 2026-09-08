@@ -2062,7 +2062,7 @@ def _arr_create_account(service):
     返回 'created'/'exists'/'err'。"""
     key = _arr_api_key(service)
     if not key:
-        return "err:no-key"
+        raise RuntimeError("%s: 无 API key，无法初始化" % service)
     url = _PROXY_DEFS[service]["url"].rstrip("/") + f"/api/{_arr_api_ver(service)}/config/host"
     try:
         with urlopen(Request(url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
@@ -2081,10 +2081,10 @@ def _arr_create_account(service):
         return "created"
     except urllib.error.HTTPError as e:
         if e.code in (400, 409):
-            return "exists"
-        return "err:%s" % e.code
+            return "exists"   # 用户已存在，视为成功
+        raise                 # 其它（网络/5xx）抛出，交外层重试
     except Exception as e:
-        return "err:%s" % e
+        raise
 
 
 def _arr_checkpoint(service):
@@ -2113,7 +2113,7 @@ def _arr_set_config(service):
     写回后 wal_checkpoint 落盘 + 重启容器清 firstRun 缓存。已是黄金组合则跳过（幂等）。"""
     key = _arr_api_key(service)
     if not key:
-        return
+        raise RuntimeError("%s: 无 API key，无法初始化" % service)
     base = _PROXY_DEFS[service]["url"].rstrip("/") + f"/api/{_arr_api_ver(service)}"
     cfg_url = base + "/config/host"
     try:
@@ -2138,15 +2138,15 @@ def _arr_set_config(service):
         with urlopen(Request(cfg_url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
             verify = json.loads(r.read().decode())
         if verify.get("authenticationMethod") != "forms" or verify.get("authenticationRequired") != "disabledForLocalAddresses":
-            print("[autopilot] %s 鉴权设置失败，当前=%r" % (service, (verify.get("authenticationMethod"), verify.get("authenticationRequired"))), flush=True)
-        else:
-            print("[autopilot] %s 配置就绪 (urlBase=\"\", auth=forms+disabledForLocalAddresses)" % service, flush=True)
+            raise RuntimeError("%s 鉴权设置未生效，当前=%r" % (service, (verify.get("authenticationMethod"), verify.get("authenticationRequired"))))
+        print("[autopilot] %s 配置就绪 (urlBase=\"\", auth=forms+disabledForLocalAddresses)" % service, flush=True)
         # 用户落盘（WAL -> 主库），否则重启丢用户 -> 向导复现
         _arr_checkpoint(service)
         # 重启容器让 firstRun 重算（用户已存在 -> firstRun=false -> 无向导/覆盖层）
         _restart_container("media-" + service)
     except Exception as e:
-        print("[autopilot] %s 配置设置异常: %s" % (service, e), flush=True)
+        print("[autopilot] %s 配置设置异常(将重试): %s" % (service, e), flush=True)
+        raise
 
 
 def _qb_fix_config():
