@@ -2057,13 +2057,25 @@ def _docker_net_subnet():
 
 
 def _arr_create_account(service):
-    """首次运行经 /api/<ver>/auth 创建管理员账号（已存在则跳过）。返回 'created'/'exists'/'err'。"""
-    url = _PROXY_DEFS[service]["url"].rstrip("/") + f"/api/{_arr_api_ver(service)}/auth"
-    data = json.dumps({"username": ARR_ADMIN_USER, "password": ARR_ADMIN_PASS}).encode()
-    req = Request(url, data=data,
-                  headers={"Content-Type": "application/json", "Accept": "application/json"},
-                  method="POST")
+    """首次运行经 PUT /api/<ver>/config/host 创建管理员账号（已存在则跳过）。
+    关键：v4 首跑向导锁定下 /api/<ver>/auth 不会建用户，必须用 /config/host 带 forms+creds。
+    返回 'created'/'exists'/'err'。"""
+    key = _arr_api_key(service)
+    if not key:
+        return "err:no-key"
+    url = _PROXY_DEFS[service]["url"].rstrip("/") + f"/api/{_arr_api_ver(service)}/config/host"
     try:
+        with urlopen(Request(url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
+            cfg = json.loads(r.read().decode())
+        payload = dict(cfg)
+        payload["authenticationMethod"] = "forms"
+        payload["authenticationRequired"] = "enabled"
+        payload["username"] = ARR_ADMIN_USER
+        payload["password"] = ARR_ADMIN_PASS
+        payload["passwordConfirmation"] = ARR_ADMIN_PASS
+        req = Request(url, data=json.dumps(payload).encode(),
+                      headers={"X-Api-Key": key, "Content-Type": "application/json", "Accept": "application/json"},
+                      method="PUT")
         with urlopen(req, timeout=30) as r:
             r.read()
         return "created"
@@ -2075,9 +2087,30 @@ def _arr_create_account(service):
         return "err:%s" % e
 
 
+def _arr_checkpoint(service):
+    """*arr 用 SQLite WAL：API 建用户只写 *.db-wal 日志，未 checkpoint 回主库则容器重启即丢（向导复现）。
+    经 docker.sock 起自身镜像临时容器，挂 /opt/media:rw 对主库执行 PRAGMA wal_checkpoint(TRUNCATE)。"""
+    import subprocess
+    db = "/opt/media/%s-config/%s.db" % (service, service)
+    script = ("import sqlite3\n"
+              "c=sqlite3.connect(%r)\n"
+              "c.execute('PRAGMA wal_checkpoint(TRUNCATE)')\n"
+              "c.close()\n"
+              "print('ckpt-ok')\n") % db
+    try:
+        subprocess.run(["docker", "run", "--rm", "-v", "/opt/media:/opt/media",
+                        "media-autopilot", "python3", "-c", script],
+                       capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        print("[autopilot] %s wal_checkpoint 失败(若向导复现需手动): %s" % (service, e), flush=True)
+
+
 def _arr_set_config(service):
-    """读 host 配置 -> 确保 urlBase=/p/<svc>(与代理「保留完整前缀转发」一致，SPA chunk 才能挂载) + 重断言鉴权绕过(disabledForLocalAddresses) -> 写回。
-    Sonarr v4 / Radarr v5 已把 /api/v3/config 拆为 /api/v3/config/host（统一端点 404）。"""
+    """读 host 配置 -> 确保 urlBase=""（与代理「剥前缀转发」一致，SPA chunk 才能挂载）
+    + 鉴权改为黄金组合 forms + disabledForLocalAddresses：
+      · forms 满足 v4 SPA 客户端校验，消除「Please select a valid authentication method」不可关闭覆盖层；
+      · disabledForLocalAddresses 让代理 docker 子网被视作本地 -> 免登录直达主界面。
+    写回后 wal_checkpoint 落盘 + 重启容器清 firstRun 缓存。已是黄金组合则跳过（幂等）。"""
     key = _arr_api_key(service)
     if not key:
         return
@@ -2086,28 +2119,34 @@ def _arr_set_config(service):
     try:
         with urlopen(Request(cfg_url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
             cfg = json.loads(r.read().decode())
-        # 设 urlBase=""（根路径服务）：与代理「剥掉 /p/<svc>/ 前缀转发到根」+ 响应里根绝对路径
-        # 由 _rewrite_* 统一加回 /p/<svc>/ 前缀的策略一致（见 _proxy_pass / _rewrite_html_body）。
-        # 若设成 /p/<svc>，*arr 会把 API 挪到 /p/<svc>/api/v3，既让本函数自己的 API 调用 404，
-        # 又与重写函数冲突导致白屏。鉴权：直接设 AuthenticationMethod=none——*arr v4 的 config.xml
-        # 会在重启时丢弃 TrustedNetworks，且 API 不暴露该字段，故「none」是最稳的免登录方案。
-        cfg["urlBase"] = ""
-        cfg["authenticationRequired"] = "disabledForLocalAddresses"
-        cfg["authenticationMethod"] = "none"
-        req = Request(cfg_url, data=json.dumps(cfg).encode(),
+        # 已是黄金组合：跳过，避免每次自启都重启 *arr
+        if (cfg.get("urlBase") == ""
+                and cfg.get("authenticationMethod") == "forms"
+                and cfg.get("authenticationRequired") == "disabledForLocalAddresses"):
+            print("[autopilot] %s 已为 forms+disabledForLocalAddresses，跳过" % service, flush=True)
+            return
+        payload = dict(cfg)
+        payload["urlBase"] = ""
+        payload["authenticationMethod"] = "forms"
+        payload["authenticationRequired"] = "disabledForLocalAddresses"
+        req = Request(cfg_url, data=json.dumps(payload).encode(),
                       headers={"X-Api-Key": key, "Content-Type": "application/json", "Accept": "application/json"},
                       method="PUT")
         with urlopen(req, timeout=30) as r:
             r.read()
-        # 写后立刻 GET 验证，没生效就报错（之前 except 静默吞错是隐性雷区）
+        # 写后立刻 GET 验证（吞错是隐性雷区）
         with urlopen(Request(cfg_url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
             verify = json.loads(r.read().decode())
-        if verify.get("urlBase") != "":
-            print("[autopilot] %s urlBase 设置失败，当前=%r" % (service, verify.get("urlBase")), flush=True)
+        if verify.get("authenticationMethod") != "forms" or verify.get("authenticationRequired") != "disabledForLocalAddresses":
+            print("[autopilot] %s 鉴权设置失败，当前=%r" % (service, (verify.get("authenticationMethod"), verify.get("authenticationRequired"))), flush=True)
         else:
-            print("[autopilot] %s 配置就绪 (urlBase=\"\", auth=disabledForLocalAddresses)" % service, flush=True)
+            print("[autopilot] %s 配置就绪 (urlBase=\"\", auth=forms+disabledForLocalAddresses)" % service, flush=True)
+        # 用户落盘（WAL -> 主库），否则重启丢用户 -> 向导复现
+        _arr_checkpoint(service)
+        # 重启容器让 firstRun 重算（用户已存在 -> firstRun=false -> 无向导/覆盖层）
+        _restart_container("media-" + service)
     except Exception as e:
-        raise
+        print("[autopilot] %s 配置设置异常: %s" % (service, e), flush=True)
 
 
 def _qb_fix_config():
@@ -2169,7 +2208,8 @@ def _qb_fix_config():
 
 
 def _arr_bootstrap():
-    """后台线程：等 *arr 就绪 -> 建账号 + 设 config(host)(AuthenticationMethod=none 免登录，幂等)。"""
+    """后台线程：等 *arr 就绪 -> 建账号(forms+creds) + 设 config(host)(forms+disabledForLocalAddresses 免登录，幂等)。
+    全程经 docker.sock 完成 wal_checkpoint 落盘 + 重启清 firstRun，确保全新部署也不弹向导/登录。"""
     _ensure_arr_admin_pass()
     _qb_fix_config()  # qB 直登自愈（docker 子网白名单，免登录）
     for service in ("radarr", "sonarr", "prowlarr"):
@@ -2177,7 +2217,7 @@ def _arr_bootstrap():
             try:
                 _arr_create_account(service)
                 _arr_set_config(service)
-                print("[autopilot] %s 账号初始化完成 (urlBase=\"\", auth=disabledForLocalAddresses)" % service, flush=True)
+                print("[autopilot] %s 账号初始化完成 (urlBase=\"\", auth=forms+disabledForLocalAddresses)" % service, flush=True)
                 break
             except Exception:
                 time.sleep(10)
