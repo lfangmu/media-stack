@@ -13,7 +13,7 @@ services:
   # ---- 出网出口（HTTP 代理转发器）----
   proxy-forwarder:
     image: ubuntu/squid:latest
-    container_name: proxy-forwarder
+    container_name: media-proxy-forwarder
     ports:
       - "3128:3128"
     volumes:
@@ -28,7 +28,8 @@ services:
   # ---- 统一控制台（影视下载台）----
   autopilot:
     build: ./autopilot
-    container_name: autopilot
+    image: media-autopilot
+    container_name: media-autopilot
     ports:
       - "${AUTOPILOT_PORT:-8787}:8787"
     environment:

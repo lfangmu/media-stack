@@ -2051,7 +2051,7 @@ def _docker_net_subnet():
         try:
             return _subnet_of("media-sonarr")
         except Exception:
-            return _subnet_of("autopilot")  # autopilot 与 *arr/qB 同处 media_default，必可达
+            return _subnet_of("media-autopilot")  # autopilot 与 *arr/qB 同处 media_default，必可达
     except Exception:
         return "172.18.0.0/16"
 
@@ -2129,6 +2129,7 @@ def _arr_set_config(service):
         payload["urlBase"] = ""
         payload["authenticationMethod"] = "forms"
         payload["authenticationRequired"] = "disabledForLocalAddresses"
+        payload["uiLanguage"] = "zh"   # 默认中文界面（全新部署即中文；用户手动改过则受下方幂等跳过保护）
         req = Request(cfg_url, data=json.dumps(payload).encode(),
                       headers={"X-Api-Key": key, "Content-Type": "application/json", "Accept": "application/json"},
                       method="PUT")
@@ -2181,14 +2182,19 @@ def _qb_fix_config():
             "crlf=b'\\r\\n' in raw\n"
             "nl='\\r\\n' if crlf else '\\n'\n"
             "t=raw.decode('utf-8')\n"
-            "if t.strip():\n"
-            " lines=t.split('\\n'); lines=[l.rstrip('\\r') for l in lines]\n"
-            " lines=[l for l in lines if not l.startswith('WebUI\\\\AuthSubnetWhitelist')]\n"
-            " idx=lines.index('[Preferences]')+1 if '[Preferences]' in lines else len(lines)\n"
-            " lines[idx:idx]=['WebUI\\AuthSubnetWhitelistEnabled=true','WebUI\\AuthSubnetWhitelist=__SUBNET__']\n"
-            " open(p,'wb').write(nl.join(lines).encode('utf-8'))\n"
+            "if not t.strip():\n"
+            " t='[General]'+nl+'[Preferences]'+nl\n"
+            "lines=t.split('\\n'); lines=[l.rstrip('\\r') for l in lines]\n"
+            "lines=[l for l in lines if not l.startswith('WebUI\\\\AuthSubnetWhitelist')]\n"
+            "lines=[l for l in lines if not l.startswith('Locale=')]\n"
+            "pidx=lines.index('[Preferences]')+1 if '[Preferences]' in lines else len(lines)\n"
+            "lines[pidx:pidx]=['WebUI\\AuthSubnetWhitelistEnabled=true','WebUI\\AuthSubnetWhitelist=__SUBNET__']\n"
+            "if '[General]' in lines:\n"
+            " gidx=lines.index('[General]')+1\n"
+            " lines[gidx:gidx]=['Locale=zh_CN']\n"
             "else:\n"
-            " open(p,'wb').write(('[Preferences]'+nl+'WebUI\\AuthSubnetWhitelistEnabled=true'+nl+'WebUI\\AuthSubnetWhitelist=__SUBNET__'+nl).encode('utf-8'))\n"
+            " lines[0:0]=['[General]','Locale=zh_CN']\n"
+            "open(p,'wb').write(nl.join(lines).encode('utf-8'))\n"
             "print('patched')\n"
         )
         subprocess.run(["docker", "run", "--rm", "-v",
@@ -2316,7 +2322,7 @@ def _compose_project_name():
     优先读容器 label com.docker.compose.project，失败回退 media-stack。"""
     try:
         import subprocess, json
-        out = subprocess.run(["docker", "inspect", "autopilot"],
+        out = subprocess.run(["docker", "inspect", "media-autopilot"],
                              capture_output=True, text=True, timeout=15).stdout
         infos = json.loads(out)
         lbl = (infos[0].get("Config", {}).get("Labels", {})
@@ -2391,6 +2397,7 @@ def _config_values():
     """汇总当前所有可配置项（含实时读取的 qB 下载目录），供 GET/POST 回显复用。"""
     return {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
             "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL,
+            "DATA_DIR": DATA_DIR,
             "MOVIE_PROFILE_ID": DEFAULT_MOVIE_PROFILE_ID,
             "TV_PROFILE_ID": DEFAULT_TV_PROFILE_ID,
             "MOVIE_ROOT": DEFAULT_MOVIE_ROOT,
@@ -2406,11 +2413,18 @@ def config_save(body_str):
         data = json.loads(body_str or "{}")
     except Exception:
         return 400, {"ok": False, "error": "请求体解析失败"}
-    global PROXY_URL, TMDB_PROXY, TMDB_KEY, TOKEN, WEBHOOK_URL, DEFAULT_MOVIE_PROFILE_ID, DEFAULT_TV_PROFILE_ID, DEFAULT_MOVIE_ROOT, DEFAULT_TV_ROOT
+    global PROXY_URL, TMDB_PROXY, TMDB_KEY, TOKEN, WEBHOOK_URL, DEFAULT_MOVIE_PROFILE_ID, DEFAULT_TV_PROFILE_ID, DEFAULT_MOVIE_ROOT, DEFAULT_TV_ROOT, DATA_DIR
     updates = {}
     notes = []
     proxy_changed = False
+    data_dir_old = DATA_DIR       # 用于判断「数据目录是否真的变了」，没变就不重建整个栈
+    data_dir_new = ""
     # 仅当字段出现在请求体时才处理，避免「部分保存」误清其它设置。
+    if "data_dir" in data:
+        # 宿主机数据目录（容器 /data 的映射源）：改它等于改「下载与媒体库落在哪块盘」，
+        # 写 .env 后必须重建容器才能重挂卷，故由下方后台线程触发 compose up -d。
+        data_dir_new = (data.get("data_dir") or "").strip() or DATA_DIR
+        updates["DATA_DIR"] = data_dir_new
     if "proxy_url" in data:
         proxy = (data.get("proxy_url") or "").strip()
         if proxy:
@@ -2475,9 +2489,15 @@ def config_save(body_str):
         DEFAULT_MOVIE_ROOT = (data.get("movie_root") or "").strip()
     if "tv_root" in data:
         DEFAULT_TV_ROOT = (data.get("tv_root") or "").strip()
+    if "data_dir" in data:
+        DATA_DIR = data_dir_new
+    # 数据目录变化：volume 映射只能靠重建容器生效，故后台起 compose up -d（autopilot 自身也在栈内会被重建）
+    if data_dir_new and data_dir_new != data_dir_old:
+        threading.Thread(target=_apply_data_dir_remount, args=(data_dir_new,), daemon=True).start()
+        notes.append("数据目录已更新，正在重新挂载整个栈（约十几秒），完成后刷新页面即可")
     # 代理状态变化（设置或清空）都重启 squid，使 never_direct/always_direct 与 .env 一致
     if proxy_changed:
-        _restart_container("proxy-forwarder")
+        _restart_container("media-proxy-forwarder")
     resp = {"ok": True, "wrote": wrote, "values": _config_values()}
     if notes:
         resp["notes"] = notes
@@ -2667,7 +2687,7 @@ def system_status():
         fla = f_f.result()
         prx = f_p.result()
     svcs = [
-        {"key": "autopilot", "name": "autopilot", "ok": True, "web": False,
+        {"key": "autopilot", "name": "media-autopilot", "ok": True, "web": False,
          "detail": "已运行 " + _uptime(),
          "desc": "统一入口：搜索片名并自动选源下载，管理电影/剧集与下载队列"},
         {"key": "radarr", "name": "Radarr", "ok": rad_ok, "web": True,
@@ -3043,7 +3063,7 @@ PAGE = r"""<!doctype html>
     <div class="muted" style="margin-bottom:10px">外网出口与 TMDB 配置。保存后即时生效（自动写入 <code>.env</code> 并重启出口代理）。</div>
     <label class="cfg-row" style="display:block;margin:8px 0"><span>代理链接 Proxy URL</span>
       <input id="ap_PROXY_URL" style="width:100%;margin-top:4px;padding:8px" placeholder="http://user:pass@host:port"></label>
-    <div class="muted" style="margin-top:6px;font-size:12px;line-height:1.5">留空 = 所有容器经 Squid 直连当前环境网络（WSL 下即直连公网）；填写 = 出网统一经 Squid 上行到此代理。保存后只重启出口代理 proxy-forwarder，*arr/qB/FlareSolverr 无需重启。</div>
+    <div class="muted" style="margin-top:6px;font-size:12px;line-height:1.5">留空 = 所有容器经 Squid 直连当前环境网络（WSL 下即直连公网）；填写 = 出网统一经 Squid 上行到此代理。保存后只重启出口代理 media-proxy-forwarder，*arr/qB/FlareSolverr 无需重启。</div>
     <label class="cfg-row" style="display:block;margin:8px 0"><span>TMDB API Key</span>
       <input id="ap_TMDB_KEY" type="password" style="width:100%;margin-top:4px;padding:8px" placeholder="在 themoviedb.org 申请的 v3 API Key"></label>
     <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
@@ -3056,6 +3076,12 @@ PAGE = r"""<!doctype html>
         <button class="btn ghost" onclick="apTestWebhook()">发送测试通知</button>
         <span class="muted" id="apWhStatus"></span>
       </div>
+    </div>
+    <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
+      <div class="muted" style="margin-bottom:8px">数据目录（宿主机落盘位置）</div>
+      <label class="cfg-row" style="display:block;margin:8px 0"><span>宿主机数据目录 DATA_DIR</span>
+        <input id="ap_DATA_DIR" style="width:100%;margin-top:4px;padding:8px" placeholder="./data （或 /mnt/media 等挂载点）"></label>
+      <div class="muted" style="margin-top:6px;font-size:12px;line-height:1.5">容器内的 <code>/data</code> 映射到宿主机的这个目录，下载与媒体库都落在这里。修改后会自动重建整个栈重新挂载（约十几秒），影视下载台本身也在栈内会随之重启，完成后刷新页面即可。</div>
     </div>
     <div class="row" style="margin-top:12px">
       <button class="btn" id="apCfgSave" onclick="apSaveConfig()">保存</button>
@@ -3957,6 +3983,7 @@ function apLoadConfig(){
     document.getElementById("ap_TMDB_KEY").value=v.TMDB_KEY||"";
     const tokEl=document.getElementById("ap_AUTH_TOKEN"); if(tokEl)tokEl.value=v.AUTH_TOKEN||"";
     const whEl=document.getElementById("ap_WEBHOOK_URL"); if(whEl)whEl.value=v.WEBHOOK_URL||"";
+    const ddEl=document.getElementById("ap_DATA_DIR"); if(ddEl)ddEl.value=v.DATA_DIR||"";
     if(st)st.textContent="已加载";
   }).catch(e=>{ if(st)st.textContent="加载失败："+e; });
 }
@@ -3967,7 +3994,8 @@ function apSaveConfig(){
     proxy_url:document.getElementById("ap_PROXY_URL").value.trim(),
     tmdb_key:document.getElementById("ap_TMDB_KEY").value.trim(),
     auth_token:document.getElementById("ap_AUTH_TOKEN").value.trim(),
-    webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim()
+    webhook_url:document.getElementById("ap_WEBHOOK_URL").value.trim(),
+    data_dir:document.getElementById("ap_DATA_DIR").value.trim()
   };
   jpost("/api/config", payload).then(d=>{
     if(d&&d.ok){ if(st)st.textContent="已保存"; toast("配置已写入");

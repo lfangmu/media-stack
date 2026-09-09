@@ -7,8 +7,8 @@
 
 | 服务 | 端口 | 作用 |
 |---|---|---|
-| 影视控制台 (autopilot) | 8787 | Web UI，配置出网代理 |
-| proxy-forwarder (squid) | 3128 | HTTP 出口转发器 |
+| 影视控制台 (media-autopilot) | 8787 | Web UI，配置出网代理 |
+| media-proxy-forwarder (squid) | 3128 | HTTP 出口转发器 |
 | flaresolverr | 8191 | 绕过 Cloudflare |
 | prowlarr | 9696 | 索引器管理 |
 | radarr | 7878 | 电影 |
@@ -69,7 +69,7 @@ Radarr / Sonarr / Prowlarr / QBittorrent 是 linuxserver 镜像，以 `PUID`/`PG
 
 ## 工作原理（一句话）
 
-所有服务的出网都指向 `proxy-forwarder`(squid)；squid 再把流量转发到你填的代理。
+所有服务的出网都指向 `proxy-forwarder` 服务（容器名 `media-proxy-forwarder`，squid）；squid 再把流量转发到你填的代理。
 改代理只改一处（页面），不用逐个服务配置。宿主本身不需要任何代理或 VPN。
 
 ## 目录结构
