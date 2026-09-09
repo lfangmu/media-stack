@@ -2129,7 +2129,7 @@ def _arr_set_config(service):
         payload["urlBase"] = ""
         payload["authenticationMethod"] = "forms"
         payload["authenticationRequired"] = "disabledForLocalAddresses"
-        payload["uiLanguage"] = "zh"   # 默认中文界面（全新部署即中文；用户手动改过则受下方幂等跳过保护）
+        # 注意：界面语言不在这里设——uiLanguage 属于 /config/ui（不是 host），见 _arr_set_language
         req = Request(cfg_url, data=json.dumps(payload).encode(),
                       headers={"X-Api-Key": key, "Content-Type": "application/json", "Accept": "application/json"},
                       method="PUT")
@@ -2150,6 +2150,49 @@ def _arr_set_config(service):
         raise
 
 
+# 界面语言：字段在 /config/ui（不是 /config/host——写 host 是无效字段，会被静默忽略）。
+# 且三个系统类型不同：Radarr/Sonarr(v3 API) 用整数，10=简体中文；Prowlarr(v1 API) 用字符串 "zh_CN"。
+# 实测确认（2026-09-09 NAS 活实例）：写 config/host 的 uiLanguage 无任何效果，中文不生效。
+_ARR_UI_LANG = {"radarr": 10, "sonarr": 10, "prowlarr": "zh_CN"}
+
+
+def _arr_set_language(service):
+    """把 *arr 界面设为简体中文（已是中文则跳过，用户手动改成其它语言不会被强拆）。
+    三个坑：
+      1. 端点必须是 /config/ui，写 /config/host 会被静默忽略（字段不存在）；
+      2. Radarr/Sonarr 用整数(10=简体中文)，Prowlarr 用字符串("zh_CN")，类型写错不报错但不生效；
+      3. 必须独立于鉴权配置调用——_arr_set_config 在「已是黄金组合」时会提前 return，
+         若把语言塞在那里，已配好免登录的实例永远补不上中文。"""
+    want = _ARR_UI_LANG.get(service)
+    if want is None:
+        return
+    key = _arr_api_key(service)
+    if not key:
+        raise RuntimeError("%s: 无 API key，无法设置界面语言" % service)
+    url = _PROXY_DEFS[service]["url"].rstrip("/") + f"/api/{_arr_api_ver(service)}/config/ui"
+    hdr = {"X-Api-Key": key, "Accept": "application/json"}
+    try:
+        with urlopen(Request(url, headers=hdr), timeout=30) as r:
+            cfg = json.loads(r.read().decode())
+        if cfg.get("uiLanguage") == want:
+            return  # 已是简体中文，跳过
+        payload = dict(cfg)
+        payload["uiLanguage"] = want
+        req = Request(url, data=json.dumps(payload).encode(),
+                      headers={"X-Api-Key": key, "Content-Type": "application/json",
+                               "Accept": "application/json"}, method="PUT")
+        with urlopen(req, timeout=30) as r:
+            r.read()
+        with urlopen(Request(url, headers=hdr), timeout=30) as r:
+            verify = json.loads(r.read().decode())
+        if verify.get("uiLanguage") != want:
+            raise RuntimeError("%s 界面语言未生效，当前=%r" % (service, verify.get("uiLanguage")))
+        print("[autopilot] %s 界面语言已设为简体中文 (%r)" % (service, want), flush=True)
+    except Exception as e:
+        print("[autopilot] %s 界面语言设置异常(将重试): %s" % (service, e), flush=True)
+        raise
+
+
 def _qb_fix_config():
     """qB 直登：docker 子网(动态检测)内免认证。
     机制=WebUI\\AuthSubnetWhitelist(等价于 *arr 的 disabledForLocalAddresses)。
@@ -2159,17 +2202,19 @@ def _qb_fix_config():
     container = "media-qbittorrent"
     try:
         import subprocess
-        # 1) 幂等：先确认 qB 起来且 conf 已生成，已含白名单就直接返回（避免每次自启都重启 qB）
+        # 1) 幂等：先确认 qB 起来且 conf 已生成。
+        #    必须「白名单 + 中文 Locale」两者齐备才返回——只查白名单的话，
+        #    老实例已配过白名单就会提前 return，Locale 永远补不上（中文不生效的元凶之一）。
         subprocess.run(["docker", "start", container], capture_output=True, text=True, timeout=60)
         subnet = _docker_net_subnet()
         for _ in range(30):
             cur = subprocess.run(["docker", "exec", container, "cat",
                                   "/config/qBittorrent/qBittorrent.conf"],
                                  capture_output=True, text=True, timeout=20).stdout
-            if ("AuthSubnetWhitelist=%s" % subnet) in cur:
+            if ("AuthSubnetWhitelist=%s" % subnet) in cur and "Locale=zh_CN" in cur:
                 return
             if cur.strip():
-                break  # conf 已生成但无白名单，进入修正
+                break  # conf 已生成但缺白名单或缺中文，进入修正
             time.sleep(2)
         # 2) 停 qB（让其把当前内存配置回写，文件稳定后再改，避免被覆盖）
         subprocess.run(["docker", "stop", container], capture_output=True, text=True, timeout=90)
@@ -2223,6 +2268,7 @@ def _arr_bootstrap():
             try:
                 _arr_create_account(service)
                 _arr_set_config(service)
+                _arr_set_language(service)   # 独立设置简体中文（/config/ui；鉴权配置会提前 return，不能塞进去）
                 print("[autopilot] %s 账号初始化完成 (urlBase=\"\", auth=forms+disabledForLocalAddresses)" % service, flush=True)
                 break
             except Exception:
@@ -2881,13 +2927,6 @@ PAGE = r"""<!doctype html>
   .dd-body label input{accent-color:#2f6fed;cursor:pointer}
   .filter-sel{padding:5px 8px;border-radius:6px;background:#171a21;border:1px solid #232a37;color:#aeb6c2;font-size:12px;cursor:pointer;line-height:1.4}
   .filter-sel:focus{outline:1px solid #2f6fed;border-color:#2f6fed}
-  .batchbox{border:1px solid #232a37;border-radius:10px;background:#13171f;padding:10px 14px;margin-bottom:12px}
-  .batchbox>summary{list-style:none;cursor:pointer;color:#cdd4df;font-weight:600;font-size:14px;user-select:none}
-  .batchbox>summary::-webkit-details-marker{display:none}
-  .batchbox>summary:hover{color:#fff}
-  #batchNames{width:100%;box-sizing:border-box;min-height:120px;resize:vertical;line-height:1.5;margin-top:8px;background:#0f1318;border:1px solid #2a3140;color:#e6e6e6;font-family:inherit}
-  #batchNames:focus{outline:1px solid #2f6fed;border-color:#2f6fed}
-  #batchResult .card{padding:10px 12px}
 </style>
 </head>
 <body>
@@ -2929,19 +2968,6 @@ PAGE = r"""<!doctype html>
       <button class="btn" onclick="doSearch()">搜索</button>
     </div>
     <div id="status"></div>
-    <details class="batchbox" id="batchBox">
-      <summary>📋 批量添加（每行一个片名/剧名，自动选源下载）</summary>
-      <div class="row" style="margin:8px 0">
-        <select id="batchKind">
-          <option value="movie">电影</option>
-          <option value="tv">剧集</option>
-        </select>
-        <button class="btn" onclick="runBatch()">开始批量添加</button>
-        <span class="muted" id="batchHint">逐条搜索并添加，结果见下</span>
-      </div>
-      <textarea id="batchNames" rows="6" placeholder="每行一个，例如：&#10;盗梦空间&#10;星际穿越&#10;权力的游戏"></textarea>
-      <div id="batchResult"></div>
-    </details>
     <div class="grid" id="cands"></div>
   </div>
 
@@ -3500,31 +3526,6 @@ function doSearch(){
 }
 
 function esc(s){const d=document.createElement("div");d.textContent=s||"";return d.innerHTML;}
-
-function runBatch(){
-  const names=document.getElementById("batchNames").value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-  if(!names.length){setStatus("批量添加：请先粘贴片名","err");return;}
-  const kind=document.getElementById("batchKind").value;
-  const prof=document.getElementById("profile").value;
-  const sm=document.getElementById("seasonMode").value;
-  const box=document.getElementById("batchResult");
-  box.innerHTML='<div class="muted">批量添加中…('+names.length+' 条)</div>';
-  jpost("/api/"+(kind==="tv"?"series":"movies")+"/bulk",{names:names,profile:prof||null,seasonMode:sm})
-   .then(d=>{
-     if(!d||!d.results){box.innerHTML='<div class="muted">无返回</div>';return;}
-     const okN=d.results.filter(r=>r.ok).length;
-     let html='<div class="muted" style="margin:6px 0">完成：成功 '+okN+' / '+d.results.length+'</div><div class="grid" style="margin-top:4px">';
-     d.results.forEach(r=>{
-       const ok=r.ok, title=esc(r.title||r.name||"???");
-       const msg=ok?("已添加 / "+(r.action||"")):("失败："+esc(String(r.error||"")));
-       const cls=ok?"ok":"err";
-       html+='<div class="card"><div class="c-title">'+title+'</div><span class="badge '+cls+'">'+(ok?"✓":"✗")+'</span><div class="s">'+esc(msg)+'</div></div>';
-     });
-     html+='</div>';
-     box.innerHTML=html;
-     toast("批量添加完成：成功 "+okN+" / "+d.results.length,"ok");
-   }).catch(e=>{box.innerHTML='<div class="muted">请求失败 '+e+'</div>';});
-}
 
 let _qFilter="all";   // 队列筛选：all / movie / tv（独立于顶部电影·剧集模式）
 let _spd=[]; const SPD_MAX=40;
