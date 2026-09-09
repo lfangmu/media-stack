@@ -2788,7 +2788,7 @@ def system_status():
         fla = f_f.result()
         prx = f_p.result()
     svcs = [
-        {"key": "autopilot", "name": "media-autopilot", "ok": True, "web": False,
+        {"key": "autopilot", "name": "autopilot", "ok": True, "web": False,
          "detail": "已运行 " + _uptime(),
          "desc": "统一入口：搜索片名并自动选源下载，管理电影/剧集与下载队列"},
         {"key": "radarr", "name": "Radarr", "ok": rad_ok, "web": True,
