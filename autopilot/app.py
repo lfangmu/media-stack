@@ -2067,9 +2067,18 @@ def _arr_create_account(service):
     try:
         with urlopen(Request(url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=30) as r:
             cfg = json.loads(r.read().decode())
+        # 已是黄金组合：说明用户早建好、免登录也配好了。直接跳过，不再 PUT。
+        # ⚠️ 不跳过会每轮重写 host 配置，配合下面的 enabled 会形成「改写→重启→再改写」死循环。
+        if (cfg.get("authenticationMethod") == "forms"
+                and cfg.get("authenticationRequired") == "disabledForLocalAddresses"):
+            return "exists"
         payload = dict(cfg)
         payload["authenticationMethod"] = "forms"
-        payload["authenticationRequired"] = "enabled"
+        # ⚠️ 绝不硬编码 authenticationRequired="enabled"：那会把「免登录」打回，
+        #    下一刻 _arr_set_config 发现不是黄金组合 -> 改写 + 重启 -> 重启后本函数又改回 enabled
+        #    -> 死循环。实测（2026-09-09）：Prowlarr 每 16 秒被重启一次，幂等跳过命中 0 次。
+        #    保留 cfg 现值：首跑默认是 enabled，随后由 _arr_set_config 改成 disabledForLocalAddresses；
+        #    第二轮起走到上面的「已是黄金组合」分支直接返回，根本不会 PUT。
         payload["username"] = ARR_ADMIN_USER
         payload["password"] = ARR_ADMIN_PASS
         payload["passwordConfirmation"] = ARR_ADMIN_PASS
@@ -2103,6 +2112,23 @@ def _arr_checkpoint(service):
                        capture_output=True, text=True, timeout=120)
     except Exception as e:
         print("[autopilot] %s wal_checkpoint 失败(若向导复现需手动): %s" % (service, e), flush=True)
+
+
+def _arr_wait_ready(service, timeout=240):
+    """重启容器后轮询等待 *arr API 真正可访问（最多 timeout 秒）。
+    *arr 冷启动要几十秒，重启完立刻调 API 必然 Connection refused——
+    必须等就绪再往下走，否则只是把失败推给外层重试、日志噪音且收敛慢。"""
+    key = _arr_api_key(service)
+    url = _PROXY_DEFS[service]["url"].rstrip("/") + f"/api/{_arr_api_ver(service)}/config/host"
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with urlopen(Request(url, headers={"X-Api-Key": key, "Accept": "application/json"}), timeout=10) as r:
+                r.read()
+            return True
+        except Exception:
+            time.sleep(3)
+    return False
 
 
 def _arr_set_config(service):
@@ -2145,6 +2171,9 @@ def _arr_set_config(service):
         _arr_checkpoint(service)
         # 重启容器让 firstRun 重算（用户已存在 -> firstRun=false -> 无向导/覆盖层）
         _restart_container("media-" + service)
+        # 等它真正起来再返回，避免紧随其后的 _arr_set_language 撞 Connection refused
+        if not _arr_wait_ready(service):
+            raise RuntimeError("%s 重启后等待就绪超时" % service)
     except Exception as e:
         print("[autopilot] %s 配置设置异常(将重试): %s" % (service, e), flush=True)
         raise
@@ -2193,6 +2222,35 @@ def _arr_set_language(service):
         raise
 
 
+def _qb_set_language():
+    """qB 界面设简体中文（幂等：locale 已是 zh_CN 则跳过，不覆盖用户手改）。
+    ⚠️ 不能靠改 qBittorrent.conf 的 [General] Locale=：qB 的偏好键是 Preferences/General/Locale，
+       实测 conf 里写了 [General] Locale=zh_CN 也不生效（/api/v2/app/preferences 的 locale 仍为 'C'）。
+       改用 Web API setPreferences（qB 5.x 的 preferences 含 locale 字段）；
+       从 docker 子网调用免认证（AuthSubnetWhitelist 已生效）。
+    ⚠️ qB 冷启动要几十秒，故轮询等待 API 可达后再设。"""
+    base = QBIT_URL.rstrip("/")
+    for _ in range(30):
+        try:
+            with urlopen(base + "/api/v2/app/preferences", timeout=15) as r:
+                cur = json.loads(r.read().decode()).get("locale")
+            if cur == "zh_CN":
+                return
+            data = urlencode({"json": json.dumps({"locale": "zh_CN"})}).encode()
+            req = Request(base + "/api/v2/app/setPreferences", data=data, method="POST")
+            with urlopen(req, timeout=15) as r:
+                r.read()
+            with urlopen(base + "/api/v2/app/preferences", timeout=15) as r:
+                after = json.loads(r.read().decode()).get("locale")
+            if after != "zh_CN":
+                raise RuntimeError("qB 界面语言未生效，当前=%r" % after)
+            print("[autopilot] qB 界面语言已设为简体中文", flush=True)
+            return
+        except Exception:
+            time.sleep(5)
+    raise RuntimeError("qB 界面语言设置超时（API 持续不可达）")
+
+
 def _qb_fix_config():
     """qB 直登：docker 子网(动态检测)内免认证。
     机制=WebUI\\AuthSubnetWhitelist(等价于 *arr 的 disabledForLocalAddresses)。
@@ -2202,19 +2260,21 @@ def _qb_fix_config():
     container = "media-qbittorrent"
     try:
         import subprocess
-        # 1) 幂等：先确认 qB 起来且 conf 已生成。
-        #    必须「白名单 + 中文 Locale」两者齐备才返回——只查白名单的话，
-        #    老实例已配过白名单就会提前 return，Locale 永远补不上（中文不生效的元凶之一）。
+        # 1) 幂等：先确认 qB 起来且 conf 已生成，已含白名单就直接返回（避免每次自启都重启 qB）。
+        #    注：界面语言不查 conf——qB 读的是 Preferences/General/Locale，写 [General] Locale= 无效
+        #    （实测 conf 已写入但 /api/v2/app/preferences 的 locale 仍是 'C'）。语言由 _qb_set_language
+        #    经 Web API 设置，故此处只查白名单。
         subprocess.run(["docker", "start", container], capture_output=True, text=True, timeout=60)
         subnet = _docker_net_subnet()
         for _ in range(30):
             cur = subprocess.run(["docker", "exec", container, "cat",
                                   "/config/qBittorrent/qBittorrent.conf"],
                                  capture_output=True, text=True, timeout=20).stdout
-            if ("AuthSubnetWhitelist=%s" % subnet) in cur and "Locale=zh_CN" in cur:
+            if ("AuthSubnetWhitelist=%s" % subnet) in cur:
+                _qb_set_language()
                 return
             if cur.strip():
-                break  # conf 已生成但缺白名单或缺中文，进入修正
+                break  # conf 已生成但无白名单，进入修正
             time.sleep(2)
         # 2) 停 qB（让其把当前内存配置回写，文件稳定后再改，避免被覆盖）
         subprocess.run(["docker", "stop", container], capture_output=True, text=True, timeout=90)
@@ -2231,14 +2291,8 @@ def _qb_fix_config():
             " t='[General]'+nl+'[Preferences]'+nl\n"
             "lines=t.split('\\n'); lines=[l.rstrip('\\r') for l in lines]\n"
             "lines=[l for l in lines if not l.startswith('WebUI\\\\AuthSubnetWhitelist')]\n"
-            "lines=[l for l in lines if not l.startswith('Locale=')]\n"
             "pidx=lines.index('[Preferences]')+1 if '[Preferences]' in lines else len(lines)\n"
             "lines[pidx:pidx]=['WebUI\\AuthSubnetWhitelistEnabled=true','WebUI\\AuthSubnetWhitelist=__SUBNET__']\n"
-            "if '[General]' in lines:\n"
-            " gidx=lines.index('[General]')+1\n"
-            " lines[gidx:gidx]=['Locale=zh_CN']\n"
-            "else:\n"
-            " lines[0:0]=['[General]','Locale=zh_CN']\n"
             "open(p,'wb').write(nl.join(lines).encode('utf-8'))\n"
             "print('patched')\n"
         )
@@ -2249,6 +2303,7 @@ def _qb_fix_config():
         # 4) 起 qB，读回修正后的 conf
         subprocess.run(["docker", "start", container], capture_output=True, text=True, timeout=90, check=True)
         print("[autopilot] qB 配置已修正(子网白名单)并重启", flush=True)
+        _qb_set_language()   # 界面中文（走 Web API，不靠 conf）
     except Exception as e:
         try:
             subprocess.run(["docker", "start", container], capture_output=True, text=True, timeout=90)
