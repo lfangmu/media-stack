@@ -1589,6 +1589,9 @@ def _ensure_flare_proxy():
         return None
 
 
+# 手动「扫描添加索引器」状态（页面按钮触发，后台线程跑 seed_indexers）
+_seed_state = {"running": False, "last": None}
+
 def seed_indexers():
     """幂等播种：自动补齐 SEED_INDEXER_NAMES 中的公共索引器（只加缺失的，已存在的跳过）。
 
@@ -1677,6 +1680,30 @@ def seed_indexers_loop(max_retries=20, wait=15):
         if attempt < max_retries:
             time.sleep(wait)
     print("[seed] 播种流程结束", flush=True)
+
+
+def seed_indexers_manual():
+    """手动触发一次幂等播种（页面「扫描添加」按钮调用）。后台线程执行，避免前端卡等。"""
+    global _seed_state
+    if _seed_state["running"]:
+        return {"ok": False, "error": "扫描进行中，请稍候"}
+    def _run():
+        global _seed_state
+        try:
+            _seed_state["running"] = True
+            added, skipped, errors, all_present = seed_indexers()
+            _seed_state["last"] = {
+                "ok": True, "added": added, "skipped": skipped,
+                "all_present": all_present,
+                "errors": errors[-12:] if errors else [],
+            }
+        except Exception as e:
+            _seed_state["last"] = {"ok": False, "error": str(e)}
+        finally:
+            _seed_state["running"] = False
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {"ok": True, "started": True}
 
 
 # ---------- 各服务健康探测 ----------
@@ -3161,7 +3188,8 @@ PAGE = r"""<!doctype html>
   <!-- 索引器只读健康 -->
   <div class="panel" id="p-indexers">
     <div class="row"><button class="btn ghost" onclick="loadIndexers()">刷新</button>
-      <span class="muted">只读：资源库（索引器）健康状态，无需登录 Prowlarr</span></div>
+      <button class="btn ghost" id="idxScan" onclick="scanIndexers()">扫描添加</button>
+      <span class="muted">只读：资源库（索引器）健康状态，无需登录 Prowlarr；「扫描添加」手动补齐缺失的公共索引器</span></div>
     <div id="indexers"></div>
   </div>
 
@@ -4083,6 +4111,34 @@ function loadIndexers(){
 }
 
 
+function scanIndexers(){
+  const b=document.getElementById("idxScan");
+  if(b){b.disabled=true; b.textContent="扫描中…";}
+  fetch("/api/indexers/seed",{method:"POST",headers:authHdr()}).then(r=>r.json()).then(d=>{
+    if(d.ok){
+      toast("已触发扫描，完成后自动刷新");
+      let tries=0;
+      const poll=setInterval(()=>{
+        tries++;
+        jget("/api/indexers/seed").then(s=>{
+          if(!s.running || tries>=24){
+            clearInterval(poll);
+            loadIndexers();
+            if(b){b.disabled=false; b.textContent="扫描添加";}
+            if(s.last){
+              if(s.last.ok) toast("扫描完成：新增 "+s.last.added+" 个，跳过 "+s.last.skipped+" 个");
+              else toast("扫描出错："+(s.last.error||"未知"));
+            }
+          }
+        }).catch(()=>{ if(tries>=24){clearInterval(poll); loadIndexers(); if(b){b.disabled=false; b.textContent="扫描添加";}} });
+      }, 5000);
+    } else {
+      toast("触发失败："+(d.error||"未知"));
+      if(b){b.disabled=false; b.textContent="扫描添加";}
+    }
+  }).catch(e=>{ toast("触发失败："+e); if(b){b.disabled=false; b.textContent="扫描添加";} });
+}
+
 // 配置面板：单一代理出口 + TMDB（自包含，无需 bitmagnet-bot）
 function apLoadConfig(){
   const st=document.getElementById("apCfgStatus");
@@ -4318,6 +4374,8 @@ class H(BaseHTTPRequestHandler):
                         hoff = 0
                     self._send(200, {"history": recent_history(hkind, hlimit, hoff),
                                      "limit": hlimit, "offset": hoff})
+                elif base == "/api/indexers/seed":
+                    self._send(200, dict(_seed_state)); return
                 elif base.startswith("/api/indexers"):
                     self._send(200, indexer_health())
                 elif base.startswith("/api/rootfolders"):
@@ -4515,6 +4573,8 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(500, {"ok": False, "error": str(e)}); return
             self._send(200, {"ok": True}); return
+        if p == "/api/indexers/seed":
+            self._send(200, seed_indexers_manual()); return
         if p.startswith("/api/indexers/") and p.endswith("/enable"):
             name = p.rsplit("/", 2)[1]
             if not name:
