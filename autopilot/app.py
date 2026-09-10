@@ -494,12 +494,18 @@ def tmdb_get(path, params=None):
                 return json.loads(raw), None
         except urllib.error.HTTPError as ex:
             # 4xx/5xx 是确定错误，不重试
+            if ex.code in (401, 403):
+                return None, "TMDB_API_KEY 无效（HTTP %s）：请检查「配置」页填写的 TMDB API Key 是否正确" % ex.code
             return None, "TMDB HTTP %s: %s" % (ex.code, ex.reason)
         except Exception as e:
             last_err = _friendly_net_err(str(e))
             if attempt < 3:
                 time.sleep(0.8)
-    return None, last_err
+    # 重试 3 次仍失败：区分「未配代理（直连）」与「已配代理但节点抖/不可达」，
+    # 避免笼统提示「去填代理」误导用户（代理已配时无需再填）。
+    if TMDB_PROXY:
+        return None, "TMDB 经代理请求失败（已重试 3 次）：节点可能抖动或代理不可达。可稍后刷新重试，或在出网配置把 GLOBAL 钉到稳定节点。"
+    return None, "TMDB 直连失败（当前未配置代理）：请在「出网配置」填写境外 HTTP 代理并保存，再刷新本页。"
 
 
 def _build_tmdb_query(kind, cat, page, genre=None, country=None,
@@ -620,10 +626,13 @@ def tmdb_discover(kind="movie", cat="popular", page=1, genre=None, country=None,
     pairs = _ALL_PAIRS.get(cat, _ALL_PAIRS["popular"])
     per_type = []
     total_pages_list, total_results_list = [], []
+    first_err = None
     for k, c in pairs:
         path, params = _build_tmdb_query(k, c, page, genre, country, decade, rating, runtime, sort)
         data, err = tmdb_get(path, params)
         if err:
+            if first_err is None:
+                first_err = err
             continue  # 单类型失败不致命，跳过该类型
         items = data.get("results", []) if isinstance(data, dict) else []
         per_type.append([_norm_item(it, k) for it in items])
@@ -631,7 +640,7 @@ def tmdb_discover(kind="movie", cat="popular", page=1, genre=None, country=None,
         total_results_list.append(data.get("total_results", 0))
     if not per_type:
         return {"ok": False, "configured": True,
-                "error": "外网未连通：请在「出网配置」填写境外 HTTP 代理（UPSTREAM_PROXY）后刷新本页；若已填写请确认代理可达。"}
+                "error": first_err or "TMDB 拉取失败（电影与剧集均未能返回数据），请稍后刷新重试。"}
     # 交错合并，避免电影/剧集各自成块
     merged = []
     maxlen = max((len(x) for x in per_type), default=0)
@@ -2504,7 +2513,7 @@ def net_test():
 
 def _config_values():
     """汇总当前所有可配置项（含实时读取的 qB 下载目录），供 GET/POST 回显复用。"""
-    return {"PROXY_URL": PROXY_URL, "TMDB_KEY": TMDB_KEY,
+    return {"PROXY_URL": PROXY_URL, "TMDB_PROXY": _mask_proxy(TMDB_PROXY), "TMDB_KEY": TMDB_KEY,
             "AUTH_TOKEN": TOKEN, "WEBHOOK_URL": WEBHOOK_URL,
             "DATA_DIR": DATA_DIR,
             "MOVIE_PROFILE_ID": DEFAULT_MOVIE_PROFILE_ID,
@@ -2513,8 +2522,41 @@ def _config_values():
             "TV_ROOT_CFG": DEFAULT_TV_ROOT}
 
 
+def _mask_proxy(u):
+    """只回显 scheme://host:port，隐去 user:pass@，避免代理凭据泄露到页面。"""
+    if not u:
+        return ""
+    at = u.find("@")
+    if at != -1:
+        scheme_end = u.find("://")
+        scheme = u[:scheme_end + 3] if scheme_end != -1 else ""
+        host = u[at + 1:]
+        return scheme + "***:***@" + host
+    return u
+
+
 def config_get():
     return {"ok": True, "values": _config_values()}
+
+
+def config_test():
+    """用「实际生效」的 TMDB_KEY / TMDB_PROXY 真发一次 TMDB 请求，
+    返回可感知的生效状态，解决「配置页显示已配置、实际没生效」看不出来的问题。"""
+    key_present = bool(TMDB_KEY)
+    proxy_effective = _mask_proxy(TMDB_PROXY or "")
+    proxy_source = "TMDB_PROXY" if TMDB_PROXY else ("PROXY_URL(回退)" if PROXY_URL else "未配置")
+    if not key_present:
+        return {"ok": False, "key_present": False, "proxy_source": proxy_source,
+                "proxy_effective": proxy_effective,
+                "error": "TMDB_API_KEY 未配置：请在「配置」页填写后保存。"}
+    data, err = tmdb_get("/movie/popular", {"page": 1})
+    if err:
+        return {"ok": False, "key_present": True, "proxy_source": proxy_source,
+                "proxy_effective": proxy_effective, "error": err}
+    n = len(data.get("results", [])) if isinstance(data, dict) else 0
+    return {"ok": True, "key_present": True, "proxy_source": proxy_source,
+            "proxy_effective": proxy_effective,
+            "detail": "TMDB 连接成功（经 %s，返回 %d 条）" % (proxy_effective or "直连", n)}
 
 
 def config_save(body_str):
@@ -3155,6 +3197,11 @@ PAGE = r"""<!doctype html>
     <div class="muted" style="margin-top:6px;font-size:12px;line-height:1.5">留空 = 所有容器经 Squid 直连当前环境网络（WSL 下即直连公网）；填写 = 出网统一经 Squid 上行到此代理。保存后只重启出口代理 media-proxy-forwarder，*arr/qB/FlareSolverr 无需重启。</div>
     <label class="cfg-row" style="display:block;margin:8px 0"><span>TMDB API Key</span>
       <input id="ap_TMDB_KEY" type="password" style="width:100%;margin-top:4px;padding:8px" placeholder="在 themoviedb.org 申请的 v3 API Key"></label>
+      <div class="row" style="margin-top:8px">
+        <button class="btn ghost" onclick="apTestTmdb()">测试 TMDB 连接</button>
+        <span class="muted" id="apTmdbStatus"></span>
+      </div>
+      <div class="muted" style="margin-top:6px;font-size:12px;line-height:1.5">TMDB 实际生效代理：<code id="ap_TMDB_PROXY_EFF">（加载中…）</code><span id="ap_TmdbProxyWarn" style="color:#ffb454"></span></div>
     <div class="cfg-sec" style="margin-top:18px;border-top:1px solid #23304a;padding-top:14px">
       <div class="muted" style="margin-bottom:8px">访问鉴权与抓取完成通知</div>
       <label class="cfg-row" style="display:block;margin:8px 0"><span>访问令牌 AUTOPILOT_TOKEN</span>
@@ -4045,11 +4092,24 @@ function apLoadConfig(){
     const v=d.values||{};
     document.getElementById("ap_PROXY_URL").value=v.PROXY_URL||"";
     document.getElementById("ap_TMDB_KEY").value=v.TMDB_KEY||"";
+    const effEl=document.getElementById("ap_TMDB_PROXY_EFF"); if(effEl)effEl.textContent=(v.TMDB_PROXY&&v.TMDB_PROXY!=="（空）")?v.TMDB_PROXY:"（空，将回退 PROXY_URL）";
+    const warnEl=document.getElementById("ap_TmdbProxyWarn"); if(warnEl){warnEl.textContent=(!v.TMDB_PROXY&&v.PROXY_URL)?" ⚠ 与 Proxy URL 不一致，已自动回退":"";}
     const tokEl=document.getElementById("ap_AUTH_TOKEN"); if(tokEl)tokEl.value=v.AUTH_TOKEN||"";
     const whEl=document.getElementById("ap_WEBHOOK_URL"); if(whEl)whEl.value=v.WEBHOOK_URL||"";
     const ddEl=document.getElementById("ap_DATA_DIR"); if(ddEl)ddEl.value=v.DATA_DIR||"";
     if(st)st.textContent="已加载";
   }).catch(e=>{ if(st)st.textContent="加载失败："+e; });
+}
+function apTestTmdb(){
+  const el=document.getElementById("apTmdbStatus");
+  if(el){el.textContent="测试中…";el.style.color="";}
+  jget("/api/config_test").then(d=>{
+    if(!d){ if(el)el.textContent="❌ 无返回"; return; }
+    const src=d.proxy_source?("（生效代理来源："+d.proxy_source+"）"):"";
+    if(d.ok){ if(el){el.style.color="#5fd38a";el.textContent="✅ "+d.detail+src;} }
+    else if(d.key_present===false){ if(el){el.style.color="#ffb454";el.textContent="⚠️ "+d.error;} }
+    else { if(el){el.style.color="#ff7a7a";el.textContent="❌ "+d.error+src;} }
+  }).catch(e=>{ if(el){el.style.color="#ff7a7a";el.textContent="测试失败："+e;} });
 }
 function apSaveConfig(){
   const st=document.getElementById("apCfgStatus");
@@ -4268,6 +4328,8 @@ class H(BaseHTTPRequestHandler):
                                     "sent": _WEBHOOK_SENT, "last": _WEBHOOK_LAST})
                 elif base == "/api/config":
                     self._send(200, config_get()); return
+                elif base == "/api/config_test":
+                    self._send(200, config_test()); return
                 elif base == "/api/nettest":
                     self._send(200, net_test()); return
                 elif base.startswith("/api/calendar"):
