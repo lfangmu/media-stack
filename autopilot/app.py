@@ -103,7 +103,7 @@ MEDIA_PROJECT_DIR = os.environ.get("MEDIA_PROJECT_DIR", "/opt/media")
 # （本 NAS 容器无直连外网，统一经 OpenClash）；若需直连可设 TMDB_PROXY=（空）。
 TMDB_KEY = os.environ.get("TMDB_API_KEY", "").strip()
 TMDB_LANG = os.environ.get("TMDB_LANG", "zh-CN").strip() or "zh-CN"
-TMDB_PROXY = os.environ.get("TMDB_PROXY", PROXY_URL)
+TMDB_PROXY = os.environ.get("TMDB_PROXY") or PROXY_URL
 TMDB_BASE = os.environ.get("TMDB_BASE", "https://api.themoviedb.org/3")
 TMDB_IMG = "https://image.tmdb.org/t/p/w342"
 
@@ -145,7 +145,7 @@ def _apply_env_file_overrides():
     if "PROXY_URL" in kv:
         # .env 里显式留空也视为「无代理 = 直连出网」，不再回退到 squid 默认值
         PROXY_URL = kv["PROXY_URL"]
-    if "TMDB_PROXY" in kv:
+    if "TMDB_PROXY" in kv and kv["TMDB_PROXY"]:
         TMDB_PROXY = kv["TMDB_PROXY"]
     # 媒体库根目录以 .env 的 MOVIE_ROOT/TV_ROOT 为准（本栈为 /data/movies、/data/tv）；
     # 否则回退默认 /movies、/tv，与 Radarr/Sonarr 实际挂载不一致，添加影片会 400。
