@@ -197,41 +197,6 @@ deploy() {
   run "./deploy.sh"
 }
 
-# ---- 6) 出网运维脚本与定时任务（路线B：OpenClash VM 出网经本机 NAT 中转）----
-# 背景：某些网络的上游网关只放行 NAS 自身、丢弃 OpenClash VM 的外网 TCP，
-#       VM 流量必须由本机做 NAT 中转。以下两个脚本不属于 docker 栈，
-#       若不随仓库分发，重新 clone/部署后会丢失 —— 曾导致出网全断（2026-09-10）。
-setup_egress() {
-  cd "$MEDIA_ROOT"
-  local wd="$MEDIA_ROOT/clash_watchdog.py"
-  local eg="$MEDIA_ROOT/restore_vm_egress.sh"
-
-  if [ ! -f "$wd" ] || [ ! -f "$eg" ]; then
-    warn "未找到出网运维脚本（clash_watchdog.py / restore_vm_egress.sh），跳过本步"
-    return 0
-  fi
-  chmod +x "$wd" "$eg"
-
-  if [ "$(id -u)" = "0" ]; then
-    log "恢复 VM 出网 NAT（路线B）…"
-    "$eg" 2>&1 | sed 's/^/    /' || warn "restore_vm_egress.sh 执行失败（检查网卡名/权限）"
-  else
-    warn "非 root，跳过立即恢复 NAT（将由 crontab @reboot 执行）"
-  fi
-
-  if command -v crontab >/dev/null 2>&1; then
-    local tmp
-    tmp=$(mktemp)
-    crontab -l 2>/dev/null | grep -v 'clash_watchdog\.py' | grep -v 'restore_vm_egress\.sh' > "$tmp" 2>/dev/null || true
-    printf '*/3 * * * * timeout 120 /usr/bin/python3 %s >> %s/clash_watchdog.log 2>&1\n' "$wd" "$MEDIA_ROOT" >> "$tmp"
-    printf '@reboot %s\n' "$eg" >> "$tmp"
-    crontab "$tmp" 2>/dev/null || warn "写入 crontab 失败"
-    rm -f "$tmp"
-    log "已写入 crontab：出网看门狗每 3 分钟 + @reboot 恢复 NAT"
-  fi
-}
-
-
 main() {
   log "影视下载台 media 栈 一键安装  (root=$MEDIA_ROOT, repo=$MEDIA_REPO)"
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -241,7 +206,6 @@ main() {
     log "  3) 克隆 $MEDIA_REPO -> $MEDIA_ROOT"
     log "  4) 由 .env.example 生成 .env 并交互填值"
     log "  5) 运行 deploy.sh 起栈"
-    log "  6) 部署出网运维脚本（clash 看门狗 + VM NAT 恢复）"
     log "完成。去掉 --dry-run 即真正执行。"
     exit 0
   fi
@@ -251,7 +215,6 @@ main() {
   get_repo
   setup_env
   deploy
-  setup_egress
   echo ""
   log "== 完成 =="
   log "打开 http://<本机IP>:8787  （影视下载台）"
