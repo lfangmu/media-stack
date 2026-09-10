@@ -37,6 +37,18 @@ else
   sudo chown -R "$PUID:$PGID" .
 fi
 
+# 4.5) 建媒体库子目录：容器 /data 映射自 $DATA_DIR；Radarr/Sonarr 注册根目录时要求
+#       该路径在容器内真实存在，否则报「路径在容器内不存在」。宿主机子目录缺失即触发该报错。
+DATA_DIR_VAL="${DATA_DIR:-$(grep '^DATA_DIR=' .env 2>/dev/null | tail -1 | cut -d= -f2-)}"
+DATA_DIR_VAL="${DATA_DIR_VAL:-./data}"
+echo ">> 创建媒体库子目录 $DATA_DIR_VAL/{movies,tv,downloads}"
+mkdir -p "$DATA_DIR_VAL/movies" "$DATA_DIR_VAL/tv" "$DATA_DIR_VAL/downloads"
+if [ -w "$DATA_DIR_VAL" ]; then
+  chown -R "$PUID:$PGID" "$DATA_DIR_VAL/movies" "$DATA_DIR_VAL/tv" "$DATA_DIR_VAL/downloads" 2>/dev/null || sudo chown -R "$PUID:$PGID" "$DATA_DIR_VAL/movies" "$DATA_DIR_VAL/tv" "$DATA_DIR_VAL/downloads"
+else
+  sudo chown -R "$PUID:$PGID" "$DATA_DIR_VAL/movies" "$DATA_DIR_VAL/tv" "$DATA_DIR_VAL/downloads"
+fi
+
 # 5) 拉起（PUID/PGID 同时以环境变量传入，确保覆盖 .env 默认值）
 echo ">> docker compose up -d"
 PUID="$PUID" PGID="$PGID" docker compose up -d

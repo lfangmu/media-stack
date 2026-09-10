@@ -1847,6 +1847,10 @@ def radarr_ensure_rootfolder(path):
         if any((r.get("path") or "").rstrip("/") == path.rstrip("/") for r in rfs):
             return True, "已存在"
         try:
+            try:
+                subprocess.run(["docker", "exec", "media-radarr", "mkdir", "-p", path], capture_output=True, timeout=30)
+            except Exception:
+                pass
             r_req("POST", "/api/v3/rootfolder", {"path": path})
             return True, "已注册"
         except urllib.error.HTTPError as ex:
@@ -1869,6 +1873,10 @@ def sonarr_ensure_rootfolder(path):
         if any((r.get("path") or "").rstrip("/") == path.rstrip("/") for r in rfs):
             return True, "已存在"
         try:
+            try:
+                subprocess.run(["docker", "exec", "media-sonarr", "mkdir", "-p", path], capture_output=True, timeout=30)
+            except Exception:
+                pass
             s_req("POST", "/api/v3/rootfolder", {"path": path})
             return True, "已注册"
         except urllib.error.HTTPError as ex:
