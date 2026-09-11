@@ -1591,6 +1591,8 @@ def _ensure_flare_proxy():
 
 # 手动「扫描添加索引器」状态（页面按钮触发，后台线程跑 seed_indexers）
 _seed_state = {"running": False, "last": None}
+# bootstrap 同步门控：等 Prowlarr 自动播种线程把公共索引器补齐后再全量同步，避免抢跑只同步到少量源
+_seed_done = False
 
 def seed_indexers():
     """幂等播种：自动补齐 SEED_INDEXER_NAMES 中的公共索引器（只加缺失的，已存在的跳过）。
@@ -1665,6 +1667,7 @@ def seed_indexers_loop(max_retries=20, wait=15):
     出口（egress）偶发中断时连通性测试会失败，这里按固定间隔重试，
     覆盖看门狗自愈窗口；全部补齐或次数用尽后停止（下次 autopilot 重启会再来一遍）。
     """
+    global _seed_done
     for attempt in range(1, max_retries + 1):
         try:
             if PROWLARR_URL and get_prowlarr_key():
@@ -1680,6 +1683,8 @@ def seed_indexers_loop(max_retries=20, wait=15):
             print("[seed] 第 %d 次尝试异常: %s" % (attempt, e), flush=True)
         if attempt < max_retries:
             time.sleep(wait)
+    global _seed_done
+    _seed_done = True
     print("[seed] 播种流程结束", flush=True)
 
 
@@ -2510,24 +2515,66 @@ def _prowlarr_indexer_count(service):
         return 0
 
 
+def _prowlarr_indexer_total():
+    """返回 Prowlarr 当前已注册的索引器总数（bootstrap 同步门控用，确定『足量』目标）。"""
+    try:
+        key = get_prowlarr_key()
+        if not key:
+            return 0
+        lst = _req(PROWLARR_URL, key, "GET", "/api/v1/indexer", None, 30)
+        return len(lst) if isinstance(lst, list) else 0
+    except Exception:
+        return 0
+
+
+def _wait_seed_stable(timeout=300, poll=10):
+    """等 Prowlarr 自动播种线程把公共索引器补齐（显式完成或数量连续稳定）后再返回。
+
+    干净重装暴露的坑：bootstrap 的同步若抢在播种只播了 1~3 个索引器时就跑，全量同步只会
+    推送少量源，导致 Radarr/Sonarr 开箱源不足（契约 [4]）。等播种完成再同步是根因修复，
+    不是运行态补丁。返回是否确认播种完成/稳定。"""
+    deadline = time.time() + timeout
+    prev = -1
+    stable = 0
+    while time.time() < deadline:
+        if _seed_done:
+            return True
+        cur = _prowlarr_indexer_total()
+        if cur > 0 and cur == prev:
+            stable += 1
+            if stable >= 2:
+                return True
+        else:
+            stable = 0
+        prev = cur
+        time.sleep(poll)
+    return _seed_done
+
+
 def _prowlarr_ensure_synced_with_retry():
     """Prowlarr→*arr 同步受出网质量影响（索引器连接测试可能因临时出网抖动失败而不被推送）。
 
-    出网刚通的 bootstrap 阶段给几次重试窗口，让全量健康索引器按各自类别推到 Radarr/Sonarr，
-    使两者开箱即有足量可用源。这是「安装必出结果」的设计，不是运行态打补丁。
+    先等 Prowlarr 播种完成（索引器数量稳定），避免 bootstrap 的同步抢跑只同步到少量源；
+    再给几次重试窗口让全量健康索引器按各自类别推到 Radarr/Sonarr，使两者开箱即有足量可用源。
+    这是「安装必出结果」的设计，不是运行态打补丁。
     注：Prowlarr 的索引器 categories 是派生字段、API 无法强行写入，同步按 capabilities 类别过滤；
-    因此目标是「所有健康索引器按其类别同步、且两边搜索都返回结果」，而非强求数量等于 Prowlarr 全量。"""
+    因此目标是「*arr 同步到的数量接近 Prowlarr 全量、且两边搜索都返回结果」，而非强求数量相等。"""
+    seeded = _wait_seed_stable(timeout=300)
+    print("[autopilot] 等待 Prowlarr 播种完成=%s，开始索引器同步" % seeded, flush=True)
     for svc in ("radarr", "sonarr"):
+        p = _prowlarr_indexer_total()
+        # 目标：*arr 同步到的数量接近 Prowlarr 全量（categories 派生、按 capabilities 过滤，允许少量差异）
+        target = max(5, p - 3) if p > 0 else 5
         for attempt in range(1, 7):
             n = _prowlarr_indexer_count(svc)
-            if n >= 5:
-                print("[autopilot] %s 已同步 %d 个索引器" % (svc, n), flush=True)
+            if n >= target:
+                print("[autopilot] %s 已同步 %d 个索引器(目标≈%d)" % (svc, n, target), flush=True)
                 break
-            print("[autopilot] %s 索引器仅 %d 个，重试同步(%d/6)…" % (svc, n, attempt), flush=True)
+            print("[autopilot] %s 索引器仅 %d 个(目标≈%d)，重试同步(%d/6)…" % (svc, n, target, attempt), flush=True)
             _prowlarr_sync()
             time.sleep(25)
         else:
-            print("[autopilot] 警告：%s 索引器同步后仍偏少，可能出网临时不稳；运行时点「扫描添加」可补种" % svc, flush=True)
+            print("[autopilot] 警告：%s 索引器同步后仍偏少(实际 %d/目标≈%d)，可能出网临时不稳；运行时点「扫描添加」可补种" % (svc, n, target), flush=True)
 
 
 def _arr_bootstrap():
@@ -2554,8 +2601,19 @@ def _arr_bootstrap():
         except Exception as e:
             print("[autopilot] 补齐下载客户端/应用连接重试: %s" % e, flush=True)
             time.sleep(10)
-    # 索引器全量同步收尾：出网刚通时部分索引器连接测试会失败而不被推送，
-    # 给几次重试窗口让 Radarr/Sonarr 开箱即有足量可用源（设计先于急救：同步是安装必出结果，不是运行态补丁）
+    # 安装即预注册根目录：全新部署时 *arr 尚无根目录，导致添加电影/剧集报 400（契约 [10]）。
+    # 主动注册（幂等 + 容器内 mkdir 自愈），让「添加即下载」从安装那一刻起就可用（设计先于急救）。
+    for _ in range(10):
+        try:
+            ok_r, msg_r = radarr_ensure_rootfolder(radarr_root())
+            ok_s, msg_s = sonarr_ensure_rootfolder(sonarr_root())
+            print("[autopilot] 根目录预注册 radarr=%s(%s) sonarr=%s(%s)" % (ok_r, msg_r, ok_s, msg_s), flush=True)
+            break
+        except Exception as e:
+            print("[autopilot] 根目录预注册重试: %s" % e, flush=True)
+            time.sleep(10)
+    # 索引器全量同步收尾：先等 Prowlarr 播种完成（避免抢跑只同步到少量源），
+    # 再给几次重试窗口让 Radarr/Sonarr 开箱即有足量可用源（设计先于急救：同步是安装必出结果，不是运行态补丁）
     _prowlarr_ensure_synced_with_retry()
 
 
