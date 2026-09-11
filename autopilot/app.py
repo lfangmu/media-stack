@@ -2527,12 +2527,14 @@ def _prowlarr_indexer_total():
         return 0
 
 
-def _wait_seed_stable(timeout=300, poll=10):
+def _wait_seed_stable(timeout=360, poll=15):
     """等 Prowlarr 自动播种线程把公共索引器补齐（显式完成或数量连续稳定）后再返回。
 
-    干净重装暴露的坑：bootstrap 的同步若抢在播种只播了 1~3 个索引器时就跑，全量同步只会
-    推送少量源，导致 Radarr/Sonarr 开箱源不足（契约 [4]）。等播种完成再同步是根因修复，
-    不是运行态补丁。返回是否确认播种完成/稳定。"""
+    干净重装暴露的坑：bootstrap 的同步若抢在播种只播了少量索引器时就跑，全量同步只会
+    推送少量源，导致 Radarr/Sonarr 开箱源不足（契约 [4]）。等播种完成再同步是根因修复。
+    优先等 seed_indexers_loop 显式置位的 _seed_done（播种真正收尾，其末尾已触发一次同步）；
+    仅当播种线程异常未置位时才退化为「数量连续 3 次稳定」判定，避免播种批次间隙误判为完成。
+    返回是否确认播种完成/稳定。"""
     deadline = time.time() + timeout
     prev = -1
     stable = 0
@@ -2542,7 +2544,7 @@ def _wait_seed_stable(timeout=300, poll=10):
         cur = _prowlarr_indexer_total()
         if cur > 0 and cur == prev:
             stable += 1
-            if stable >= 2:
+            if stable >= 3:
                 return True
         else:
             stable = 0
@@ -2555,26 +2557,27 @@ def _prowlarr_ensure_synced_with_retry():
     """Prowlarr→*arr 同步受出网质量影响（索引器连接测试可能因临时出网抖动失败而不被推送）。
 
     先等 Prowlarr 播种完成（索引器数量稳定），避免 bootstrap 的同步抢跑只同步到少量源；
-    再给几次重试窗口让全量健康索引器按各自类别推到 Radarr/Sonarr，使两者开箱即有足量可用源。
-    这是「安装必出结果」的设计，不是运行态打补丁。
-    注：Prowlarr 的索引器 categories 是派生字段、API 无法强行写入，同步按 capabilities 类别过滤；
-    因此目标是「*arr 同步到的数量接近 Prowlarr 全量、且两边搜索都返回结果」，而非强求数量相等。"""
-    seeded = _wait_seed_stable(timeout=300)
+    再以「连续同步后数量不再增长即视为该类别已全量同步」为收敛判据反复触发同步，
+    使两者开箱即有足量可用源。这是「安装必出结果」的设计，不是运行态打补丁。
+    注：Prowlarr 的索引器 categories 是派生字段、API 无法强行写入，同步按 capabilities 类别过滤，
+    因此 Radarr 只收到 movie 类、Sonarr 只收到 tv 类，不能用「等于 Prowlarr 全量」做阈值——
+    正确判据是「该类别索引器已按 capabilities 全量同步且搜索返回结果」。"""
+    seeded = _wait_seed_stable(timeout=360)
     print("[autopilot] 等待 Prowlarr 播种完成=%s，开始索引器同步" % seeded, flush=True)
     for svc in ("radarr", "sonarr"):
-        p = _prowlarr_indexer_total()
-        # 目标：*arr 同步到的数量接近 Prowlarr 全量（categories 派生、按 capabilities 过滤，允许少量差异）
-        target = max(5, p - 3) if p > 0 else 5
-        for attempt in range(1, 7):
+        prev = -1
+        for attempt in range(1, 9):
             n = _prowlarr_indexer_count(svc)
-            if n >= target:
-                print("[autopilot] %s 已同步 %d 个索引器(目标≈%d)" % (svc, n, target), flush=True)
+            # 收敛：数量达标(>=5)且本次同步后不再增长 => 该类别索引器已按 capabilities 全量同步
+            if n >= 5 and n == prev:
+                print("[autopilot] %s 已同步 %d 个索引器（按类别收敛）" % (svc, n), flush=True)
                 break
-            print("[autopilot] %s 索引器仅 %d 个(目标≈%d)，重试同步(%d/6)…" % (svc, n, target, attempt), flush=True)
+            print("[autopilot] %s 索引器 %d 个，触发同步(%d/8)…" % (svc, n, attempt), flush=True)
             _prowlarr_sync()
-            time.sleep(25)
+            time.sleep(20)
+            prev = n
         else:
-            print("[autopilot] 警告：%s 索引器同步后仍偏少(实际 %d/目标≈%d)，可能出网临时不稳；运行时点「扫描添加」可补种" % (svc, n, target), flush=True)
+            print("[autopilot] 警告：%s 索引器同步后仅 %d 个，可能出网临时不稳；运行时点「扫描添加」可补种" % (svc, n), flush=True)
 
 
 def _arr_bootstrap():
