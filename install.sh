@@ -86,6 +86,24 @@ set_env() {
   fi
 }
 
+# 敏感键：安装时不回显明文、不打印到日志（避免 TMDB Key / 代理凭据泄漏到屏幕或管道）
+SENSITIVE_KEYS="TMDB_API_KEY EGRESS_PROXY AUTOPILOT_TOKEN AUTOPILOT_WEBHOOK_URL"
+
+is_sensitive() {
+  local k="$1"
+  for s in $SENSITIVE_KEYS; do
+    [ "$s" = "$k" ] && return 0
+  done
+  return 1
+}
+
+# 把敏感值脱敏为「长度提示」，绝不输出明文
+mask_secret() {
+  local v="$1"
+  local n=${#v}
+  if [ "$n" -eq 0 ]; then printf '(空)'; else printf '***(%s字符)' "$n"; fi
+}
+
 # 交互读取一个带默认值与环境预填的键
 prompt_env() {
   local key="$1" label="$2" default="$3"
@@ -97,16 +115,30 @@ prompt_env() {
   # 若已通过同名环境变量传入，直接采用，不再询问
   if [ -n "${!key:-}" ]; then
     set_env "$key" "${!key}"
-    log "  $label = ${!key} (来自环境变量)"
+    if is_sensitive "$key"; then
+      log "  $label = $(mask_secret "${!key}") (来自环境变量)"
+    else
+      log "  $label = ${!key} (来自环境变量)"
+    fi
     return
   fi
   if [ "$INTERACTIVE" -eq 0 ]; then
     set_env "$key" "$cur"
-    log "  $label = $cur (默认值/非交互)"
+    if is_sensitive "$key"; then
+      log "  $label = $(mask_secret "$cur") (默认值/非交互)"
+    else
+      log "  $label = $cur (默认值/非交互)"
+    fi
     return
   fi
   local input
-  read -r -p "  $label [$cur]: " input
+  if is_sensitive "$key"; then
+    # 敏感键：输入不回显，提示里也不展示当前值
+    read -r -s -p "  $label (输入不回显，直接回车用空值): " input
+    echo
+  else
+    read -r -p "  $label [$cur]: " input
+  fi
   input="${input:-$cur}"
   set_env "$key" "$input"
 }
