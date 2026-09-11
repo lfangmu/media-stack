@@ -2574,10 +2574,15 @@ def _prowlarr_ensure_synced_with_retry():
                 break
             print("[autopilot] %s 索引器 %d 个，触发同步(%d/8)…" % (svc, n, attempt), flush=True)
             _prowlarr_sync()
-            time.sleep(20)
+            time.sleep(30)
             prev = n
         else:
-            print("[autopilot] 警告：%s 索引器同步后仅 %d 个，可能出网临时不稳；运行时点「扫描添加」可补种" % (svc, n), flush=True)
+            # 循环耗尽仍未稳定：Radarr 处理同步有延迟，末次读数可能滞后于实际已同步数量；
+            # 只要最终数量 >=5 即视为该类别已足量同步（契约目标），仅当 <5 才真正告警。
+            if n >= 5:
+                print("[autopilot] %s 已同步 %d 个索引器（≥5，视为足量）" % (svc, n), flush=True)
+            else:
+                print("[autopilot] 警告：%s 索引器同步后仅 %d 个，可能出网临时不稳；运行时点「扫描添加」可补种" % (svc, n), flush=True)
 
 
 def _arr_bootstrap():
