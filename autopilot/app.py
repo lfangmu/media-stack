@@ -1674,6 +1674,7 @@ def seed_indexers_loop(max_retries=20, wait=15):
                 # 只在「全部补齐」时停止；否则继续重试（CF 类索引器需等 FlareSolverr 代理就绪后才加得进）。
                 # 若已尝试多次且本轮无任何新增，说明剩余项受出口限制暂时不可达，提前收尾避免空转。
                 if all_present or (added == 0 and attempt >= 4):
+                    _prowlarr_sync()
                     break
         except Exception as e:
             print("[seed] 第 %d 次尝试异常: %s" % (attempt, e), flush=True)
@@ -2357,6 +2358,144 @@ def _qb_fix_config():
               % (container, e), flush=True)
 
 
+
+def _prowlarr_sync():
+    """触发 Prowlarr 把索引器全量同步到已连接的应用(Radarr/Sonarr)。"""
+    try:
+        key = get_prowlarr_key()
+        if key:
+            _req(PROWLARR_URL, key, "POST", "/api/v1/command",
+                 {"name": "ApplicationIndexerSync"}, 30)
+            print("[autopilot] Prowlarr→*arr 索引器同步已触发", flush=True)
+    except Exception as e:
+        print("[autopilot] 触发索引器同步失败(可忽略): %s" % e, flush=True)
+
+
+def _ensure_download_clients():
+    """确保 Radarr/Sonarr 已配置 qBittorrent 下载客户端(幂等)。
+    新装/重置后若缺此步，会出现「搜得到却下不动」(Download client isn't configured)。"""
+    import urllib.parse as _up
+    host, port = "media-qbittorrent", 8085
+    try:
+        pu = _up.urlparse(QBIT_URL)
+        if pu.hostname:
+            host = pu.hostname
+        if pu.port:
+            port = pu.port
+    except Exception:
+        pass
+    qb_pass = globals().get("QBIT_PASS") or os.environ.get("QBITTORRENT_PASS", "MediaFn2026")
+    for svc, base, keyfn, category in (
+        ("radarr", RADARR_URL, get_radarr_key, "movies"),
+        ("sonarr", SONARR_URL, get_sonarr_key, "tv"),
+    ):
+        key = keyfn()
+        if not key:
+            print("[autopilot] %s 无 API key，跳过下载客户端配置" % svc, flush=True)
+            continue
+        try:
+            existing = _req(base, key, "GET", "/api/v3/downloadclient", None, 30)
+            if isinstance(existing, list) and any(
+                    d.get("implementation") == "QBittorrent" for d in existing):
+                print("[autopilot] %s 已有 qBittorrent 下载客户端，跳过" % svc, flush=True)
+                continue
+            _create_qb_client(base, key, host, port, qb_pass, category)
+        except Exception as e:
+            print("[autopilot] %s 下载客户端配置失败(将重试): %s" % (svc, e), flush=True)
+            raise
+
+
+def _create_qb_client(base, key, host, port, qb_pass, category):
+    schema = _req(base, key, "GET", "/api/v3/downloadclient/schema", None, 30)
+    tpl = None
+    if isinstance(schema, list):
+        for x in schema:
+            if x.get("implementation") == "QBittorrent":
+                tpl = x
+                break
+    if not tpl:
+        raise RuntimeError("QBittorrent schema 未找到")
+    for f in tpl.get("fields", []):
+        n = f["name"]
+        if n == "host":
+            f["value"] = host
+        elif n == "port":
+            f["value"] = port
+        elif n == "username":
+            f["value"] = QBIT_USER
+        elif n == "password":
+            f["value"] = qb_pass
+        elif n == "category":
+            f["value"] = category
+        elif n == "useSsl":
+            f["value"] = False
+    tpl["name"] = "qBittorrent"
+    tpl["enable"] = True
+    tpl["protocol"] = "torrent"
+    _req(base, key, "POST", "/api/v3/downloadclient", tpl, 30)
+    print("[autopilot] %s 已配置 qBittorrent 下载客户端 (%s:%s)" % (base, host, port), flush=True)
+
+
+def _prowlarr_ensure_apps():
+    """确保 Prowlarr 建有 Radarr/Sonarr 应用连接(幂等)并触发索引器同步。
+    否则新装后 Prowlarr 的索引器不会推送到 *arr，导致「*arr 搜不到源」。
+    依赖 NO_PROXY 已生效：Prowlarr 对内网 *arr 的连通性测试需绕过代理(否则 502)。"""
+    key = get_prowlarr_key()
+    if not key:
+        print("[autopilot] Prowlarr 无 API key，跳过应用连接配置", flush=True)
+        return
+    try:
+        apps = _req(PROWLARR_URL, key, "GET", "/api/v1/applications", None, 30)
+    except Exception as e:
+        print("[autopilot] 读取 Prowlarr 应用列表失败: %s" % e, flush=True)
+        raise
+    apps = apps or []
+    have = {a.get("implementation") for a in apps}
+    for impl, svc, base, keyfn in (
+        ("Radarr", "radarr", RADARR_URL, get_radarr_key),
+        ("Sonarr", "sonarr", SONARR_URL, get_sonarr_key),
+    ):
+        if impl in have:
+            print("[autopilot] Prowlarr 已有 %s 应用连接，跳过" % impl, flush=True)
+            continue
+        ak = keyfn()
+        if not ak:
+            print("[autopilot] %s 无 API key，跳过 Prowlarr 应用连接" % svc, flush=True)
+            continue
+        schema = _req(PROWLARR_URL, key, "GET",
+                      "/api/v1/applications/schema", None, 30)
+        tpl = None
+        if isinstance(schema, list):
+            for s in schema:
+                if s.get("implementation") == impl:
+                    tpl = s
+                    break
+        if not tpl:
+            print("[autopilot] %s schema 未找到，跳过" % impl, flush=True)
+            continue
+        for f in tpl.get("fields", []):
+            n = f["name"]
+            if n == "prowlarrUrl":
+                f["value"] = PROWLARR_URL
+            elif n == "baseUrl":
+                f["value"] = base
+            elif n == "apiKey":
+                f["value"] = ak
+        tpl["name"] = impl
+        tpl["implementation"] = impl
+        tpl["configContract"] = "%sSettings" % impl
+        tpl["syncLevel"] = "fullSync"
+        tpl["protocol"] = "torrent"
+        tpl["enable"] = True
+        try:
+            _req(PROWLARR_URL, key, "POST", "/api/v1/applications", tpl, 30)
+            print("[autopilot] 已创建 Prowlarr→%s 应用连接" % impl, flush=True)
+        except Exception as e:
+            print("[autopilot] 创建 Prowlarr→%s 应用连接失败: %s" % (impl, e), flush=True)
+            raise
+    _prowlarr_sync()
+
+
 def _arr_bootstrap():
     """后台线程：等 *arr 就绪 -> 建账号(forms+creds) + 设 config(host)(forms+disabledForLocalAddresses 免登录，幂等)。
     全程经 docker.sock 完成 wal_checkpoint 落盘 + 重启清 firstRun，确保全新部署也不弹向导/登录。"""
@@ -2368,10 +2507,19 @@ def _arr_bootstrap():
                 _arr_create_account(service)
                 _arr_set_config(service)
                 _arr_set_language(service)   # 独立设置简体中文（/config/ui；鉴权配置会提前 return，不能塞进去）
-                print("[autopilot] %s 账号初始化完成 (urlBase=\"\", auth=forms+disabledForLocalAddresses)" % service, flush=True)
                 break
             except Exception:
                 time.sleep(10)
+    # 补齐下载客户端 + Prowlarr→*arr 应用连接(幂等)，否则「搜得到下不动 / *arr 搜不到源」
+    for _ in range(30):
+        try:
+            _ensure_download_clients()
+            _prowlarr_ensure_apps()
+            print("[autopilot] 下载客户端与应用连接补齐完成", flush=True)
+            break
+        except Exception as e:
+            print("[autopilot] 补齐下载客户端/应用连接重试: %s" % e, flush=True)
+            time.sleep(10)
 
 
 def _ensure_arr_token(service):

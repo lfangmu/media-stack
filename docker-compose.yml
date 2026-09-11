@@ -88,6 +88,7 @@ services:
       - PGID=${PGID:-1000}
       - HTTP_PROXY=http://proxy-forwarder:3128
       - HTTPS_PROXY=http://proxy-forwarder:3128
+      - NO_PROXY=localhost,127.0.0.1,radarr,prowlarr,sonarr,qbittorrent,proxy-forwarder,media-radarr,media-prowlarr,media-sonarr,media-qbittorrent,media-proxy-forwarder
     ports:
       - "9696:9696"
     volumes:
@@ -103,6 +104,7 @@ services:
       - PGID=${PGID:-1000}
       - HTTP_PROXY=http://proxy-forwarder:3128
       - HTTPS_PROXY=http://proxy-forwarder:3128
+      - NO_PROXY=localhost,127.0.0.1,radarr,prowlarr,sonarr,qbittorrent,proxy-forwarder,media-radarr,media-prowlarr,media-sonarr,media-qbittorrent,media-proxy-forwarder
     ports:
       - "7878:7878"
     volumes:
@@ -118,6 +120,7 @@ services:
       - PGID=${PGID:-1000}
       - HTTP_PROXY=http://proxy-forwarder:3128
       - HTTPS_PROXY=http://proxy-forwarder:3128
+      - NO_PROXY=localhost,127.0.0.1,radarr,prowlarr,sonarr,qbittorrent,proxy-forwarder,media-radarr,media-prowlarr,media-sonarr,media-qbittorrent,media-proxy-forwarder
     ports:
       - "8989:8989"
     volumes:
