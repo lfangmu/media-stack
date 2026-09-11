@@ -220,6 +220,32 @@ setup_env() {
   log ".env 配置完成"
 }
 
+# ---- 4.5) 前置自检（装前发现环境/配置问题，给出可操作引导，而非假设环境已就绪）----
+preflight_check() {
+  local dir="${DATA_DIR:-./data}"
+  mkdir -p "$dir" 2>/dev/null || die "数据目录 $dir 不可写，请检查权限或更换安装目录 (--root)"
+  log "数据目录可写: $dir"
+
+  local proxy="${EGRESS_PROXY:-}"
+  if [ -n "$proxy" ]; then
+    log "检测到出网代理 $proxy，自检可达性…"
+    if command -v curl >/dev/null 2>&1; then
+      if curl -s -m 12 -o /dev/null -x "$proxy" "https://api.themoviedb.org/3/configuration" 2>/dev/null; then
+        log "代理可达 TMDB，出网自检通过"
+      else
+        warn "代理 $proxy 暂不可达 TMDB（节点未起 / 需鉴权 / 地址错误）。"
+        warn "仍可继续安装，但「发现墙 / 搜索 / 下载」需出网正常后才可用；"
+        warn "请确认你的出网代理可用，或安装后在页面「出网配置」中修正代理地址。"
+      fi
+    else
+      log "未找到 curl，跳过代理可达性自检（不影响安装）"
+    fi
+  else
+    log "未配置出网代理（直连出网）。若本机无法直连外网，发现墙/搜索将不可用，"
+    log "可在安装前于 .env 填 EGRESS_PROXY，或在安装后于页面「出网配置」填入代理。"
+  fi
+}
+
 # ---- 5) 起栈 ----
 deploy() {
   cd "$MEDIA_ROOT"
@@ -246,6 +272,7 @@ main() {
   ensure_docker
   get_repo
   setup_env
+  preflight_check
   deploy
   echo ""
   log "== 完成 =="

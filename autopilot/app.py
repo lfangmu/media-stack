@@ -2496,6 +2496,40 @@ def _prowlarr_ensure_apps():
     _prowlarr_sync()
 
 
+def _prowlarr_indexer_count(service):
+    """返回某 *arr 当前已同步到的索引器数量（bootstrap 自检用）。"""
+    keyfn = get_radarr_key if service == "radarr" else get_sonarr_key
+    base = RADARR_URL if service == "radarr" else SONARR_URL
+    try:
+        ks = keyfn()
+        if not ks:
+            return 0
+        lst = _req(base, ks, "GET", "/api/v3/indexer", None, 30)
+        return len(lst) if isinstance(lst, list) else 0
+    except Exception:
+        return 0
+
+
+def _prowlarr_ensure_synced_with_retry():
+    """Prowlarr→*arr 同步受出网质量影响（索引器连接测试可能因临时出网抖动失败而不被推送）。
+
+    出网刚通的 bootstrap 阶段给几次重试窗口，让全量健康索引器按各自类别推到 Radarr/Sonarr，
+    使两者开箱即有足量可用源。这是「安装必出结果」的设计，不是运行态打补丁。
+    注：Prowlarr 的索引器 categories 是派生字段、API 无法强行写入，同步按 capabilities 类别过滤；
+    因此目标是「所有健康索引器按其类别同步、且两边搜索都返回结果」，而非强求数量等于 Prowlarr 全量。"""
+    for svc in ("radarr", "sonarr"):
+        for attempt in range(1, 7):
+            n = _prowlarr_indexer_count(svc)
+            if n >= 5:
+                print("[autopilot] %s 已同步 %d 个索引器" % (svc, n), flush=True)
+                break
+            print("[autopilot] %s 索引器仅 %d 个，重试同步(%d/6)…" % (svc, n, attempt), flush=True)
+            _prowlarr_sync()
+            time.sleep(25)
+        else:
+            print("[autopilot] 警告：%s 索引器同步后仍偏少，可能出网临时不稳；运行时点「扫描添加」可补种" % svc, flush=True)
+
+
 def _arr_bootstrap():
     """后台线程：等 *arr 就绪 -> 建账号(forms+creds) + 设 config(host)(forms+disabledForLocalAddresses 免登录，幂等)。
     全程经 docker.sock 完成 wal_checkpoint 落盘 + 重启清 firstRun，确保全新部署也不弹向导/登录。"""
@@ -2520,6 +2554,9 @@ def _arr_bootstrap():
         except Exception as e:
             print("[autopilot] 补齐下载客户端/应用连接重试: %s" % e, flush=True)
             time.sleep(10)
+    # 索引器全量同步收尾：出网刚通时部分索引器连接测试会失败而不被推送，
+    # 给几次重试窗口让 Radarr/Sonarr 开箱即有足量可用源（设计先于急救：同步是安装必出结果，不是运行态补丁）
+    _prowlarr_ensure_synced_with_retry()
 
 
 def _ensure_arr_token(service):
