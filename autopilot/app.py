@@ -2557,28 +2557,40 @@ def _prowlarr_ensure_synced_with_retry():
     """Prowlarr→*arr 同步受出网质量影响（索引器连接测试可能因临时出网抖动失败而不被推送）。
 
     先等 Prowlarr 播种完成（索引器数量稳定），避免 bootstrap 的同步抢跑只同步到少量源；
-    再以「连续同步后数量不再增长即视为该类别已全量同步」为收敛判据反复触发同步，
+    再触发同步并被动等待 Radarr/Sonarr 把索引器抓取完成（按 capabilities 类别过滤），
     使两者开箱即有足量可用源。这是「安装必出结果」的设计，不是运行态打补丁。
     注：Prowlarr 的索引器 categories 是派生字段、API 无法强行写入，同步按 capabilities 类别过滤，
-    因此 Radarr 只收到 movie 类、Sonarr 只收到 tv 类，不能用「等于 Prowlarr 全量」做阈值——
-    正确判据是「该类别索引器已按 capabilities 全量同步且搜索返回结果」。"""
+    因此 Radarr 只收到 movie 类、Sonarr 只收到 tv 类，不能用「等于 Prowlarr 全量」做阈值。
+    关键：Radarr 抓取索引器是异步慢操作，频繁重发同步会打断其抓取队列导致长时间停在低数位；
+    故只触发 1~2 次同步，随后被动轮询等待其抓取收敛，而非每 30s 重发。"""
     seeded = _wait_seed_stable(timeout=360)
     print("[autopilot] 等待 Prowlarr 播种完成=%s，开始索引器同步" % seeded, flush=True)
     for svc in ("radarr", "sonarr"):
+        # 触发同步让 *arr 把索引器抓取任务入队（最多 2 次，避免打断异步抓取）
+        _prowlarr_sync()
+        time.sleep(30)
+        _prowlarr_sync()
         prev = -1
-        for attempt in range(1, 9):
+        stable = 0
+        for attempt in range(1, 15):
             n = _prowlarr_indexer_count(svc)
-            # 收敛：数量达标(>=5)且本次同步后不再增长 => 该类别索引器已按 capabilities 全量同步
+            # 收敛：数量达标(>=5)且连续两次轮询不再增长 => 该类别索引器已按 capabilities 全量抓取
             if n >= 5 and n == prev:
-                print("[autopilot] %s 已同步 %d 个索引器（按类别收敛）" % (svc, n), flush=True)
-                break
-            print("[autopilot] %s 索引器 %d 个，触发同步(%d/8)…" % (svc, n, attempt), flush=True)
-            _prowlarr_sync()
+                stable += 1
+                if stable >= 2:
+                    print("[autopilot] %s 已同步 %d 个索引器（按类别收敛）" % (svc, n), flush=True)
+                    break
+            else:
+                stable = 0
+            # 长时间无增长且仍偏少时，中途再触发一次同步兜底（仅停滞时，不打断正常抓取）
+            if attempt == 7 and n < 5:
+                _prowlarr_sync()
             time.sleep(30)
             prev = n
         else:
-            # 循环耗尽仍未稳定：Radarr 处理同步有延迟，末次读数可能滞后于实际已同步数量；
-            # 只要最终数量 >=5 即视为该类别已足量同步（契约目标），仅当 <5 才真正告警。
+            # 循环耗尽仍未稳定：Radarr 抓取有延迟，末次读数可能滞后于实际已抓取数量；
+            # 退出前再读一次最终数量，>=5 即视为该类别已足量同步（契约目标），仅 <5 才真正告警。
+            n = _prowlarr_indexer_count(svc)
             if n >= 5:
                 print("[autopilot] %s 已同步 %d 个索引器（≥5，视为足量）" % (svc, n), flush=True)
             else:
