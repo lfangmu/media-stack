@@ -81,7 +81,7 @@ services:
     restart: unless-stopped
 
   prowlarr:
-    image: lscr.io/linuxserver/prowlarr:latest
+    image: linuxserver/prowlarr:latest
     container_name: media-prowlarr
     environment:
       - PUID=${PUID:-1000}
@@ -97,7 +97,7 @@ services:
     restart: unless-stopped
 
   radarr:
-    image: lscr.io/linuxserver/radarr:latest
+    image: linuxserver/radarr:latest
     container_name: media-radarr
     environment:
       - PUID=${PUID:-1000}
@@ -113,7 +113,7 @@ services:
     restart: unless-stopped
 
   sonarr:
-    image: lscr.io/linuxserver/sonarr:latest
+    image: linuxserver/sonarr:latest
     container_name: media-sonarr
     environment:
       - PUID=${PUID:-1000}
@@ -129,7 +129,7 @@ services:
     restart: unless-stopped
 
   qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:latest
+    image: linuxserver/qbittorrent:latest
     container_name: media-qbittorrent
     environment:
       - PUID=${PUID:-1000}
