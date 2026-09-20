@@ -51,6 +51,9 @@ services:
       - PROXY_URL=${PROXY_URL:-}
       - TMDB_PROXY=${TMDB_PROXY:-}
       - DATA_DIR=${DATA_DIR:-./data}
+      # qB 下载目录自愈目标：必须落在 ${DATA_DIR}:/data 挂载内，否则文件写进容器可写层
+      # （重建即丢）且 *arr 容器看不到该路径 → 导入链路必断。见 _qb_ensure_save_path()。
+      - QB_SAVE_PATH=${QB_SAVE_PATH:-/data/downloads}
       - MEDIA_PROJECT_DIR=/opt/media
     volumes:
       - ./.env:/app/.env

@@ -2032,7 +2032,12 @@ def qbit_set_save_path(path):
             "Content-Type": "application/x-www-form-urlencoded"}
     if cm:
         hdrs["X-Csrftoken"] = cm.group(1).split("=", 1)[1]
-    body = urlencode({"json": json.dumps({"save_path": path, "temp_path": path})}).encode()
+    body = urlencode({"json": json.dumps({
+        "save_path": path,
+        # temp_path 一并收进同一持久卷：不设它的话，一旦用户开启「临时目录」，
+        # 未完成文件又会落回容器可写层（重建即丢）。惯例取 save_path/incomplete。
+        "temp_path": path.rstrip("/") + "/incomplete",
+    })}).encode()
     try:
         with urlopen(Request(QBIT_URL + "/api/v2/app/setPreferences", data=body, headers=hdrs),
                      timeout=10, context=SSL_CTX) as r:
@@ -2461,6 +2466,45 @@ def _qb_set_language():
     raise RuntimeError("qB 界面语言设置超时（API 持续不可达）")
 
 
+def _qb_ensure_save_path():
+    """qB 下载/做种目录自愈：确保落在 compose 的持久卷内（QB_SAVE_PATH，默认 /data/downloads）。
+
+    根因（真事故）：linuxserver/qbittorrent 镜像默认 save_path=/downloads，而本项目 compose 只把
+    宿主机媒体盘挂到 /data —— /downloads 不在任何卷里，于是：
+      ① 下载产物写进**容器可写层**，容器重建/升级即全丢；
+      ② Radarr/Sonarr 容器内没有 /downloads，看不到已完成的文件 → **导入链路必断**
+         （表现为「100% 完成却一直停在 stalledUP，媒体库始终没有该片」）。
+    幂等：已是目标路径直接返回；qB 冷启动要几十秒，故先轮询等 API 可达。
+    """
+    want = (QB_SAVE_PATH or "").strip()
+    if not want:
+        print("[autopilot] 未配置 QB_SAVE_PATH，跳过 qB 下载目录自愈", flush=True)
+        return
+    want_n = want.rstrip("/") or "/"
+    last = ""
+    for _ in range(30):
+        cur = qbit_get_save_path()
+        if not cur:
+            last = "qB API 不可达或未登录"
+            time.sleep(5)
+            continue
+        if (cur.rstrip("/") or "/") == want_n:
+            print("[autopilot] qB 下载目录已就位：%s" % want_n, flush=True)
+            return
+        ok, msg = qbit_set_save_path(want_n)
+        if not ok:
+            last = msg
+        else:
+            after = (qbit_get_save_path() or "").rstrip("/")
+            if after == want_n:
+                print("[autopilot] qB 下载目录已修正为 %s（原 %s）" % (want_n, cur), flush=True)
+                return
+            last = "设置后读回=%r" % after
+        time.sleep(5)
+    print("[autopilot] qB 下载目录自愈失败（%s）；请确认 qB 的默认保存路径为持久卷内的 %s"
+          % (last, want_n), flush=True)
+
+
 def _qb_fix_config():
     """qB 直登：docker 子网(动态检测)内免认证。
     机制=WebUI\\AuthSubnetWhitelist(等价于 *arr 的 disabledForLocalAddresses)。
@@ -2762,6 +2806,9 @@ def _arr_bootstrap():
     全程经 docker.sock 完成 wal_checkpoint 落盘 + 重启清 firstRun，确保全新部署也不弹向导/登录。"""
     _ensure_arr_admin_pass()
     _qb_fix_config()  # qB 直登自愈（docker 子网白名单，免登录）
+    # qB 下载目录自愈：必须落在 ${DATA_DIR}:/data 挂载内。镜像默认 /downloads 不在任何卷里，
+    # 会造成「文件写进容器可写层 + *arr 看不到 → 100% 却永远导不进媒体库」。
+    _qb_ensure_save_path()
     for service in ("radarr", "sonarr", "prowlarr"):
         for _ in range(90):
             try:
