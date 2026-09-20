@@ -152,6 +152,10 @@ def _fetch_search(kind, genre, country, rating, sort, page):
 
 def get_douban(kind="movie", cat="popular", page=1,
                genre=None, country=None, rating=None, sort=None):
+    # 豆瓣只有「电影 / 剧集」两类，没有混合榜：非 tv 一律按电影抓。
+    # item.kind 必须回填实际抓取类型，不能沿用请求里的 "all"（否则下游按片名
+    # 解析 tmdbId 时会走错 /search/movie|tv 分支，且添加时 kind 非法）。
+    eff_kind = "tv" if kind == "tv" else "movie"
     has_filter = bool(genre or country or rating or (sort and sort != "pop"))
     if has_filter:
         subjects, err = _fetch_search(kind, genre, country, rating, sort, page)
@@ -170,7 +174,7 @@ def get_douban(kind="movie", cat="popular", page=1,
         cover = s.get("cover") or (s.get("pic") or {}).get("large") or ""
         items.append({
             "tmdbId": None,
-            "kind": kind,
+            "kind": eff_kind,
             "title": title,
             "year": None,
             "overview": "",
@@ -179,5 +183,5 @@ def get_douban(kind="movie", cat="popular", page=1,
             "source": "douban",
             "doubanId": s.get("id"),
         })
-    return {"ok": True, "configured": True, "source": "douban", "kind": kind, "cat": cat,
+    return {"ok": True, "configured": True, "source": "douban", "kind": eff_kind, "cat": cat,
             "page": page, "totalPages": 9999, "totalResults": None, "items": items}

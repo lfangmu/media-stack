@@ -899,16 +899,23 @@ def discover_add(kind="movie", tmdb_id=None, name=None, profile=None, root_folde
     tmdb_id 优先；缺省时用 name 经 TMDB 搜索解析（豆瓣卡片走此路）。"""
     if not tmdb_id and name:
         tmdb_id = _resolve_tmdb_by_title(kind, name)
-    if not tmdb_id:
-        return {"ok": False, "error": "缺少 tmdbId" + ("" if name else "（且未提供片名）")}
     if kind == "tv":
-        ext, err = tmdb_get("/tv/%s/external_ids" % tmdb_id)
-        if err:
-            return {"ok": False, "error": "获取剧集 TVDB ID 失败: " + err}
-        tvdb = (ext or {}).get("tvdb_id")
-        if not tvdb:
-            return {"ok": False, "error": "TMDB 未提供该剧的 TVDB ID，无法交由 Sonarr 添加"}
-        return add_series(tvdb_id=tvdb, profile=profile, season_mode=season_mode, root_folder=root_folder)
+        # 剧集最终要 tvdbId 交 Sonarr：TMDB 有映射就用（准），没有则退回
+        # Sonarr 自己的 TVDB 检索（TVDB 收录中文译名，实测「流人」可命中）。
+        if tmdb_id:
+            ext, err = tmdb_get("/tv/%s/external_ids" % tmdb_id)
+            tvdb = (ext or {}).get("tvdb_id") if not err else None
+            if tvdb:
+                return add_series(tvdb_id=tvdb, profile=profile, season_mode=season_mode,
+                                  root_folder=root_folder)
+        if name:
+            return add_series(name=name, profile=profile, season_mode=season_mode,
+                              root_folder=root_folder)
+        return {"ok": False, "error": "TMDB 未收录该剧且未提供片名，无法交由 Sonarr 添加"}
+    if not tmdb_id:
+        if name:
+            return {"ok": False, "error": "TMDB 未收录「%s」或片名对不上，无法添加（可点卡片打开详情手动确认）" % name}
+        return {"ok": False, "error": "缺少 tmdbId（也未提供片名）"}
     return add_movie(tmdb_id=tmdb_id, profile=profile, root_folder=root_folder)
 
 
@@ -5282,14 +5289,20 @@ class H(BaseHTTPRequestHandler):
             if "__error__" in d:
                 self._send(400, {"ok": False, "error": "请求体解析失败: " + d["__error__"]}); return
             dkind = (d.get("kind") or "movie").strip()
+            if dkind not in ("movie", "tv"):
+                dkind = "movie"  # 豆瓣源 kind 可能是 "all"/空，按下游能力归一化
             tmdb = d.get("tmdbId")
-            if not tmdb:
-                self._send(400, {"ok": False, "error": "缺少 tmdbId"}); return
+            dname = str(d.get("name") or "").strip()
+            # 豆瓣条目只带片名（无 tmdbId），必须允许 name-only 请求：
+            # discover_add 会用片名经 TMDB 解析出 tmdbId 再添加。
+            if not tmdb and not dname:
+                self._send(400, {"ok": False, "error": "缺少 tmdbId（也未提供片名）"}); return
             season_mode = str(d.get("seasonMode") or "all").strip()
             if season_mode not in ("all", "latest", "first"):
                 season_mode = "all"
             try:
-                res = discover_add(kind=dkind, tmdb_id=tmdb, profile=d.get("profile"),
+                res = discover_add(kind=dkind, tmdb_id=tmdb, name=(dname or None),
+                                   profile=d.get("profile"),
                                    root_folder=d.get("rootFolderPath"), season_mode=season_mode)
             except Exception as e:
                 self._send(500, {"ok": False, "error": str(e)}); return
