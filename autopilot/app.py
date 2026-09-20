@@ -107,6 +107,37 @@ TMDB_PROXY = os.environ.get("TMDB_PROXY") or PROXY_URL
 TMDB_BASE = os.environ.get("TMDB_BASE", "https://api.themoviedb.org/3")
 TMDB_IMG = "https://image.tmdb.org/t/p/w342"
 
+# 豆瓣数据源（内热榜/评分/搜索，零 MoviePilot 依赖；默认开启，置 DOUBAN_ENABLED=0 关闭）
+try:
+    import douban_helper as _dh
+    DOUBAN_ENABLED = os.environ.get("DOUBAN_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+    _dh_proxy = os.environ.get("DOUBAN_PROXY", "").strip()
+    if _dh_proxy in ("", "auto"):
+        _dh_proxy = PROXY_URL
+    elif _dh_proxy in ("direct", "none", "0"):
+        _dh_proxy = None
+    _dh.configure(_dh_proxy)
+except Exception as _e_dh:
+    _dh = None
+    DOUBAN_ENABLED = False
+    print("[warn] douban_helper 加载失败：%s" % _e_dh)
+
+# 字幕数据源（OpenSubtitles 匿名 + SubtitleCat 中文；零 MoviePilot 依赖；默认开启，置 SUBTITLE_ENABLED=0 关闭）
+try:
+    import subtitle_helper as _sh
+    SUBTITLE_ENABLED = os.environ.get("SUBTITLE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+    _sh_proxy = os.environ.get("SUBTITLE_PROXY", "").strip()
+    if _sh_proxy in ("", "auto"):
+        # 字幕站走 squid：Clash:7890 对 .srt 直链返回空体，squid 对 subtitlecat 全路径正常
+        _sh_proxy = "http://media-proxy-forwarder:3128"
+    elif _sh_proxy in ("direct", "none", "0"):
+        _sh_proxy = None
+    _sh.configure(_sh_proxy)
+except Exception as _e_sh:
+    _sh = None
+    SUBTITLE_ENABLED = False
+    print("[warn] subtitle_helper 加载失败：%s" % _e_sh)
+
 # ---------- 反向代理直登（系统状态「打开 ↗」经 autopilot 同源代理，初始化时已建好 *arr 账号）----------
 ARR_ADMIN_USER = (os.environ.get("ARR_ADMIN_USER", "admin") or "admin").strip()
 ARR_ADMIN_PASS = (os.environ.get("ARR_ADMIN_PASS", "") or "").strip()
@@ -673,7 +704,7 @@ def tmdb_detail(kind="movie", tmdb_id=None):
                          "（免费，在 themoviedb.org 申请）。"}
     kind = kind if kind in ("movie", "tv") else "movie"
     path = ("/movie/%s" if kind == "movie" else "/tv/%s") % tmdb_id
-    data, err = tmdb_get(path, {"append_to_response": "external_ids"})
+    data, err = tmdb_get(path, {"append_to_response": "external_ids,credits,similar"})
     if err:
         return {"ok": False, "configured": True, "error": err}
     is_tv = (kind == "tv")
@@ -697,6 +728,18 @@ def tmdb_detail(kind="movie", tmdb_id=None):
     ext = data.get("external_ids") or {}
     tvdb = ext.get("tvdb_id") if is_tv else None
     rating = data.get("vote_average")
+    # 详情增强：演职表 + 相似推荐（直接复用 TMDB credits/similar，零 MoviePilot 依赖）
+    _credits = data.get("credits") or {}
+    cast = [{"name": c.get("name"), "character": c.get("character"),
+             "profile": (TMDB_IMG.replace("/w342", "/w185") + c["profile_path"]) if c.get("profile_path") else None}
+            for c in (_credits.get("cast") or [])[:8]]
+    _similar = data.get("similar") or {}
+    similar = [{"tmdbId": ss.get("id"), "kind": kind,
+                "title": ss.get("title") if kind == "movie" else ss.get("name"),
+                "year": (ss.get("release_date") or ss.get("first_air_date") or "")[:4],
+                "poster": (TMDB_IMG + ss["poster_path"]) if ss.get("poster_path") else None,
+                "rating": round(ss["vote_average"], 1) if isinstance(ss.get("vote_average"), (int, float)) else None}
+               for ss in (_similar.get("results") or [])[:8]]
     return {"ok": True, "configured": True, "kind": kind, "tmdbId": tmdb_id,
             "title": title, "originalTitle": orig, "year": year,
             "poster": poster, "backdrop": backdrop, "genres": genres, "countries": countries,
@@ -704,7 +747,7 @@ def tmdb_detail(kind="movie", tmdb_id=None):
             "episodes": data.get("number_of_episodes") if is_tv else None,
             "overview": data.get("overview") or "", "rating": round(rating, 1) if isinstance(rating, (int, float)) else None,
             "tagline": data.get("tagline") or "", "status": data.get("status") or "",
-            "tvdbId": tvdb}
+            "tvdbId": tvdb, "cast": cast, "similar": similar}
 
 
 from concurrent.futures import ThreadPoolExecutor
@@ -744,10 +787,27 @@ def _prefetch_details(items, limit=20):
         pass
 
 
-def discover_add(kind="movie", tmdb_id=None, profile=None, root_folder=None, season_mode="all"):
-    """发现墙一键添加：电影直接走 add_movie(tmdb_id)；剧集先取 tvdbId 再走 add_series。"""
+def _resolve_tmdb_by_title(kind, title):
+    """按片名经 TMDB 搜索解析 tmdbId（豆瓣卡片走此路）。返回 id 或 None。"""
+    if not TMDB_KEY:
+        return None
+    path = "/search/movie" if kind != "tv" else "/search/tv"
+    data, err = tmdb_get(path, {"query": title, "page": 1, "include_adult": "false"})
+    if err or not data:
+        return None
+    res = data.get("results") or []
+    if not res:
+        return None
+    return res[0].get("id")
+
+
+def discover_add(kind="movie", tmdb_id=None, name=None, profile=None, root_folder=None, season_mode="all"):
+    """发现墙一键添加：电影直接走 add_movie；剧集先取 tvdbId 再走 add_series。
+    tmdb_id 优先；缺省时用 name 经 TMDB 搜索解析（豆瓣卡片走此路）。"""
+    if not tmdb_id and name:
+        tmdb_id = _resolve_tmdb_by_title(kind, name)
     if not tmdb_id:
-        return {"ok": False, "error": "缺少 tmdbId"}
+        return {"ok": False, "error": "缺少 tmdbId" + ("" if name else "（且未提供片名）")}
     if kind == "tv":
         ext, err = tmdb_get("/tv/%s/external_ids" % tmdb_id)
         if err:
@@ -3292,6 +3352,19 @@ PAGE = r"""<!doctype html>
   .detail-title{font-size:22px;font-weight:700;color:#f4f6fb;margin-bottom:6px;line-height:1.25}
   .detail-tagline{color:#8b93a3;font-style:italic;margin:10px 2px 0}
   .detail-tags{margin:10px 0 0}
+  .detail-section{margin-top:16px}
+  .detail-h{font-size:13px;color:#9aa6b6;margin-bottom:8px;font-weight:600}
+  .cast-row{display:flex;gap:12px;overflow-x:auto;padding-bottom:6px}
+  .cast{flex:0 0 auto;width:84px;text-align:center}
+  .cast img{width:64px;height:64px;border-radius:50%;object-fit:cover;background:#222834}
+  .cast span{display:block;font-size:11px;line-height:1.3;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cast .muted{color:#7c879a;font-size:10px}
+  .grid.sm{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:10px}
+  .card.sm{cursor:pointer;border:1px solid #232a37;border-radius:8px;overflow:hidden;background:#171a21}
+  .card.sm img{width:100%;aspect-ratio:2/3;object-fit:cover;background:#222834}
+  .card.sm .meta{padding:5px 6px}
+  .card.sm .t{font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .card.sm .s{font-size:10px;color:#7c879a}
   .detail-overview{margin-top:14px;padding-top:14px;border-top:1px solid #222a37;
     line-height:1.7;color:#c6cdd9;font-size:14px;white-space:pre-wrap}
   .detail-acts{margin-top:18px;display:flex;gap:10px;justify-content:flex-end}
@@ -3370,6 +3443,12 @@ PAGE = r"""<!doctype html>
   <div class="panel" id="p-discover">
     <div id="discCats" class="chip-row" style="margin-bottom:10px"></div>
     <div id="discTypes" class="chip-row" style="margin-bottom:12px"></div>
+    <div class="row" style="margin-bottom:10px" id="discSrc">
+      <span class="muted" style="margin-right:8px">数据源</span>
+      <span class="chip on" data-src="tmdb">TMDB</span>
+      <span class="chip" data-src="douban">🟢 豆瓣</span>
+    </div>
+    <div id="discActive" class="active-row"></div>
     <div class="disc-dd-row">
       <details class="filter-dd" id="discGenreDD">
         <summary id="discGenreSummary">类型 ▼</summary>
@@ -3381,7 +3460,7 @@ PAGE = r"""<!doctype html>
       <select id="discRuntimeSel" class="filter-sel" style="display:none"></select>
       <select id="discSortSel" class="filter-sel"></select>
     </div>
-    <div id="discActive" class="active-row"></div>
+    <div id="discDbHint" class="muted" style="display:none;font-size:12px;margin:-4px 0 8px">ℹ️ 豆瓣源不支持「年代/时长」筛选，其余筛选项均可用</div>
     <div class="row" style="align-items:center">
       <span id="discStatus" class="muted"></span>
       <span style="flex:1"></span>
@@ -3600,22 +3679,45 @@ const RATINGS=[["","全部"],["6","6分以上"],["7","7分以上"],["8","8分以
 const RUNTIMES=[["","全部"],["0,90","90分钟内"],["90,120","90-120分钟"],["120,9999","120分钟以上"]];
 const SORTS=[["pop","按热度"],["rating","按评分"],["date","按上映日期"]];
 const CATS=[["popular","🔥 热门"],["top_rated","⭐ 高分"],["now_playing","🎬 热映"],["upcoming","📅 即将上映"],["on_the_air","📺 在播"]];
+const DOUBAN_CATS={"movie":[["popular","🔥 热门"],["top_rated","⭐ 豆瓣高分"],["latest","🆕 最新"],["cn","🇨🇳 华语"]],"tv":[["tv_pop","🔥 热门剧集"],["tv_top","⭐ 高分剧集"]],"all":[["popular","🔥 热门"],["top_rated","⭐ 豆瓣高分"],["latest","🆕 最新"],["cn","🇨🇳 华语"]]};
 
-let discKind="all", discCat="popular", discPage=1, discTotal=1;
+let discKind="all", discCat="popular", discPage=1, discTotal=1, discSource="tmdb";
 let discGenres=[], discCountry="", discYear="", discRating="", discRuntime="", discSort="pop";
+let discReqToken=0; // 请求令牌：丢弃过期响应，防快速切筛选时旧结果覆盖新结果
 
 function _genreList(){ return discKind==="tv"?GENRE_TV:GENRE_MOVIE; }
 function _catVisible(c){ if(c==="on_the_air"&&discKind==="movie")return false; if(c==="upcoming"&&discKind==="tv")return false; return true; }
 function _label(list,v){ const f=list.find(x=>x[0]===v); return f?f[1]:v; }
 
-function renderDiscChips(){
-  const cats=document.getElementById("discCats");
-  cats.innerHTML=CATS.filter(c=>_catVisible(c[0])).map(c=>'<span class="chip'+(c[0]===discCat?" on":"")+'" data-cat="'+c[0]+'">'+c[1]+'</span>').join("");
-  cats.querySelectorAll("[data-cat]").forEach(el=>el.onclick=()=>{discCat=el.getAttribute("data-cat");discPage=1;renderDiscChips();loadDiscover();});
-  const types=document.getElementById("discTypes");
+function _srcCats(){ return discSource==="douban" ? (DOUBAN_CATS[discKind]||DOUBAN_CATS["movie"]) : CATS; }
+function _doubanNoYearRuntime(){ return discSource==="douban"; }
+// 只重建分类 chips（kind/source 变化时）
+function renderDiscCats(){
+  const cats=document.getElementById("discCats"); if(!cats)return;
+  cats.innerHTML=_srcCats().filter(c=>_catVisible(c[0])).map(c=>'<span class="chip'+(c[0]===discCat?" on":"")+'" data-cat="'+c[0]+'">'+c[1]+'</span>').join("");
+}
+function renderDiscTypes(){
+  const types=document.getElementById("discTypes"); if(!types)return;
   types.innerHTML=[["all","全部"],["movie","🎬 电影"],["tv","📺 剧集"]].map(t=>'<span class="chip'+(t[0]===discKind?" on":"")+'" data-kind="'+t[0]+'">'+t[1]+'</span>').join("");
-  types.querySelectorAll("[data-kind]").forEach(el=>el.onclick=()=>{discKind=el.getAttribute("data-kind");discGenres=[];discPage=1;renderDiscChips();renderDiscDropdowns();renderActiveChips();loadDiscover();});
-  renderDiscDropdowns(); renderActiveChips();
+}
+function updateSrcChips(){
+  const s=document.getElementById("discSrc"); if(!s)return;
+  s.querySelectorAll("[data-src]").forEach(el=>el.classList.toggle("on", el.getAttribute("data-src")===discSource));
+}
+// 原地切换分类选中（不重建 DOM）
+function updateCatActive(){
+  const cats=document.getElementById("discCats"); if(!cats)return;
+  cats.querySelectorAll("[data-cat]").forEach(el=>el.classList.toggle("on", el.getAttribute("data-cat")===discCat));
+}
+// 豆瓣源：年代/时长不可用 -> 禁用并提示
+function applyDoubanFilterUi(){
+  const dis=_doubanNoYearRuntime();
+  ["discYearSel","discRuntimeSel"].forEach(id=>{const el=document.getElementById(id);if(!el)return;el.disabled=dis;el.title=dis?"豆瓣源不支持该筛选":"";});
+  const hint=document.getElementById("discDbHint"); if(hint) hint.style.display=dis?"":"none";
+}
+// 全量重建（仅切到发现页 / kind / source 变化时调用）
+function renderDiscChips(){
+  renderDiscCats(); renderDiscTypes(); updateSrcChips(); renderDiscDropdowns(); renderActiveChips();
 }
 function renderDiscDropdowns(){
   // 类型（多选，details + checkboxes）
@@ -3626,15 +3728,7 @@ function renderDiscDropdowns(){
       const on=discGenres.includes(g[0]);
       return '<label'+(on?' class="on"':'')+'><input type="checkbox" value="'+g[0]+'"'+(on?' checked':'')+'>'+g[1]+'</label>';
     }).join("");
-    gb.querySelectorAll('input[type="checkbox"]').forEach(cb=>{
-      cb.onchange=()=>{
-        const v=cb.value;
-        discGenres=cb.checked?discGenres.concat(v):discGenres.filter(x=>x!==v);
-        cb.parentElement.classList.toggle("on",cb.checked);
-        updateGenreSummary();
-        discPage=1; renderActiveChips(); loadDiscover();
-      };
-    });
+    // 勾选事件走事件委托（见 bindDiscEvents），这里不逐个绑定
     updateGenreSummary();
   }
   // 5 个单选下拉：年代/国别/评分/时长/排序
@@ -3645,6 +3739,18 @@ function renderDiscDropdowns(){
   _fillSel("discSortSel", SORTS, discSort, "排序", false);
   const rt=document.getElementById("discRuntimeSel");
   if(rt) rt.style.display=(discKind==="tv")?"none":"";
+  applyDoubanFilterUi();
+}
+// 把 state 回写到控件（清空筛选/切源后用）
+function syncDiscControls(){
+  const gb=document.getElementById("discGenreBody");
+  if(gb) gb.querySelectorAll('input[type="checkbox"]').forEach(cb=>{const on=discGenres.includes(cb.value);cb.checked=on;cb.parentElement.classList.toggle("on",on);});
+  updateGenreSummary();
+  const set=(id,v)=>{const el=document.getElementById(id);if(el)el.value=v||"";};
+  set("discYearSel",discYear); set("discCountrySel",discCountry);
+  set("discRatingSel",discRating); set("discRuntimeSel",discRuntime);
+  set("discSortSel",discSort||"pop");
+  updateCatActive();
 }
 function _fillSel(id, list, currentVal, ph, allowAll){
   const el=document.getElementById(id);
@@ -3663,12 +3769,78 @@ function updateGenreSummary(){
   const n=discGenres.length;
   sum.textContent=n?("类型 ("+n+") ▼"):("类型 ▼");
 }
-function bindDiscDropdowns(){
-  const ys=document.getElementById("discYearSel"); if(ys) ys.onchange=e=>{discYear=e.target.value;discPage=1;renderActiveChips();loadDiscover();};
-  const cs=document.getElementById("discCountrySel"); if(cs) cs.onchange=e=>{discCountry=e.target.value;discPage=1;renderActiveChips();loadDiscover();};
-  const rs=document.getElementById("discRatingSel"); if(rs) rs.onchange=e=>{discRating=e.target.value;discPage=1;renderActiveChips();loadDiscover();};
-  const ts=document.getElementById("discRuntimeSel"); if(ts) ts.onchange=e=>{discRuntime=e.target.value;discPage=1;renderActiveChips();loadDiscover();};
-  const ss=document.getElementById("discSortSel"); if(ss) ss.onchange=e=>{discSort=e.target.value;discPage=1;renderActiveChips();loadDiscover();};
+function discAddClick(b){
+  const card=b.closest('.card');
+  const nm=card?card.getAttribute('data-name'):null;
+  const sm=document.getElementById("seasonMode");
+  if(nm){
+    b.disabled=true;b.textContent="添加中…";
+    jpost("/api/discover/add",{kind:(card.getAttribute('data-detail')||"").split(':')[0],name:nm,seasonMode:sm?sm.value:"all"}).then(res=>handleAddResult(res,b)).catch(e=>{b.disabled=false;b.textContent="添加下载";toast("❌ "+e,"err");});
+    return;
+  }
+  const p=(b.getAttribute('data-add')||"").split(':');
+  b.disabled=true;b.textContent="添加中…";
+  jpost("/api/discover/add",{kind:p[0],tmdbId:Number(p[1]),seasonMode:sm?sm.value:"all"}).then(res=>handleAddResult(res,b)).catch(e=>{b.disabled=false;b.textContent="添加下载";toast("❌ "+e,"err");});
+}
+function discCardClick(card){
+  const nm=card.getAttribute('data-name');
+  const detail=card.getAttribute('data-detail')||"";
+  if(nm){
+    const kind=detail.split(':')[0];
+    jget("/api/douban/resolve?kind="+encodeURIComponent(kind)+"&title="+encodeURIComponent(nm)).then(r=>{
+      if(r&&r.tmdbId){ openDetail(kind, r.tmdbId); } else { toast("未在 TMDB 匹配到「"+nm+"」","err"); }
+    }).catch(e=>toast("❌ "+e,"err"));
+    return;
+  }
+  const p=detail.split(':'); if(p[0]) openDetail(p[0],p[1]);
+}
+// 发现页事件统一委托：一次性绑定，杜绝“每次交互重建+重绑”造成的卡顿
+function bindDiscEvents(){
+  const panel=document.getElementById("p-discover");
+  if(panel && !panel.__discBound){
+    panel.__discBound=true;
+    panel.addEventListener("change",e=>{
+      const t=e.target;
+      if(t.matches('#discGenreBody input[type="checkbox"]')){
+        const v=t.value;
+        discGenres=t.checked?discGenres.concat(v):discGenres.filter(x=>x!==v);
+        t.parentElement.classList.toggle("on",t.checked);
+        updateGenreSummary(); discPage=1; renderActiveChips(); loadDiscover(); return;
+      }
+      const map={discYearSel:1,discCountrySel:1,discRatingSel:1,discRuntimeSel:1,discSortSel:1};
+      if(!map[t.id])return;
+      if(t.id==="discYearSel")discYear=t.value; else if(t.id==="discCountrySel")discCountry=t.value;
+      else if(t.id==="discRatingSel")discRating=t.value; else if(t.id==="discRuntimeSel")discRuntime=t.value;
+      else if(t.id==="discSortSel")discSort=t.value;
+      discPage=1; renderActiveChips(); loadDiscover();
+    });
+    panel.addEventListener("click",e=>{
+      const cat=e.target.closest("[data-cat]");
+      if(cat){ discCat=cat.getAttribute("data-cat"); discPage=1; updateCatActive(); loadDiscover(); return; }
+      const kind=e.target.closest("[data-kind]");
+      if(kind){ discKind=kind.getAttribute("data-kind"); discGenres=[]; discPage=1; renderDiscTypes(); renderDiscCats(); renderDiscDropdowns(); renderActiveChips(); loadDiscover(); return; }
+      const src=e.target.closest("[data-src]");
+      if(src){ const ns=src.getAttribute("data-src");
+        if(ns!==discSource){ discSource=ns; discGenres=[];
+          if(ns==="douban"){discYear="";discRuntime="";discSort="pop";}
+          discCat=ns==="douban"?(discKind==="tv"?"tv_pop":"popular"):"popular";
+          discPage=1; updateSrcChips(); renderDiscCats(); renderDiscDropdowns(); renderActiveChips(); loadDiscover(); }
+        return; }
+      const x=e.target.closest(".xchip[data-k]");
+      if(x){ const k=x.getAttribute("data-k");
+        if(k==="g")discGenres=[];else if(k==="c")discCountry="";else if(k==="y")discYear="";
+        else if(k==="r")discRating="";else if(k==="t")discRuntime="";else if(k==="s")discSort="pop";
+        discPage=1; syncDiscControls(); renderActiveChips(); loadDiscover(); return; }
+      if(e.target.closest("#clearAll")){ discGenres=[];discCountry="";discYear="";discRating="";discRuntime="";discSort="pop";
+        discPage=1; syncDiscControls(); renderActiveChips(); loadDiscover(); return; }
+      const moreBtn=e.target.closest("#discMore button");
+      if(moreBtn){ discPage++; loadDiscover(true); return; }
+      const addBtn=e.target.closest("button[data-add]");
+      if(addBtn){ discAddClick(addBtn); return; }
+      const card=e.target.closest(".card[data-detail]");
+      if(card){ discCardClick(card); return; }
+    });
+  }
   // 点击外部关闭类型 dropdown
   document.addEventListener("click",e=>{
     const dd=document.getElementById("discGenreDD");
@@ -3676,8 +3848,14 @@ function bindDiscDropdowns(){
     if(dd.contains(e.target))return;
     dd.removeAttribute("open");
   });
+  // Esc 关闭类型 dropdown
+  document.addEventListener("keydown",e=>{
+    if(e.key!=="Escape")return;
+    const dd=document.getElementById("discGenreDD");
+    if(dd&&dd.hasAttribute("open"))dd.removeAttribute("open");
+  });
 }
-bindDiscDropdowns();
+bindDiscEvents();
 function renderActiveChips(){
   const box=document.getElementById("discActive");
   const parts=[];
@@ -3688,9 +3866,8 @@ function renderActiveChips(){
   if(discRuntime) parts.push(["时长",_label(RUNTIMES,discRuntime),"t",discRuntime]);
   if(discSort&&discSort!=="pop") parts.push(["排序",_label(SORTS,discSort),"s",discSort]);
   if(!parts.length){box.innerHTML="";return;}
+  // 点击 xchip / clearAll 走事件委托（见 bindDiscEvents），这里不逐个绑定
   box.innerHTML=parts.map(p=>'<span class="chip xchip" data-k="'+p[2]+'" data-v="'+p[3]+'"><b>'+p[0]+'：'+p[1]+'</b> <span class="x">✕</span></span>').join("")+'<span class="chip xchip clear" id="clearAll">✕ 清空全部</span>';
-  box.querySelectorAll(".xchip[data-k]").forEach(el=>el.onclick=()=>{const k=el.getAttribute("data-k");if(k==="g")discGenres=[];else if(k==="c")discCountry="";else if(k==="y")discYear="";else if(k==="r")discRating="";else if(k==="t")discRuntime="";else if(k==="s")discSort="pop";discPage=1;renderDiscChips();renderActiveChips();loadDiscover();});
-  const clr=document.getElementById("clearAll"); if(clr)clr.onclick=()=>{discGenres=[];discCountry="";discYear="";discRating="";discRuntime="";discSort="pop";discPage=1;renderDiscChips();renderActiveChips();loadDiscover();};
 }
 
 function loadDiscover(append, refresh){
@@ -3710,17 +3887,21 @@ function loadDiscover(append, refresh){
   if(runtime){const tn=_label(RUNTIMES,runtime);if(tn)fparts.push(tn);}
   if(discSort&&discSort!=="pop"){const sn=_label(SORTS,discSort);if(sn)fparts.push("排序="+sn);}
   if(!append){discPage=1;if(g)g.innerHTML="";}
-  st.textContent=append?"正在加载更多…":"正在从 TMDB 拉取…";
+  st.textContent=append?"正在加载更多…":(discSource==="douban"?"正在从豆瓣拉取…":"正在从 TMDB 拉取…");
   st.className="muted";
-  const qs="/api/discover?kind="+discKind+"&cat="+discCat+"&page="+discPage
-    +(genre?"&genre="+encodeURIComponent(genre):"")
+  const useDouban=(discSource==="douban");
+  const flt=(genre?"&genre="+encodeURIComponent(genre):"")
     +(country?"&country="+encodeURIComponent(country):"")
     +(decade?"&decade="+encodeURIComponent(decade):"")
     +(rating?"&rating="+encodeURIComponent(rating):"")
     +(runtime?"&runtime="+encodeURIComponent(runtime):"")
-    +(discSort?"&sort="+encodeURIComponent(discSort):"")
-    +(refresh?"&refresh=1":"");
+    +(discSort?"&sort="+encodeURIComponent(discSort):"");
+  const qs=useDouban
+    ? ("/api/douban?kind="+discKind+"&cat="+discCat+"&page="+discPage+flt)
+    : ("/api/discover?kind="+discKind+"&cat="+discCat+"&page="+discPage+flt+(refresh?"&refresh=1":""));
+  const my=++discReqToken;
   jget(qs).then(d=>{
+    if(my!==discReqToken)return; // 过期响应丢弃，防快速切筛选时旧结果覆盖新结果
     if(d.configured===false){
       st.className="err";
       st.innerHTML='⚠️ 未配置 TMDB_API_KEY。请在「配置」页的 <code>TMDB API Key</code> 一栏填写'
@@ -3731,37 +3912,30 @@ function loadDiscover(append, refresh){
     const items=d.items||[];
     discPage=d.page||discPage;
     discTotal=d.totalPages||1;
-    if(!items.length){if(!append)st.textContent="暂无内容";if(g)g.innerHTML="";if(more)more.innerHTML="";return;}
+    if(!items.length){if(!append){st.textContent="暂无内容";if(g)g.innerHTML="";}if(more)more.innerHTML="";return;}
     const loaded=(append?(g?g.querySelectorAll(".card").length:0):0)+items.length;
     st.textContent="已加载 "+loaded+" 个"+(d.totalResults?(" · 共 "+d.totalResults+" 个"):"")+(fparts.length?(" · "+fparts.join(" · ")):"")+" · 点「添加下载」即加入队列";
-    if(!append&&g)g.innerHTML="";
+    // 卡片批量构建 + 一次性 append（DocumentFragment）；事件由面板委托统一处理
+    const frag=document.createDocumentFragment();
     items.forEach(it=>{
       const r=Math.round(it.rating||0);
-      const sub=(it.year||"")+(r?' · ★ '+r:"");
+      const sub=(it.year||"")+(r?' · ★ '+r:"")+(it.source==="douban"?' · 🟢豆瓣':"");
       const ch=buildCard({poster:it.poster,title:it.title,kind:it.kind,sub:sub,
-        acts:'<button class="btn" data-add="'+escAttr(it.kind+":"+it.tmdbId)+'">添加下载</button>'});
+        acts:'<button class="btn" data-add="'+escAttr(it.kind+":"+(it.tmdbId||""))+'">添加下载</button>'});
       const wrap=document.createElement("div");wrap.innerHTML=ch;
       const card=wrap.firstElementChild;
       card.style.cursor="pointer";
-      card.setAttribute("data-detail",it.kind+":"+it.tmdbId);
-      g.appendChild(card);
+      card.setAttribute("data-detail",it.kind+":"+(it.tmdbId||""));
+      if(it.source==="douban") card.setAttribute("data-name",it.title||"");
+      frag.appendChild(card);
     });
-    g.querySelectorAll('[data-detail]').forEach(c=>{
-      c.onclick=(e)=>{ if(e.target.closest('button'))return; const p=c.getAttribute('data-detail').split(':'); openDetail(p[0],p[1]); };
-    });
-    g.querySelectorAll('button[data-add]').forEach(b=>{
-      b.onclick=(e)=>{ e.stopPropagation(); const p=b.getAttribute('data-add').split(':');
-        b.disabled=true;b.textContent="添加中…";
-        jpost("/api/discover/add",{kind:p[0],tmdbId:Number(p[1]),seasonMode:document.getElementById("seasonMode").value}).then(res=>handleAddResult(res,b)).catch(e=>{b.disabled=false;b.textContent="添加下载";toast("❌ "+e,"err");});
-      };
-    });
+    if(g)g.appendChild(frag);
     if(more){
       more.innerHTML="";
       if(discPage<discTotal){
         const mb=document.createElement("button");
         mb.className="btn";mb.textContent="加载更多";
         mb.style.width="100%";mb.style.margin="14px 0";
-        mb.onclick=()=>{discPage++;loadDiscover(true);};
         more.appendChild(mb);
       }else if(discTotal>1){
         const tip=document.createElement("div");
@@ -3770,7 +3944,7 @@ function loadDiscover(append, refresh){
         more.appendChild(tip);
       }
     }
-  }).catch(e=>{st.className="err";st.textContent="❌ 请求失败: "+e;if(more)more.innerHTML="";});
+  }).catch(e=>{if(my!==discReqToken)return;st.className="err";st.textContent="❌ 请求失败: "+e;if(more)more.innerHTML="";});
 }
 
 function openDetail(kind,tmdbId){
@@ -3802,7 +3976,10 @@ function openDetail(kind,tmdbId){
       +tag
       +'</div>'
       +ov
-      +'<div class="detail-acts"><button class="btn" id="detailAdd">添加下载</button></div>';
+      +(d.cast&&d.cast.length?('<div class="detail-section"><div class="detail-h">🎭 演职表</div><div class="cast-row">'+d.cast.map(c=>'<div class="cast"><img src="'+(c.profile||"")+'" onerror="this.style.visibility=\'hidden\'"/><span>'+esc(c.name||"")+'</span><span class="muted">'+esc(c.character||"")+'</span></div>').join("")+'</div></div>'):"")
+      +(d.similar&&d.similar.length?('<div class="detail-section"><div class="detail-h">🔗 相似推荐</div><div class="grid sm">'+d.similar.map(ss=>'<div class="card sm" data-sim="'+escAttr((ss.kind||"movie")+":"+ss.tmdbId)+'"><img src="'+(ss.poster||"")+'" onerror="this.style.visibility=\'hidden\'"/><div class="meta"><div class="t">'+esc(ss.title||"")+'</div><div class="s">'+(ss.year||"")+(ss.rating?(" · ★ "+Math.round(ss.rating)):"")+'</div></div></div>').join("")+'</div></div>'):"")
+      +'<div class="detail-acts"><button class="btn" id="detailAdd">添加下载</button>'
+      +'<button class="btn ghost" id="detailSub">下载字幕</button></div>';
     const ab=document.getElementById("detailAdd");
     ab.onclick=()=>{
       ab.disabled=true;ab.textContent="添加中…";
@@ -3811,6 +3988,32 @@ function openDetail(kind,tmdbId){
         handleAddResult(res,ab);
       }).catch(e=>{ab.disabled=false;ab.textContent="添加下载";toast("❌ "+e,"err");});
     };
+    const subBtn=document.getElementById("detailSub");
+    if(subBtn){
+      subBtn.onclick=()=>{
+        subBtn.disabled=true;subBtn.textContent="搜索字幕…";
+        const q=encodeURIComponent(d.title||"");
+        jget("/api/subtitle?kind="+kind+"&tmdbId="+encodeURIComponent(tmdbId)+"&name="+q).then(r=>{
+          subBtn.disabled=false;subBtn.textContent="下载字幕";
+          if(!r||!r.ok){toast("字幕："+(r&&r.error||"无结果"),"err");return;}
+          const box=document.createElement("div");
+          box.className="detail-section";
+          box.innerHTML='<div class="detail-h">💬 字幕候选</div>';
+          (r.items||[]).slice(0,15).forEach(it=>{
+            const b=document.createElement("button");
+            b.className="btn ghost";b.style.margin="4px";
+            b.textContent=(it.lang||"?")+" · "+(it.source||"")+" · "+((it.title||"").slice(0,40));
+            b.onclick=()=>{window.location="/api/subtitle/download?url="+encodeURIComponent(it.url)+"&source="+encodeURIComponent(it.source)+"&name="+encodeURIComponent(it.title||"subtitle");};
+            box.appendChild(b);
+          });
+          (r.warns||[]).forEach(w=>{const wd=document.createElement("div");wd.className="muted";wd.style.margin="6px 0";wd.textContent="⚠️ "+w;box.appendChild(wd);});
+          body.appendChild(box);
+        }).catch(e=>{subBtn.disabled=false;subBtn.textContent="下载字幕";toast("❌ "+e,"err");});
+      };
+    }
+    body.querySelectorAll('[data-sim]').forEach(el=>{
+      el.onclick=()=>{ const p=el.getAttribute('data-sim').split(':'); closeDetail(); openDetail(p[0],p[1]); };
+    });
   }).catch(e=>{body.innerHTML='<div class="err" style="padding:24px">❌ 请求失败: '+esc(""+e)+'</div>';});
 }
 function closeDetail(){
@@ -4660,6 +4863,81 @@ class H(BaseHTTPRequestHandler):
                         self._send(400, {"error": "缺少 start/end (YYYY-MM-DD)"})
                     else:
                         self._send(200, {"events": calendar_events(cs, ce)})
+                elif base == "/api/douban":
+                    dkind = (_qs.get("kind") or ["movie"])[0]
+                    dcat = (_qs.get("cat") or ["popular"])[0]
+                    dpage = (_qs.get("page") or ["1"])[0]
+                    dgenre = (_qs.get("genre") or [""])[0]
+                    dcountry = (_qs.get("country") or [""])[0]
+                    drating = (_qs.get("rating") or [""])[0]
+                    dsort = (_qs.get("sort") or [""])[0]
+                    if not DOUBAN_ENABLED or not _dh:
+                        self._send(200, {"ok": False, "configured": True, "source": "douban",
+                                         "error": "豆瓣数据源未启用（DOUBAN_ENABLED=0 或未加载模块）"}); return
+                    try:
+                        res = _dh.get_douban(dkind, dcat, dpage,
+                                             genre=(dgenre or None), country=(dcountry or None),
+                                             rating=(drating or None), sort=(dsort or None))
+                    except Exception as e:
+                        self._send(200, {"ok": False, "configured": True, "source": "douban",
+                                         "error": str(e)}); return
+                    self._send(200, res); return
+                elif base == "/api/subtitle":
+                    skind = (_qs.get("kind") or ["movie"])[0]
+                    stid = (_qs.get("tmdbId") or [""])[0]
+                    sname = (_qs.get("name") or [""])[0]
+                    sseason = (_qs.get("season") or [""])[0]
+                    sepisode = (_qs.get("episode") or [""])[0]
+                    if not SUBTITLE_ENABLED or not _sh:
+                        self._send(200, {"ok": False, "configured": True, "source": "subtitle",
+                                         "error": "字幕数据源未启用（SUBTITLE_ENABLED=0 或未加载模块）"}); return
+                    try:
+                        res = _sh.search_subtitles(name=(sname or ""), tmdbId=(stid or None),
+                                                  season=(sseason or None), episode=(sepisode or None), lang="zh")
+                    except Exception as e:
+                        self._send(200, {"ok": False, "error": str(e)}); return
+                    self._send(200, res); return
+                elif base == "/api/subtitle/download":
+                    surl = (_qs.get("url") or [""])[0]
+                    ssrc = (_qs.get("source") or [""])[0]
+                    reqname = (_qs.get("name") or [""])[0]
+                    if not SUBTITLE_ENABLED or not _sh:
+                        self._send(200, {"ok": False, "error": "字幕模块未加载"}); return
+                    from urllib.parse import urlparse as _up
+                    _host = (_up(surl).netloc or "").lower()
+                    if not any(h in _host for h in ("opensubtitles.org", "subtitlecat.com")):
+                        self._send(200, {"ok": False, "error": "非字幕站域名已拒绝: " + _host}); return
+                    try:
+                        data, fname, ctype, err = _sh.download_subtitle(surl, ssrc)
+                    except Exception as e:
+                        self._send(200, {"ok": False, "error": str(e)}); return
+                    if err or not data:
+                        self._send(200, {"ok": False, "error": err or "下载为空"}); return
+                    try:
+                        # 文件名：优先用字幕站返回的真实文件名（多为 ASCII），其次请求名，最后回退
+                        disp_name = (fname or reqname or "subtitle.srt").replace('"', "_").replace("/", "_")[:80]
+                        import re as _re
+                        # HTTP 头仅允许 latin-1：非 ASCII 走 RFC5987，ASCII 直用，避免 send_header 编码异常
+                        ascii_name = _re.sub(r'[^\x20-\x7e]', '_', disp_name)
+                        if ascii_name != disp_name:
+                            from urllib.parse import quote as _q
+                            disp = 'attachment; filename="%s"; filename*=UTF-8\'\'%s' % (ascii_name, _q(disp_name))
+                        else:
+                            disp = 'attachment; filename="%s"' % ascii_name
+                        self.send_response(200)
+                        self.send_header("Content-Type", ctype or "application/octet-stream")
+                        self.send_header("Content-Disposition", disp)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                    except Exception as e:
+                        self._send(200, {"ok": False, "error": "回写失败: " + str(e)}); return
+                    return
+                elif base == "/api/douban/resolve":
+                    dkind = (_qs.get("kind") or ["movie"])[0]
+                    dtitle = (_qs.get("title") or [""])[0]
+                    tid = _resolve_tmdb_by_title(dkind, dtitle)
+                    self._send(200, {"tmdbId": tid}); return
                 elif base == "/api/discover":
                     dkind = (_qs.get("kind") or ["movie"])[0]
                     dcat = (_qs.get("cat") or ["popular"])[0]

@@ -102,7 +102,7 @@ cd /opt/media && docker compose up -d --build autopilot
 | 页签 | 功能 |
 |---|---|
 | 搜索（顶部） | 输入片名搜候选（电影走 Radarr lookup、剧集走 Sonarr lookup），选画质档位后一键添加；支持一次贴多行批量添加、`仅预览` 试跑 |
-| 🎯 发现 | TMDB 发现墙：热门 / 热映 / 即将上映 / 高分，可按 类型、国别、年代、最低评分、最长时长 筛选并排序，点开详情页看简介与海报，直接加入下载 |
+| 🎯 发现 | 发现墙数据源可切换：**TMDB**（热门 / 热映 / 即将上映 / 高分，支持类型、国别、年代、最低评分、时长筛选排序）与 **豆瓣**（热门 / 豆瓣高分 / 最新 / 华语 + 热门剧集 / 高分剧集）。点开详情页看简介、海报、**演职表与相似推荐**，直接加入下载。豆瓣卡片经 TMDB 按片名解析后复用同一套 Radarr/Sonarr 下载链 |
 | ⬇️ 下载队列 | 队列进度、速度、ETA，可取消；支持 电影 / 剧集 / 全部 三种视图 |
 | 🎞️ 媒体库 | 海报墙；按 全部 / 已下载 / 下载中 / 待源 / 未监控 过滤；可重新搜索或移除条目 |
 | 📅 日历 | 电影上映与剧集播出日历（Radarr `releaseDate` + Sonarr `airDate` 合并按日排序） |
@@ -177,7 +177,9 @@ Radarr / Sonarr / Prowlarr / QBittorrent 都是 linuxserver 镜像，以 `PUID` 
 | `QB_SAVE_PATH` | `/data/downloads` | qB 下载目录（容器内路径） |
 | `MOVIE_ROOT` / `TV_ROOT` | `/data/movies` / `/data/tv` | 电影 / 剧集库根目录（容器内路径） |
 | `QBITTORRENT_USER` / `QBITTORRENT_PASS` | `admin` / `MediaFn2026` | 探测 qB 用的账号，须与 compose 里 qB 的 `WEBUI_PASSWORD` 一致 |
-| `TMDB_API_KEY` | 空 | 发现墙 / 海报 / 简介数据源，[免费申请](https://www.themoviedb.org/settings/api) |
+| `TMDB_API_KEY` | 空 | 发现墙 / 海报 / 简介数据源，[免费申请](https://www.themoviedb.org/settings/api)；豆瓣卡片添加 / 详情也依赖它按片名解析 TMDB id |
+| `DOUBAN_ENABLED` | `1` | 发现墙「豆瓣」数据源开关；置 `0`/`false`/`no` 关闭 |
+| `DOUBAN_PROXY` | 空（回退 `PROXY_URL`） | 豆瓣请求专用代理：`direct`/`none`/`0` 走容器直连（豆瓣为国内服务，直连通常更快），留空则与全局代理一致 |
 | `RADARR_URL` / `SONARR_URL` | `http://media-radarr:7878` 等 | 容器内互访地址，一般不用改 |
 | `RADARR_API_KEY` / `SONARR_API_KEY` | 空 | 留空时自动从各容器挂进来的 `config.xml` 读取 |
 
@@ -206,8 +208,10 @@ Radarr / Sonarr / Prowlarr / QBittorrent 都是 linuxserver 镜像，以 `PUID` 
 | GET | `/api/profiles?kind=` | 画质档位 |
 | GET | `/api/rootfolders?kind=` | 根目录列表 |
 | GET | `/api/discover?kind&cat&page&genre&country&decade&rating&runtime&sort&refresh` | 发现墙数据（TMDB，带缓存） |
-| POST | `/api/discover/add` | 从发现墙加入下载 |
-| GET | `/api/detail?kind&tmdbId&refresh` | 影片 / 剧集详情 |
+| GET | `/api/douban?kind&cat&page` | 发现墙数据（豆瓣：热门 / 高分 / 最新 / 华语 + 剧集分类） |
+| POST | `/api/discover/add` | 从发现墙加入下载（支持 `tmdbId` 或 `name` 按片名经 TMDB 解析） |
+| GET | `/api/douban/resolve?kind&title` | 豆瓣卡片标题 → TMDB id（详情 / 添加前置解析） |
+| GET | `/api/detail?kind&tmdbId&refresh` | 影片 / 剧集详情（含 `cast` 演职表、`similar` 相似推荐） |
 | GET | `/api/calendar?start&end` | 上映与播出日历（`YYYY-MM-DD`） |
 | GET | `/api/system` | 系统状态（磁盘 / 版本 / 服务） |
 | GET | `/api/history?kind&limit&offset` | 抓取历史 |

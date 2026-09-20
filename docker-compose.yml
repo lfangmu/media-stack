@@ -57,6 +57,8 @@ services:
       - .:/opt/media:ro
       - ${DATA_DIR:-./data}:/data
       - ./autopilot/app.py:/app/app.py:ro
+      - ./autopilot/douban_helper.py:/app/douban_helper.py:ro
+      - ./autopilot/subtitle_helper.py:/app/subtitle_helper.py:ro
       - /var/run/docker.sock:/var/run/docker.sock:rw
       - /usr/bin/docker:/usr/bin/docker:ro
       - ./radarr-config:/radarr-config:ro
