@@ -37,6 +37,7 @@ import re
 import json
 import socket
 import time
+import hashlib
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
@@ -537,6 +538,98 @@ def tmdb_get(path, params=None):
     if TMDB_PROXY:
         return None, "TMDB 经代理请求失败（已重试 3 次）：节点可能抖动或代理不可达。可稍后刷新重试，或在出网配置把 GLOBAL 钉到稳定节点。"
     return None, "TMDB 直连失败（当前未配置代理）：请在「出网配置」填写境外 HTTP 代理并保存，再刷新本页。"
+
+
+# ---------- 图片代理（/api/img）：域名白名单 + 落盘缓存 ----------
+IMG_ALLOW_HOSTS = ("image.tmdb.org", "doubanio.com")
+# DATA_DIR 是宿主路径（compose 拿它当 volume 源），容器内对应挂载点是 /data；
+# 直接用 os.path.join(DATA_DIR,"imgcache") 会把缓存写进容器可写层（宿主看不到、重建即丢）。
+IMG_CACHE_DIR = os.environ.get("IMG_CACHE_DIR") or (
+    "/data/imgcache" if os.path.isdir("/data") else os.path.join(DATA_DIR, "imgcache"))
+IMG_MAX_BYTES = 8 * 1024 * 1024
+_IMG_CTYPE = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+              ".webp": "image/webp", ".gif": "image/gif"}
+
+
+def img_allowed(url):
+    try:
+        u = urlparse(url)
+    except Exception:
+        return False
+    if u.scheme not in ("http", "https"):
+        return False
+    host = (u.hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in IMG_ALLOW_HOSTS)
+
+
+def _img_cache_path(url):
+    ext = os.path.splitext(urlparse(url).path)[1].lower()
+    if ext not in _IMG_CTYPE:
+        ext = ".img"
+    return os.path.join(IMG_CACHE_DIR, hashlib.sha1(url.encode("utf-8")).hexdigest() + ext)
+
+
+def _sniff_img_ctype(data, fallback="image/jpeg"):
+    """按魔术字节判定图片类型——CDN 会按 Accept 头返回 webp，而 URL 后缀仍是 .jpg，
+    若只按后缀声明 Content-Type 就会「内容 webp / 声明 jpeg」，故以字节为准。"""
+    if not data:
+        return fallback
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return fallback
+
+
+def img_fetch(url):
+    """返回 (data, content_type, err)。命中缓存直接回；未命中经代理抓取并落盘。"""
+    fp = _img_cache_path(url)
+    try:
+        if os.path.isfile(fp) and os.path.getsize(fp) > 0:
+            with open(fp, "rb") as f:
+                data = f.read()
+            return (data, _sniff_img_ctype(data), None)
+    except Exception:
+        pass
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    if "doubanio.com" in url:
+        headers["Referer"] = "https://movie.douban.com/"
+    last_err = ""
+    for attempt in range(1, 3):
+        try:
+            handlers = []
+            if PROXY_URL:
+                handlers.append(_ureq.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL}))
+            opener = _ureq.build_opener(*handlers)
+            with opener.open(_ureq.Request(url, headers=headers), timeout=20) as r:
+                data = r.read(IMG_MAX_BYTES + 1)
+                ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip()
+            if not data:
+                return None, None, "图片为空"
+            if len(data) > IMG_MAX_BYTES:
+                return None, None, "图片超过 8MB 上限"
+            ctype = _sniff_img_ctype(
+                data, ctype or _IMG_CTYPE.get(os.path.splitext(urlparse(url).path)[1].lower(), "image/jpeg"))
+            try:
+                os.makedirs(IMG_CACHE_DIR, exist_ok=True)
+                with open(fp, "wb") as f:
+                    f.write(data)
+            except Exception:
+                pass
+            return data, ctype, None
+        except Exception as e:
+            last_err = _friendly_net_err(str(e))
+            if attempt < 2:
+                time.sleep(0.5)
+    return None, None, last_err
 
 
 def _build_tmdb_query(kind, cat, page, genre=None, country=None,
@@ -3459,8 +3552,10 @@ PAGE = r"""<!doctype html>
       <select id="discRatingSel" class="filter-sel"></select>
       <select id="discRuntimeSel" class="filter-sel" style="display:none"></select>
       <select id="discSortSel" class="filter-sel"></select>
+      <button class="btn ghost" id="discApply" disabled onclick="applyDiscFilters()">应用筛选</button>
     </div>
     <div id="discDbHint" class="muted" style="display:none;font-size:12px;margin:-4px 0 8px">ℹ️ 豆瓣源不支持「年代/时长」筛选，其余筛选项均可用</div>
+    <div id="discDirtyTip" class="muted" style="display:none;font-size:12px;margin:-4px 0 8px">✏️ 筛选已修改，点「应用筛选」后生效</div>
     <div class="row" style="align-items:center">
       <span id="discStatus" class="muted"></span>
       <span style="flex:1"></span>
@@ -3608,7 +3703,9 @@ function jpost(u,b){return fetch(u,{method:"POST",headers:Object.assign({"Conten
 function toast(t,cls){const e=document.getElementById("toast");e.textContent=t;e.className="toast show"+(cls?" "+cls:"");setTimeout(()=>e.className="toast",2200)}
 function setStatus(t,cls){const s=document.getElementById("status");s.className=cls||"";s.textContent=t||""}
 function posterFail(img){try{var d=document.createElement("div");d.className="poster-fallback";d.textContent="🎞";img.parentNode.replaceChild(d,img);}catch(e){}}
-function posterHTML(p,title){if(p)return '<div class="poster"><img src="'+p+'" loading="lazy" onerror="posterFail(this)"></div>';return '<div class="poster poster-fallback">🎞</div>';}
+// 图片统一走后端代理：/api/img 带白名单 + 落盘缓存，避免直连 CDN 抖动/被墙
+function imgSrc(u){if(!u)return "";if(u.indexOf("data:")===0||u.indexOf("/api/img")===0)return u;return "/api/img?url="+encodeURIComponent(u)+(TOKEN?("&token="+encodeURIComponent(TOKEN)):"");}
+function posterHTML(p,title){if(p)return '<div class="poster"><img src="'+imgSrc(p)+'" loading="lazy" onerror="posterFail(this)"></div>';return '<div class="poster poster-fallback">🎞</div>';}
 // 统一卡片构造器：搜索下载 / 发现 / 媒体库 / 剧集库 全部复用，保证视觉一致
 // o: {poster, title, kind("movie"|"tv"|null), sub(已转义HTML串), extra(额外行HTML), badges([HTML]), acts(按钮HTML)}
 function kindBadge(kind){return kind==="tv"?"📺 ":((kind==="movie")?"🎬 ":"");}
@@ -3657,7 +3754,7 @@ function switchTo(p){
   if(p==="history")loadHistory();
   if(p==="indexers")loadIndexers();
   if(p==="calendar")loadCalendar();
-  if(p==="discover"){ renderDiscChips(); loadDiscover(); }
+  if(p==="discover"){ renderDiscChips(); clearDiscDirty(); loadDiscover(); }
   if(p==="config")apLoadConfig();
 }
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
@@ -3718,6 +3815,7 @@ function applyDoubanFilterUi(){
 // 全量重建（仅切到发现页 / kind / source 变化时调用）
 function renderDiscChips(){
   renderDiscCats(); renderDiscTypes(); updateSrcChips(); renderDiscDropdowns(); renderActiveChips();
+  updateApplyBtn();
 }
 function renderDiscDropdowns(){
   // 类型（多选，details + checkboxes）
@@ -3756,7 +3854,8 @@ function _fillSel(id, list, currentVal, ph, allowAll){
   const el=document.getElementById(id);
   if(!el)return;
   let opts=[];
-  if(allowAll){
+  // 列表自身首项已是空值（「全部」）时不再插 placeholder，否则会出现两个空选项
+  if(allowAll && !list.some(x=>!x[0])){
     opts.push('<option value="">'+escAttr(ph||"全部")+'</option>');
   }
   opts=opts.concat(list.map(x=>'<option value="'+escAttr(x[0])+'">'+escAttr(x[1])+'</option>'));
@@ -3794,6 +3893,31 @@ function discCardClick(card){
   }
   const p=detail.split(':'); if(p[0]) openDetail(p[0],p[1]);
 }
+// —— 筛选草稿态：改条件只动本地，点「应用筛选」才发一次请求（杜绝勾一次发一次）——
+let discDirty=false, discApplied="";
+// 指纹：草稿与「已应用」一致时不算脏（选回空值不应亮起「应用」）
+function discFingerprint(){
+  return [discGenres.slice().sort().join(","),discCountry,discYear,discRating,discRuntime,discSort].join("|");
+}
+function discActiveCount(){
+  return discGenres.length+(discCountry?1:0)+(discYear?1:0)+(discRating?1:0)
+    +(discRuntime?1:0)+((discSort&&discSort!=="pop")?1:0);
+}
+function updateApplyBtn(){
+  const b=document.getElementById("discApply"); if(!b)return;
+  const n=discActiveCount();
+  b.disabled=!discDirty;
+  b.className="btn"+(discDirty?"":" ghost");
+  b.textContent=(discDirty&&n)?("应用筛选 ("+n+")"):"应用筛选";
+  const tip=document.getElementById("discDirtyTip");
+  if(tip) tip.style.display=discDirty?"":"none";
+}
+function clearDiscDirty(){ discApplied=discFingerprint(); discDirty=false; updateApplyBtn(); }
+function markDiscDirty(){ discDirty=(discFingerprint()!==discApplied); renderActiveChips(); updateApplyBtn(); }
+function applyDiscFilters(){
+  if(!discDirty)return;
+  discApplied=discFingerprint(); discDirty=false; updateApplyBtn(); discPage=1; loadDiscover();
+}
 // 发现页事件统一委托：一次性绑定，杜绝“每次交互重建+重绑”造成的卡顿
 function bindDiscEvents(){
   const panel=document.getElementById("p-discover");
@@ -3805,34 +3929,34 @@ function bindDiscEvents(){
         const v=t.value;
         discGenres=t.checked?discGenres.concat(v):discGenres.filter(x=>x!==v);
         t.parentElement.classList.toggle("on",t.checked);
-        updateGenreSummary(); discPage=1; renderActiveChips(); loadDiscover(); return;
+        updateGenreSummary(); markDiscDirty(); return;
       }
       const map={discYearSel:1,discCountrySel:1,discRatingSel:1,discRuntimeSel:1,discSortSel:1};
       if(!map[t.id])return;
       if(t.id==="discYearSel")discYear=t.value; else if(t.id==="discCountrySel")discCountry=t.value;
       else if(t.id==="discRatingSel")discRating=t.value; else if(t.id==="discRuntimeSel")discRuntime=t.value;
       else if(t.id==="discSortSel")discSort=t.value;
-      discPage=1; renderActiveChips(); loadDiscover();
+      markDiscDirty();
     });
     panel.addEventListener("click",e=>{
       const cat=e.target.closest("[data-cat]");
       if(cat){ discCat=cat.getAttribute("data-cat"); discPage=1; updateCatActive(); loadDiscover(); return; }
       const kind=e.target.closest("[data-kind]");
-      if(kind){ discKind=kind.getAttribute("data-kind"); discGenres=[]; discPage=1; renderDiscTypes(); renderDiscCats(); renderDiscDropdowns(); renderActiveChips(); loadDiscover(); return; }
+      if(kind){ discKind=kind.getAttribute("data-kind"); discGenres=[]; discPage=1; renderDiscTypes(); renderDiscCats(); renderDiscDropdowns(); renderActiveChips(); clearDiscDirty(); loadDiscover(); return; }
       const src=e.target.closest("[data-src]");
       if(src){ const ns=src.getAttribute("data-src");
         if(ns!==discSource){ discSource=ns; discGenres=[];
           if(ns==="douban"){discYear="";discRuntime="";discSort="pop";}
           discCat=ns==="douban"?(discKind==="tv"?"tv_pop":"popular"):"popular";
-          discPage=1; updateSrcChips(); renderDiscCats(); renderDiscDropdowns(); renderActiveChips(); loadDiscover(); }
+          discPage=1; updateSrcChips(); renderDiscCats(); renderDiscDropdowns(); renderActiveChips(); clearDiscDirty(); loadDiscover(); }
         return; }
       const x=e.target.closest(".xchip[data-k]");
       if(x){ const k=x.getAttribute("data-k");
         if(k==="g")discGenres=[];else if(k==="c")discCountry="";else if(k==="y")discYear="";
         else if(k==="r")discRating="";else if(k==="t")discRuntime="";else if(k==="s")discSort="pop";
-        discPage=1; syncDiscControls(); renderActiveChips(); loadDiscover(); return; }
+        syncDiscControls(); markDiscDirty(); return; }
       if(e.target.closest("#clearAll")){ discGenres=[];discCountry="";discYear="";discRating="";discRuntime="";discSort="pop";
-        discPage=1; syncDiscControls(); renderActiveChips(); loadDiscover(); return; }
+        discPage=1; syncDiscControls(); renderActiveChips(); clearDiscDirty(); loadDiscover(); return; }
       const moreBtn=e.target.closest("#discMore button");
       if(moreBtn){ discPage++; loadDiscover(true); return; }
       const addBtn=e.target.closest("button[data-add]");
@@ -3964,7 +4088,7 @@ function openDetail(kind,tmdbId){
     const ov=(d.overview?('<div class="detail-overview">'+esc(d.overview)+'</div>'):'<div class="muted">暂无简介。</div>');
     const tag=(d.tagline?'<div class="detail-tagline">'+esc(d.tagline)+'</div>':"");
     body.innerHTML=
-      (d.backdrop?'<img class="detail-backdrop" src="'+esc(d.backdrop)+'" alt=""/>':'')
+      (d.backdrop?'<img class="detail-backdrop" src="'+escAttr(imgSrc(d.backdrop))+'" alt=""/>':'')
       +'<div class="detail-head">'
       +'<div class="detail-title">'+esc(d.title||"")+'</div>'
       +(d.originalTitle&&d.originalTitle!==d.title?'<div class="s">原名：'+esc(d.originalTitle)+'</div>':"")
@@ -3976,8 +4100,8 @@ function openDetail(kind,tmdbId){
       +tag
       +'</div>'
       +ov
-      +(d.cast&&d.cast.length?('<div class="detail-section"><div class="detail-h">🎭 演职表</div><div class="cast-row">'+d.cast.map(c=>'<div class="cast"><img src="'+(c.profile||"")+'" onerror="this.style.visibility=\'hidden\'"/><span>'+esc(c.name||"")+'</span><span class="muted">'+esc(c.character||"")+'</span></div>').join("")+'</div></div>'):"")
-      +(d.similar&&d.similar.length?('<div class="detail-section"><div class="detail-h">🔗 相似推荐</div><div class="grid sm">'+d.similar.map(ss=>'<div class="card sm" data-sim="'+escAttr((ss.kind||"movie")+":"+ss.tmdbId)+'"><img src="'+(ss.poster||"")+'" onerror="this.style.visibility=\'hidden\'"/><div class="meta"><div class="t">'+esc(ss.title||"")+'</div><div class="s">'+(ss.year||"")+(ss.rating?(" · ★ "+Math.round(ss.rating)):"")+'</div></div></div>').join("")+'</div></div>'):"")
+      +(d.cast&&d.cast.length?('<div class="detail-section"><div class="detail-h">🎭 演职表</div><div class="cast-row">'+d.cast.map(c=>'<div class="cast"><img src="'+(c.profile?escAttr(imgSrc(c.profile)):"")+'" onerror="this.style.visibility=\'hidden\'"/><span>'+esc(c.name||"")+'</span><span class="muted">'+esc(c.character||"")+'</span></div>').join("")+'</div></div>'):"")
+      +(d.similar&&d.similar.length?('<div class="detail-section"><div class="detail-h">🔗 相似推荐</div><div class="grid sm">'+d.similar.map(ss=>'<div class="card sm" data-sim="'+escAttr((ss.kind||"movie")+":"+ss.tmdbId)+'"><img src="'+(ss.poster?escAttr(imgSrc(ss.poster)):"")+'" onerror="this.style.visibility=\'hidden\'"/><div class="meta"><div class="t">'+esc(ss.title||"")+'</div><div class="s">'+(ss.year||"")+(ss.rating?(" · ★ "+Math.round(ss.rating)):"")+'</div></div></div>').join("")+'</div></div>'):"")
       +'<div class="detail-acts"><button class="btn" id="detailAdd">添加下载</button>'
       +'<button class="btn ghost" id="detailSub">下载字幕</button></div>';
     const ab=document.getElementById("detailAdd");
@@ -4757,7 +4881,15 @@ class H(BaseHTTPRequestHandler):
         if not TOKEN:
             return True
         h = self.headers.get("Authorization", "")
-        return h == ("Bearer " + TOKEN) or h == ("token " + TOKEN)
+        if h == ("Bearer " + TOKEN) or h == ("token " + TOKEN):
+            return True
+        # <img>/<a> 等浏览器直取资源无法自带 header，故放行 ?token=<同值>
+        if "?" in self.path:
+            try:
+                return (parse_qs(self.path.split("?", 1)[1]).get("token") or [""])[0] == TOKEN
+            except Exception:
+                return False
+        return False
 
     def _q(self):
         """返回 (path无查询串, 查询参数dict)。支持 ?kind=tv 之类模式参数。"""
@@ -4863,6 +4995,29 @@ class H(BaseHTTPRequestHandler):
                         self._send(400, {"error": "缺少 start/end (YYYY-MM-DD)"})
                     else:
                         self._send(200, {"events": calendar_events(cs, ce)})
+                elif base == "/api/img":
+                    iurl = (_qs.get("url") or [""])[0]
+                    if not iurl:
+                        self._send(404, {"ok": False, "error": "缺少 url 参数"}); return
+                    if not img_allowed(iurl):
+                        self._send(403, {"ok": False, "error": "非白名单图片域名"}); return
+                    try:
+                        idata, ictype, ierr = img_fetch(iurl)
+                    except Exception as e:
+                        idata, ictype, ierr = None, None, str(e)
+                    if ierr or not idata:
+                        self._send(502, {"ok": False, "error": ierr or "抓取失败"}); return
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", ictype)
+                        self.send_header("Content-Length", str(len(idata)))
+                        self.send_header("Cache-Control", "public, max-age=1209600")
+                        self.end_headers()
+                        self.wfile.write(idata)
+                    except Exception:
+                        pass
+                    return
+
                 elif base == "/api/douban":
                     dkind = (_qs.get("kind") or ["movie"])[0]
                     dcat = (_qs.get("cat") or ["popular"])[0]
