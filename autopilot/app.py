@@ -2108,9 +2108,15 @@ def _qb_ensure_prefs():
         "max_active_downloads": 8,
         "max_active_torrents": 15,
         "dont_count_slow_torrents": True,
-        "listen_port": 6881,
-        "upnp": False,
-        "random_port": False,
+        # A 类抗干扰策略（2026-09-21）：移动家宽对 6881 做 RST 注入，且大概率为 CGNAT 无入站
+        # -> 不纠结入站，改「出站握手不被识别 + 最大化 peer 发现」
+        "encryption": 1,        # 1=启用/优先加密（绕开明文握手 RST；0=禁用, 2=强制仅加密）
+        "listen_port": 45000,   # 高位端口，避开 6881 的定向干扰；固定便于诊断与将来转发
+        "random_port": False,   # 固定端口，避免重启变端口导致旧 seed 失联
+        "dht": True,            # 全开 peer 发现，不依赖 tracker
+        "pex": True,
+        "lsd": True,
+        "upnp": False,           # 端口映射仍由用户路由器侧管理，qB 不碰 UPnP
     }
     last = ""
     for _ in range(30):
