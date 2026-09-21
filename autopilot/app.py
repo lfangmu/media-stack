@@ -3576,6 +3576,26 @@ PAGE = r"""<!doctype html>
   .empty .btn{margin-top:14px}
   .errcard{border:1px solid rgba(226,75,74,.4);background:rgba(226,75,74,.08);border-radius:var(--r-md);padding:16px;color:var(--text-2);margin:12px 0}
   .errcard .t{color:var(--err);font-weight:600;margin-bottom:4px}
+  /* 骨架屏卡片（发现页加载占位） */
+  .sk-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+  .sk-card .sk-poster{aspect-ratio:2/3;width:100%}
+  .sk-card .sk-line{height:10px;border-radius:4px;margin:10px 10px 0}
+  .sk-card .sk-line.s2{width:55%}
+  /* FullCalendar 暗色覆盖 */
+  .fc{--fc-border-color:var(--border);--fc-page-bg-color:var(--bg-surface);--fc-neutral-bg-color:var(--bg-elev);--fc-today-bg-color:rgba(47,111,237,.14);--fc-now-indicator-color:var(--accent);background:var(--bg-surface);color:var(--text)}
+  .fc .fc-toolbar-title{color:var(--text)}
+  .fc .fc-col-header-cell-cushion{color:var(--text-2)}
+  .fc .fc-daygrid-day-number{color:var(--text-2)}
+  .fc .fc-button{background:var(--bg-elev);border-color:var(--border);color:var(--text);text-transform:none;box-shadow:none}
+  .fc .fc-button-primary:not(:disabled).fc-button-active,.fc .fc-button-primary:not(:disabled):active{background:var(--accent);border-color:var(--accent);color:#fff}
+  .fc-theme-standard td,.fc-theme-standard th{border-color:var(--border)}
+  .fc .fc-daygrid-day.fc-day-today{background:var(--fc-today-bg-color)}
+  .fc-event{color:#fff!important;cursor:pointer;font-size:11px;padding:1px 3px}
+  /* 图表 */
+  .charts-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+  .chart-box{background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--r-md);padding:14px}
+  .chart-box h4{margin:0 0 8px;color:var(--text)}
+  @media(max-width:760px){.charts-row{grid-template-columns:1fr}}
   .stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin-bottom:18px}
   .stat-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--r-md);padding:14px 16px}
   .stat-card .k{color:var(--text-3);font-size:var(--fz-1)}
@@ -3983,6 +4003,10 @@ PAGE = r"""<!doctype html>
   <div class="panel" id="p-dashboard">
     <div class="section-title">仪表盘 <span class="sub">一眼掌握全局：抓取 / 入库 / 失败 / 存储 / 做种</span></div>
     <div class="stat-grid" id="dashStats"><div class="skeleton" style="height:78px"></div><div class="skeleton" style="height:78px"></div><div class="skeleton" style="height:78px"></div><div class="skeleton" style="height:78px"></div></div>
+    <div class="charts-row" id="dashCharts">
+      <div class="chart-box" id="dashPie"><h4>内容构成</h4><div class="skeleton" style="height:240px"></div></div>
+      <div class="chart-box" id="dashDisk"><h4>存储可用度</h4><div class="skeleton" style="height:240px"></div></div>
+    </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
       <div class="card" style="padding:14px"><h4 style="margin:0 0 8px;color:var(--text)">活动下载</h4><div id="dashQueue" class="muted">加载中…</div></div>
       <div class="card" style="padding:14px"><h4 style="margin:0 0 8px;color:var(--text)">最近失败抓取</h4><div id="dashFail" class="muted">加载中…</div></div>
@@ -4105,10 +4129,61 @@ function loadDashboard(){
       document.getElementById("dashFail").innerHTML=fail?hist.filter(x=>x.status==="failed"||x.status==="error").slice(0,6).map(x=>'<div style="padding:3px 0;color:var(--err)">'+esc(x.title||x.name||"?")+'</div>').join(""):'<span class="muted">无失败</span>';
       document.getElementById("dashManual").innerHTML=mi?('<span class="muted">'+mi+' 项待整理 · </span><a onclick="switchTo(\'manual\')" style="cursor:pointer;color:var(--info)">去处理 →</a>'):'<span class="muted">无</span>';
       updateBell(fail);
+      const mv=queue.filter(x=>x.kind!=="tv").length, tvN=queue.length-mv;
+      const pie=[["队列·电影",mv,"#2f6fed"],["队列·剧集",tvN,"#c98a2b"],["入库成功",okc,"#1b8a4b"],["失败",fail,"#e24b4a"],["待整理",mi,"#9b6dff"]];
+      ensureApex().then(ok=>{ if(ok){ renderDashPie(pie); renderDashDisk(s.disks||[]); } });
     }).catch(()=>{});
   }).catch(e=>{
     document.getElementById("dashStats").innerHTML='<div class="errcard" style="grid-column:1/-1"><div class="t">仪表盘加载失败</div><div>'+esc(e)+'</div></div>';
   });
+}
+
+let _apexLoading=null,_dashPie=null,_dashDisk=null;
+function ensureApex(){
+  if(window.ApexCharts)return Promise.resolve(true);
+  if(_apexLoading)return _apexLoading;
+  _apexLoading=new Promise(res=>{
+    const s=document.createElement("script");
+    s.src="https://cdn.jsdelivr.net/npm/apexcharts@3.49.1/dist/apexcharts.min.js";
+    s.onload=()=>res(true);
+    s.onerror=()=>res(false);
+    document.head.appendChild(s);
+    setTimeout(()=>res(false),6000);
+  });
+  return _apexLoading;
+}
+function renderDashPie(data){
+  const box=document.getElementById("dashPie");if(!box)return;
+  if(_dashPie&&_dashPie.destroy)_dashPie.destroy();
+  box.innerHTML='<h4>内容构成</h4><div id="pieCanvas"></div>';
+  _dashPie=new ApexCharts(document.querySelector("#pieCanvas"),{
+    chart:{type:"donut",height:240,background:"transparent"},
+    theme:{mode:"dark"},
+    labels:data.map(x=>x[0]),series:data.map(x=>x[1]),colors:data.map(x=>x[2]),
+    legend:{position:"bottom",labels:{colors:"#aab"}},
+    dataLabels:{enabled:false},
+    plotOptions:{pie:{donut:{labels:{show:true,total:{show:true,label:"总计",color:"#ccd"}}}}}
+  });
+  _dashPie.render();
+}
+function renderDashDisk(disks){
+  const box=document.getElementById("dashDisk");if(!box)return;
+  if(!disks.length){box.innerHTML='<h4>存储可用度</h4><div class="muted">无磁盘数据</div>';return;}
+  const labels=disks.map(x=>x.path),series=disks.map(x=>x.total?Math.round((x.total-x.free)/x.total*100):0);
+  if(_dashDisk&&_dashDisk.destroy)_dashDisk.destroy();
+  box.innerHTML='<h4>存储可用度（已用 %）</h4><div id="diskCanvas"></div>';
+  _dashDisk=new ApexCharts(document.querySelector("#diskCanvas"),{
+    chart:{type:"bar",height:240,background:"transparent",toolbar:{show:false}},
+    theme:{mode:"dark"},
+    plotOptions:{bar:{horizontal:true,borderRadius:4,barHeight:"55%"}},
+    dataLabels:{enabled:false},
+    xaxis:{categories:labels,max:100,labels:{formatter:v=>v+"%"}},
+    yaxis:{labels:{style:{colors:"#aab"}}},
+    series:[{name:"已用",data:series}],
+    colors:["#e0a85f"],
+    tooltip:{y:{formatter:v=>v+"% 已用"}}
+  });
+  _dashDisk.render();
 }
 
 // ===== 手动整理（/api/manualimport） =====
@@ -4413,6 +4488,17 @@ function renderActiveChips(){
   box.innerHTML=parts.map(p=>'<span class="chip xchip" data-k="'+p[2]+'" data-v="'+p[3]+'"><b>'+p[0]+'：'+p[1]+'</b> <span class="x">✕</span></span>').join("")+'<span class="chip xchip clear" id="clearAll">✕ 清空全部</span>';
 }
 
+function discSkeleton(n){
+  let h="";
+  for(let i=0;i<(n||12);i++){
+    h+='<div class="sk-card"><div class="skeleton sk-poster"></div><div class="skeleton sk-line"></div><div class="skeleton sk-line s2"></div></div>';
+  }
+  return h;
+}
+function clearDiscFilters(){
+  discGenres=[];discCountry="";discYear="";discRating="";discRuntime="";discSort="pop";
+  syncDiscControls();renderActiveChips();applyDoubanFilterUi();clearDiscDirty();loadDiscover(false,true);
+}
 function loadDiscover(append, refresh){
   const g=document.getElementById("discGrid");
   const st=document.getElementById("discStatus");
@@ -4429,7 +4515,7 @@ function loadDiscover(append, refresh){
   if(rating){const rn=_label(RATINGS,rating);if(rn)fparts.push(rn);}
   if(runtime){const tn=_label(RUNTIMES,runtime);if(tn)fparts.push(tn);}
   if(discSort&&discSort!=="pop"){const sn=_label(SORTS,discSort);if(sn)fparts.push("排序="+sn);}
-  if(!append){discPage=1;if(g)g.innerHTML="";}
+  if(!append){discPage=1;if(g)g.innerHTML=discSkeleton(12);}
   st.textContent=append?"正在加载更多…":(discSource==="douban"?"正在从豆瓣拉取…":"正在从 TMDB 拉取…");
   st.className="muted";
   const useDouban=(discSource==="douban");
@@ -4449,13 +4535,13 @@ function loadDiscover(append, refresh){
       st.className="err";
       st.innerHTML='⚠️ 未配置 TMDB_API_KEY。请在「配置」页的 <code>TMDB API Key</code> 一栏填写'
         +'（免费，在 themoviedb.org 申请），保存后即时生效。';
-      if(g)g.innerHTML="";if(more)more.innerHTML="";return;
+      if(g)g.innerHTML='<div class="errcard"><div class="t">需要先配置 TMDB API Key</div><div>配置后即可浏览发现墙与详情。</div></div>';if(more)more.innerHTML="";return;
     }
-    if(!d.ok){st.className="err";st.textContent="❌ "+(d.error||"拉取失败");if(g)g.innerHTML="";if(more)more.innerHTML="";return;}
+    if(!d.ok){st.className="err";st.textContent="❌ "+(d.error||"拉取失败");if(g)g.innerHTML='<div class="errcard"><div class="t">加载失败</div><div>'+esc(d.error||"拉取失败")+'</div><button class="btn" style="margin-top:10px" onclick="loadDiscover(false,true)">重试</button></div>';if(more)more.innerHTML="";return;}
     const items=d.items||[];
     discPage=d.page||discPage;
     discTotal=d.totalPages||1;
-    if(!items.length){if(!append){st.textContent="暂无内容";if(g)g.innerHTML="";}if(more)more.innerHTML="";return;}
+    if(!items.length){if(!append){st.textContent="暂无内容";if(g)g.innerHTML='<div class="empty"><div class="big">🔍</div>没有匹配的内容<br><span class="muted">换一组筛选条件，或清除当前筛选试试</span><br><button class="btn" style="margin-top:14px" onclick="clearDiscFilters()">清除筛选条件</button></div>';}if(more)more.innerHTML="";return;}
     const loaded=(append?(g?g.querySelectorAll(".card").length:0):0)+items.length;
     st.textContent="已加载 "+loaded+" 个"+(d.totalResults?(" · 共 "+d.totalResults+" 个"):"")+(fparts.length?(" · "+fparts.join(" · ")):"")+" · 点「添加下载」即加入队列";
     // 卡片批量构建 + 一次性 append（DocumentFragment）；事件由面板委托统一处理
@@ -4487,7 +4573,7 @@ function loadDiscover(append, refresh){
         more.appendChild(tip);
       }
     }
-  }).catch(e=>{if(my!==discReqToken)return;st.className="err";st.textContent="❌ 请求失败: "+e;if(more)more.innerHTML="";});
+  }).catch(e=>{if(my!==discReqToken)return;st.className="err";st.textContent="❌ 请求失败: "+e;if(g)g.innerHTML='<div class="errcard"><div class="t">请求失败</div><div>'+esc(""+e)+'</div><button class="btn" style="margin-top:10px" onclick="loadDiscover(false,true)">重试</button></div>';if(more)more.innerHTML="";});
 }
 
 function openDetail(kind,tmdbId){
@@ -4963,10 +5049,12 @@ function loadCalendar(){
   jget("/api/calendar?start="+start+"&end="+end).then(d=>{
     _calMap={};
     (d.events||[]).forEach(e=>{ (_calMap[e.date]=_calMap[e.date]||[]).push(e); });
-    renderCalendar();
+    ensureFullCalendar().then(ok=>{ if(ok)renderCalendarFC(); else renderCalendar(); });
   }).catch(e=>{document.getElementById("calGrid").innerHTML='<div class="err">加载失败: '+e+'</div>';});
 }
 function renderCalendar(){
+  const hd=document.querySelector(".cal-head");if(hd)hd.style.display="";
+  const wk=document.querySelector(".cal-week");if(wk)wk.style.display="";
   const box=document.getElementById("calGrid");
   document.getElementById("calTitle").textContent=_calY+"年"+(_calM+1)+"月";
   const firstDow=(new Date(_calY,_calM,1).getDay()+6)%7;
@@ -4987,6 +5075,46 @@ function renderCalendar(){
   }
   box.innerHTML=cells;
   box.querySelectorAll(".cal-chip").forEach(ch=>{ ch.onclick=()=>calAdd(ch.getAttribute("data-title"),ch.getAttribute("data-kind")); });
+}
+let _fcLoading=null,_fcInst=null;
+function ensureFullCalendar(){
+  if(window.FullCalendar)return Promise.resolve(true);
+  if(_fcLoading)return _fcLoading;
+  _fcLoading=new Promise(res=>{
+    const s=document.createElement("script");
+    s.src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js";
+    s.onload=()=>res(true);
+    s.onerror=()=>res(false);
+    document.head.appendChild(s);
+    setTimeout(()=>res(false),6000);
+  });
+  return _fcLoading;
+}
+function renderCalendarFC(){
+  const box=document.getElementById("calGrid");
+  if(!box)return;
+  const hd=document.querySelector(".cal-head");if(hd)hd.style.display="none";
+  const wk=document.querySelector(".cal-week");if(wk)wk.style.display="none";
+  const toEv=(date,e)=>({title:(e.kind==="tv"?"📺 ":"🎬 ")+e.title,date:date,kind:e.kind,
+    color:e.kind==="tv"?"#c98a2b":"#2f6fed"});
+  if(_fcInst){try{_fcInst.destroy();}catch(e){}_fcInst=null;}
+  box.innerHTML="";
+  const el=document.createElement("div");box.appendChild(el);
+  _fcInst=new FullCalendar.Calendar(el,{
+    initialView:"dayGridMonth",
+    initialDate:_calY+"-"+String(_calM+1).padStart(2,"0")+"-01",
+    headerToolbar:{left:"prev,next today",center:"title",right:""},
+    height:"auto",
+    events:function(info,success){
+      const s=ymd(info.start.getFullYear(),info.start.getMonth(),1);
+      const e=ymd(info.start.getFullYear(),info.start.getMonth()+1,1);
+      jget("/api/calendar?start="+s+"&end="+e).then(d=>{
+        const evs=[];(d.events||[]).forEach(x=>evs.push(toEv(x.date,x)));success(evs);
+      }).catch(()=>success([]));
+    },
+    eventClick:function(info){calAdd(info.event.title.replace(/^📺 |^🎬 /,""),info.event.extendedProps.kind);}
+  });
+  _fcInst.render();
 }
 function prevMonth(){ if(!_calY){_calY=new Date().getFullYear();_calM=new Date().getMonth();} _calM--; if(_calM<0){_calM=11;_calY--;} loadCalendar(); }
 function nextMonth(){ if(!_calY){_calY=new Date().getFullYear();_calM=new Date().getMonth();} _calM++; if(_calM>11){_calM=0;_calY++;} loadCalendar(); }
