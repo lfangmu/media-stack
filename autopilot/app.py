@@ -1523,18 +1523,26 @@ def calendar_events(start, end):
         pass
     try:
         eps = s_req("GET", "/api/v3/calendar?start=%s&end=%s" % (start, end)) or []
+        _ser_cache = {}
         for e in eps:
             ad = e.get("airDate")
             if not ad:
                 continue
-            ser = e.get("series") or {}
+            ser_id = e.get("seriesId")
+            sd = _ser_cache.get(ser_id)
+            if sd is None:
+                sd = {}
+                if ser_id:
+                    sd = s_req("GET", "/api/v3/series/%s" % ser_id) or {}
+                _ser_cache[ser_id] = sd
             out.append({"date": (ad or "")[:10],
-                        "title": ser.get("title") or e.get("title"),
+                        "title": sd.get("title") or e.get("title"),
                         "kind": "tv",
                         "sub": "S%02dE%02d %s" % (e.get("seasonNumber", 0),
                                                  e.get("episodeNumber", 0),
                                                  e.get("title") or ""),
-                        "seriesId": ser.get("id"), "id": e.get("id")})
+                        "tmdbId": sd.get("tmdbId"),
+                        "seriesId": ser_id, "id": e.get("id")})
     except Exception:
         pass
     out.sort(key=lambda x: (x.get("date") or "", x.get("title") or ""))
@@ -3967,7 +3975,7 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="cal-week"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>
     <div class="cal-grid" id="calGrid"></div>
-    <div class="muted" style="margin-top:8px">点击条目即用当前模式搜索并添加；🎬 电影上映 / 📺 剧集播出（数据来自 Radarr/Sonarr 日历）。</div>
+    <div class="muted" style="margin-top:8px">点击条目查看详情，再决定是否下载；🎬 电影上映 / 📺 剧集播出（数据来自 Radarr/Sonarr 日历）。</div>
   </div>
 
   <!-- 配置（单一代理出口 + TMDB） -->
@@ -5173,13 +5181,13 @@ function renderCalendar(){
     let chips="";
     evs.slice(0,3).forEach(e=>{
       const ic=e.kind==="tv"?"📺":"🎬";
-      chips+='<div class="cal-chip '+(e.kind==="tv"?"tv":"mv")+'" data-title="'+esc(e.title)+'" data-kind="'+e.kind+'" title="'+esc(e.title)+(e.sub?(" · "+esc(e.sub)):"")+'">'+ic+esc((e.title||"").slice(0,8))+'</div>';
+      chips+='<div class="cal-chip '+(e.kind==="tv"?"tv":"mv")+'" data-title="'+esc(e.title)+'" data-kind="'+e.kind+'" data-tmdb="'+(e.tmdbId?e.tmdbId:"")+'" title="'+esc(e.title)+(e.sub?(" · "+esc(e.sub)):"")+'">'+ic+esc((e.title||"").slice(0,8))+'</div>';
     });
     if(evs.length>3)chips+='<div class="cal-more">+'+(evs.length-3)+'</div>';
     cells+='<div class="cal-cell'+(ds===tToday?" cal-today":"")+'"><div class="cal-d">'+d+'</div>'+chips+'</div>';
   }
   box.innerHTML=cells;
-  box.querySelectorAll(".cal-chip").forEach(ch=>{ ch.onclick=()=>calAdd(ch.getAttribute("data-title"),ch.getAttribute("data-kind")); });
+  box.querySelectorAll(".cal-chip").forEach(ch=>{ ch.onclick=()=>calOpen(ch.getAttribute("data-kind"),ch.getAttribute("data-tmdb")||"",ch.getAttribute("data-title")); });
 }
 let _fcLoading=null,_fcInst=null;
 function ensureFullCalendar(){
@@ -5201,7 +5209,7 @@ function renderCalendarFC(){
   const hd=document.querySelector(".cal-head");if(hd)hd.style.display="none";
   const wk=document.querySelector(".cal-week");if(wk)wk.style.display="none";
   const toEv=(date,e)=>({title:(e.kind==="tv"?"📺 ":"🎬 ")+e.title,date:date,kind:e.kind,
-    color:e.kind==="tv"?"var(--warn-strong)":"var(--accent)"});
+    tmdbId:e.tmdbId, color:e.kind==="tv"?"var(--warn-strong)":"var(--accent)"});
   if(_fcInst){try{_fcInst.destroy();}catch(e){}_fcInst=null;}
   box.innerHTML="";
   const el=document.createElement("div");box.appendChild(el);
@@ -5217,7 +5225,7 @@ function renderCalendarFC(){
         const evs=[];(d.events||[]).forEach(x=>evs.push(toEv(x.date,x)));success(evs);
       }).catch(()=>success([]));
     },
-    eventClick:function(info){calAdd(info.event.title.replace(/^📺 |^🎬 /,""),info.event.extendedProps.kind);}
+    eventClick:function(info){ const k=info.event.extendedProps.kind,t=info.event.extendedProps.tmdbId; if(t){openDetail(k,t);} else {calAdd(info.event.title.replace(/^📺 |^🎬 /,""),k);} }
   });
   _fcInst.render();
 }
@@ -5231,6 +5239,10 @@ function calAdd(title,kind){
   document.getElementById("term").value=title;
   switchTo("search");
   doSearch();
+}
+function calOpen(kind,tmdbId,title){
+  if(tmdbId){ openDetail(kind, tmdbId); }
+  else { calAdd(title, kind); }
 }
 
 // 抓取历史：事件类型 -> 中文标签与配色
