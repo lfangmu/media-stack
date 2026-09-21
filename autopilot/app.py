@@ -2562,6 +2562,35 @@ def _qb_set_language():
     raise RuntimeError("qB 界面语言设置超时（API 持续不可达）")
 
 
+def manual_import_list():
+    """合并 Radarr/Sonarr 的 manualImport，给「手动整理」页用。
+    返回未自动导入的下载项（已完成但 *arr 没匹配/没落库），前端可逐条触发导入。"""
+    folder = (QB_SAVE_PATH or "/data/downloads").strip() or "/data/downloads"
+    out = []
+    for svc, req in (("radarr", r_req), ("sonarr", s_req)):
+        try:
+            items = req("GET", "/api/v3/manualImport?folder=" + folder) or []
+        except Exception as e:
+            items = []
+        if not isinstance(items, list):
+            items = []
+        for it in items:
+            it = dict(it)
+            it["service"] = svc
+            out.append(it)
+    return out
+
+
+def manual_import_do(payload):
+    """转发单条 manualImport 到对应 *arr。payload 含 service 字段，其余原样转发。"""
+    svc = payload.get("service")
+    if svc not in ("radarr", "sonarr"):
+        raise ValueError("未知 service：%s" % svc)
+    body = {k: v for k, v in payload.items() if k != "service"}
+    req = r_req if svc == "radarr" else s_req
+    return req("POST", "/api/v3/manualImport", body)
+
+
 def _qb_ensure_save_path():
     """qB 下载/做种目录自愈：确保落在 compose 的持久卷内（QB_SAVE_PATH，默认 /data/downloads）。
 
@@ -3486,6 +3515,80 @@ PAGE = r"""<!doctype html>
   *{box-sizing:border-box}
   body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
        background:#0f1115;color:#e6e6e6;margin:0}
+
+  /* ===== 设计令牌（2026-09-21 交互重规划） ===== */
+  :root{
+    --bg-base:#0f1318; --bg-surface:#171a21; --bg-elev:#1d212a; --bg-input:#222834;
+    --border:#232a37; --border-strong:#2f3a4d;
+    --text:#f4f6fb; --text-2:#c6cdd9; --text-3:#8b93a1;
+    --accent:#2f6fed; --accent-hover:#3f7ffa; --accent-soft:#16313f;
+    --ok:#1d9e75; --warn:#ef9f27; --err:#e24b4a; --info:#378add;
+    --r-sm:8px; --r-md:12px; --r-lg:16px;
+    --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s6:24px; --s8:32px;
+    --fz-1:12px; --fz-2:13px; --fz-3:14px; --fz-4:16px; --fz-5:18px; --fz-6:22px;
+    --ease:150ms ease;
+  }
+
+  /* ===== 布局：左分组侧边栏 + 顶栏 + 内容区 ===== */
+  .app{display:flex;min-height:100vh}
+  .sidebar{width:240px;flex:0 0 240px;background:var(--bg-surface);border-right:1px solid var(--border);
+    display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto}
+  .sb-head{padding:var(--s4);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+  .sb-head h1{font-size:var(--fz-5);margin:0;color:var(--text);font-weight:600}
+  .sb-health{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(29,158,117,.15);flex:0 0 auto}
+  .sb-health.warn{background:var(--warn);box-shadow:0 0 0 3px rgba(239,159,39,.15)}
+  .sb-health.err{background:var(--err);box-shadow:0 0 0 3px rgba(226,75,74,.15)}
+  .sb-ver{font-size:var(--fz-1);color:var(--text-3);margin-left:auto}
+  .navgrp{color:var(--text-3);font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin:var(--s4) var(--s4) 2px;display:flex;align-items:center;gap:6px}
+  .navitem{display:flex;align-items:center;gap:9px;padding:9px 14px;margin:2px var(--s3);border-radius:var(--r-sm);
+    color:var(--text-2);font-size:var(--fz-3);cursor:pointer;user-select:none;border-left:3px solid transparent}
+  .navitem:hover{background:var(--bg-elev);color:var(--text)}
+  .navitem.active{background:var(--accent-soft);color:#9bdcff;border-left-color:var(--accent)}
+  .navitem .ic{width:20px;text-align:center;font-size:15px}
+  .navitem .lb{flex:1}
+  .navitem .tag-new{font-size:10px;color:var(--ok);border:1px solid var(--ok);border-radius:999px;padding:0 6px}
+  .sb-foot{margin-top:auto;padding:var(--s3) var(--s4);border-top:1px solid var(--border);font-size:var(--fz-1);color:var(--text-3);line-height:1.7}
+  .sb-foot b{color:var(--text-2);font-weight:500}
+  .main{flex:1;min-width:0;display:flex;flex-direction:column}
+  .topbar{position:sticky;top:0;z-index:20;background:var(--bg-surface);border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:12px;padding:10px 20px}
+  .crumb{font-size:var(--fz-3);color:var(--text-2);white-space:nowrap}
+  .crumb b{color:var(--text)}
+  .gsearch{flex:1;max-width:360px;min-width:140px}
+  .topbar .spacer{flex:1}
+  .bell{position:relative;cursor:pointer;font-size:18px;padding:5px 9px;border-radius:var(--r-sm);border:1px solid transparent}
+  .bell:hover{background:var(--bg-elev);border-color:var(--border)}
+  .bell .dot{position:absolute;top:1px;right:3px;min-width:16px;height:16px;line-height:16px;text-align:center;
+    background:var(--err);color:#fff;font-size:10px;border-radius:999px;padding:0 4px;display:none}
+  .bell .dot.show{display:block}
+  .content{padding:18px 20px 60px;overflow-x:hidden}
+  .panel{max-width:1200px;margin:0 auto}
+  .section-title{font-size:var(--fz-6);font-weight:600;color:var(--text);margin:0 0 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .section-title .sub{font-size:var(--fz-2);color:var(--text-3);font-weight:400}
+
+  /* ===== 全局组件 ===== */
+  .skeleton{background:linear-gradient(90deg,var(--bg-elev) 25%,#262c38 37%,var(--bg-elev) 63%);
+    background-size:400% 100%;animation:sh 1.4s ease infinite;border-radius:var(--r-sm)}
+  @keyframes sh{0%{background-position:100% 0}100%{background-position:-100% 0}}
+  @media(prefers-reduced-motion:reduce){.skeleton{animation:none}}
+  .empty{border:1px dashed var(--border-strong);border-radius:var(--r-md);padding:48px;text-align:center;color:var(--text-3)}
+  .empty .big{font-size:34px;margin-bottom:8px}
+  .empty .btn{margin-top:14px}
+  .errcard{border:1px solid rgba(226,75,74,.4);background:rgba(226,75,74,.08);border-radius:var(--r-md);padding:16px;color:var(--text-2);margin:12px 0}
+  .errcard .t{color:var(--err);font-weight:600;margin-bottom:4px}
+  .stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin-bottom:18px}
+  .stat-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--r-md);padding:14px 16px}
+  .stat-card .k{color:var(--text-3);font-size:var(--fz-1)}
+  .stat-card .v{color:var(--text);font-size:var(--fz-6);font-weight:600;margin-top:4px}
+  .stat-card .v.ok{color:var(--ok)} .stat-card .v.warn{color:var(--warn)} .stat-card .v.err{color:var(--err)}
+  .filter-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+  .card-hover{transition:transform var(--ease),border-color var(--ease)}
+  .card-hover:hover{border-color:var(--border-strong);transform:translateY(-2px)}
+  .seg{display:inline-flex;border:1px solid var(--border);border-radius:var(--r-sm);overflow:hidden}
+  .seg button{background:var(--bg-surface);border:none;color:var(--text-2);padding:7px 14px;font-size:var(--fz-2);cursor:pointer}
+  .seg button.active{background:var(--accent);color:#fff}
+  .muted a{color:var(--info)}
+
   header{background:#151923;border-bottom:1px solid #232a37;padding:14px 20px;
          display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:10}
   header h1{font-size:18px;margin:0}
@@ -3642,28 +3745,44 @@ PAGE = r"""<!doctype html>
 </style>
 </head>
 <body>
-<header>
-  <h1>🎬 影视下载台</h1>
-  <div class="pill" id="syspill">
-    <span id="pillver">—</span>
-    <span>影片 <b id="pillmv">—</b></span>
-    <span>已下 <b id="pilldl">—</b></span>
-    <span>索引器 <b id="pillidx">—</b></span>
-    <span id="pilldisk">—</span>
-  </div>
-</header>
-<div class="wrap">
-  <div class="tabs">
-    <div class="tab active" data-p="search">🔍 搜索下载</div>
-    <div class="tab" data-p="discover">🎯 发现</div>
-    <div class="tab" data-p="queue">⬇️ 下载队列</div>
-    <div class="tab" data-p="library">🎞️ 媒体库</div>
-    <div class="tab" data-p="calendar">📅 日历</div>
-    <div class="tab" data-p="history">📜 抓取历史</div>
-    <div class="tab" data-p="indexers">🛰️ 索引器</div>
-    <div class="tab" data-p="status">📊 系统状态</div>
-    <div class="tab" data-p="config">🛠 配置</div>
-  </div>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sb-head">
+      <span class="sb-health" id="sbHealth" title="系统健康"></span>
+      <h1>影视下载台</h1>
+      <span class="sb-ver" id="pillver">v—</span>
+    </div>
+    <div class="navgrp">影视获取</div>
+    <div class="navitem" data-p="discover"><span class="ic">🎯</span><span class="lb">发现</span></div>
+    <div class="navitem active" data-p="search"><span class="ic">🔍</span><span class="lb">搜索下载</span></div>
+    <div class="navitem" data-p="calendar"><span class="ic">📅</span><span class="lb">日历</span></div>
+    <div class="navgrp">内容管理</div>
+    <div class="navitem" data-p="library"><span class="ic">🎞️</span><span class="lb">媒体库</span></div>
+    <div class="navitem" data-p="queue"><span class="ic">⬇️</span><span class="lb">下载队列</span></div>
+    <div class="navitem" data-p="manual"><span class="ic">🗂️</span><span class="lb">手动整理</span><span class="tag-new">新</span></div>
+    <div class="navitem" data-p="rules"><span class="ic">🧰</span><span class="lb">下载过滤规则</span><span class="tag-new">新</span></div>
+    <div class="navgrp">概览</div>
+    <div class="navitem" data-p="dashboard"><span class="ic">📈</span><span class="lb">仪表盘</span><span class="tag-new">新</span></div>
+    <div class="navitem" data-p="history"><span class="ic">📜</span><span class="lb">抓取历史</span></div>
+    <div class="navgrp">系统</div>
+    <div class="navitem" data-p="notify"><span class="ic">🔔</span><span class="lb">通知</span><span class="tag-new">新</span></div>
+    <div class="navitem" data-p="indexers"><span class="ic">🛰️</span><span class="lb">索引器</span></div>
+    <div class="navitem" data-p="status"><span class="ic">📊</span><span class="lb">系统状态</span></div>
+    <div class="navitem" data-p="config"><span class="ic">🛠️</span><span class="lb">配置</span></div>
+    <div class="sb-foot">
+      <div>影片 <b id="pillmv">—</b> · 已下 <b id="pilldl">—</b></div>
+      <div>索引器 <b id="pillidx">—</b> · <span id="pilldisk">—</span></div>
+    </div>
+  </aside>
+  <div class="main">
+    <div class="topbar">
+      <div class="crumb" id="crumb"><b>搜索下载</b></div>
+      <input id="gsearch" class="gsearch" placeholder="全局搜索片名，回车跳「搜索下载」">
+      <span class="spacer"></span>
+      <button class="btn ghost" onclick="topRefresh()">⟳ 刷新</button>
+      <div class="bell" id="bell" title="通知"><span>🔔</span><span class="dot" id="bellDot"></span></div>
+    </div>
+    <div class="content">
 
   <!-- 搜索下载（电影/剧集合并搜索：搜出什么是什么） -->
   <div class="panel active" id="p-search">
@@ -3842,7 +3961,48 @@ PAGE = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- 索引器 -->
+  <!-- ===== 新增页面（2026-09-21 交互重规划落位） ===== -->
+  <div class="panel" id="p-manual">
+    <div class="section-title">手动整理 <span class="sub">下载完成但未被 *arr 自动导入的项，可在此逐条触发导入</span></div>
+    <div class="row"><button class="btn ghost" onclick="loadManual()">刷新</button>
+      <span class="muted" id="manualHint"></span></div>
+    <div id="manualList"></div>
+  </div>
+
+  <div class="panel" id="p-rules">
+    <div class="section-title">下载过滤规则 <span class="sub">自动抓取与手动添加前的预检（本端管理，保存于浏览器）</span></div>
+    <div class="errcard" style="border-color:rgba(239,159,39,.4);background:rgba(239,159,39,.08)">
+      <div class="t" style="color:var(--warn)">⚠️ 当前为前端预检版</div>
+      <div>规则在「添加前」做本地提示 / 拦截建议；真正的服务端强制拦截将在后续版本接入自愈写盘。规则保存在本机浏览器（localStorage），换设备需重新设置。</div>
+    </div>
+    <div class="row"><button class="btn" onclick="ruleAdd()">＋ 新增规则</button>
+      <span class="muted">支持：关键词黑名单 / 最小大小(MB) / 排除语言 / 最大含广告标记</span></div>
+    <div id="ruleList"></div>
+  </div>
+
+  <div class="panel" id="p-dashboard">
+    <div class="section-title">仪表盘 <span class="sub">一眼掌握全局：抓取 / 入库 / 失败 / 存储 / 做种</span></div>
+    <div class="stat-grid" id="dashStats"><div class="skeleton" style="height:78px"></div><div class="skeleton" style="height:78px"></div><div class="skeleton" style="height:78px"></div><div class="skeleton" style="height:78px"></div></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+      <div class="card" style="padding:14px"><h4 style="margin:0 0 8px;color:var(--text)">活动下载</h4><div id="dashQueue" class="muted">加载中…</div></div>
+      <div class="card" style="padding:14px"><h4 style="margin:0 0 8px;color:var(--text)">最近失败抓取</h4><div id="dashFail" class="muted">加载中…</div></div>
+    </div>
+    <div class="card" style="padding:14px;margin-top:14px"><h4 style="margin:0 0 8px;color:var(--text)">待手动整理</h4><div id="dashManual" class="muted">加载中…</div></div>
+  </div>
+
+  <div class="panel" id="p-notify">
+    <div class="section-title">通知 <span class="sub">抓取完成 / 失败 的推送记录与配置</span></div>
+    <div class="row"><button class="btn ghost" onclick="loadNotify()">刷新</button>
+      <button class="btn" onclick="apTestWebhook()">发送测试通知</button>
+      <span class="muted" id="notifyHint"></span></div>
+    <div class="card" style="padding:14px">
+      <div id="notifyCfg" class="muted">加载中…</div>
+      <div id="notifyLog" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+</div>
+</div>
 </div>
 <div class="toast" id="toast"></div>
 
@@ -3887,30 +4047,138 @@ function setMode(m){
   document.getElementById("cands").innerHTML="";
   setStatus("");
   loadProfiles();loadRootFolders();loadQueue();
-  if(document.querySelector(".tab.active").dataset.p==="library"){
+  if(CUR==="library"){
     if(m==="tv")loadSeriesLibrary();else loadLibrary();
   }
 }
 
 // tabs
+function NAV_GROUP(p){return ({discover:"影视获取",search:"影视获取",calendar:"影视获取",library:"内容管理",queue:"内容管理",manual:"内容管理",rules:"内容管理",dashboard:"概览",history:"概览",notify:"系统",indexers:"系统",status:"系统",config:"系统"})[p]||"";}
+function NAV_NAME(p){return ({discover:"发现",search:"搜索下载",calendar:"日历",library:"媒体库",queue:"下载队列",manual:"手动整理",rules:"下载过滤规则",dashboard:"仪表盘",history:"抓取历史",notify:"通知",indexers:"索引器",status:"系统状态",config:"配置"})[p]||p;}
+let CUR="search";
 function switchTo(p){
-  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+  CUR=p;
+  document.querySelectorAll(".navitem").forEach(x=>x.classList.toggle("active",x.dataset.p===p));
   document.querySelectorAll(".panel").forEach(x=>x.classList.remove("active"));
-  document.querySelectorAll(".tab").forEach(x=>{if(x.dataset.p===p)x.classList.add("active");});
   const panel=document.getElementById("p-"+p);
   if(panel)panel.classList.add("active");
+  const g=NAV_GROUP(p),n=NAV_NAME(p);
+  document.getElementById("crumb").innerHTML=g+' <span style="opacity:.5">›</span> <b>'+n+'</b>';
   if(p==="queue")loadQueue();
-  if(p==="library"){ if(MODE==="tv")loadSeriesLibrary(); else loadLibrary(); }
-  if(p==="status"){loadSystem();}
-  if(p==="history")loadHistory();
-  if(p==="indexers")loadIndexers();
-  if(p==="calendar")loadCalendar();
-  if(p==="discover"){ renderDiscChips(); clearDiscDirty(); loadDiscover(); }
-  if(p==="config")apLoadConfig();
+  else if(p==="library"){ if(MODE==="tv")loadSeriesLibrary(); else loadLibrary(); }
+  else if(p==="status"){loadSystem();}
+  else if(p==="history"){loadHistory();}
+  else if(p==="indexers"){loadIndexers();}
+  else if(p==="calendar"){loadCalendar();}
+  else if(p==="discover"){ renderDiscChips(); clearDiscDirty(); loadDiscover(); }
+  else if(p==="config"){apLoadConfig();}
+  else if(p==="dashboard"){loadDashboard();}
+  else if(p==="manual"){loadManual();}
+  else if(p==="rules"){renderRules();}
+  else if(p==="notify"){loadNotify();}
 }
-document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
-  switchTo(t.dataset.p);
-});
+document.querySelectorAll(".navitem").forEach(t=>t.onclick=()=>{ switchTo(t.dataset.p); });
+document.getElementById("bell").onclick=()=>{ switchTo("notify"); };
+
+// 顶栏刷新：重跑当前页加载器
+function topRefresh(){
+  const m={queue:loadQueue,library:()=>MODE==="tv"?loadSeriesLibrary():loadLibrary(),status:loadSystem,
+    history:loadHistory,indexers:loadIndexers,calendar:loadCalendar,discover:()=>loadDiscover(),
+    config:apLoadConfig,dashboard:loadDashboard,manual:loadManual,rules:renderRules,notify:loadNotify,search:()=>{}};
+  (m[CUR]||function(){})();
+  if(CUR!=="search")toast("已刷新");
+}
+
+// ===== 仪表盘（客户端聚合现有端点） =====
+function updateBell(fail){ const d=document.getElementById("bellDot"); if(!d)return; if(fail>0){d.textContent=fail>99?"99+":String(fail);d.classList.add("show");} else d.classList.remove("show"); }
+function loadDashboard(){
+  jget("/api/system").then(s=>{
+    Promise.all([jget("/api/queue?kind=all"),jget("/api/history?kind=all&limit=10"),jget("/api/manualimport")]).then(([qd,hd,md])=>{
+      const queue=qd.queue||[];
+      const hist=hd.history||[];
+      const fail=hist.filter(x=>x.status==="failed"||x.status==="error").length;
+      const okc=hist.filter(x=>x.status==="imported"||x.status==="grabbed").length;
+      const mi=(md.items||[]).length;
+      const stats=[["队列中",queue.length,""],["入库成功",okc,"ok"],["失败",fail,fail?"err":"ok"],["待整理",mi,mi?"warn":""]];
+      document.getElementById("dashStats").innerHTML=stats.map(r=>'<div class="stat-card"><div class="k">'+r[0]+'</div><div class="v '+r[2]+'">'+r[1]+'</div></div>').join("");
+      document.getElementById("dashQueue").innerHTML=queue.length?queue.slice(0,6).map(x=>'<div style="padding:3px 0">'+esc(x.name||"?")+' <span class="muted">· '+fmtSize(x.size||0)+'</span></div>').join(""):'<span class="muted">无活动下载</span>';
+      document.getElementById("dashFail").innerHTML=fail?hist.filter(x=>x.status==="failed"||x.status==="error").slice(0,6).map(x=>'<div style="padding:3px 0;color:var(--err)">'+esc(x.title||x.name||"?")+'</div>').join(""):'<span class="muted">无失败</span>';
+      document.getElementById("dashManual").innerHTML=mi?('<span class="muted">'+mi+' 项待整理 · </span><a onclick="switchTo(\'manual\')" style="cursor:pointer;color:var(--info)">去处理 →</a>'):'<span class="muted">无</span>';
+      updateBell(fail);
+    }).catch(()=>{});
+  }).catch(e=>{
+    document.getElementById("dashStats").innerHTML='<div class="errcard" style="grid-column:1/-1"><div class="t">仪表盘加载失败</div><div>'+esc(e)+'</div></div>';
+  });
+}
+
+// ===== 手动整理（/api/manualimport） =====
+let manualItems=[];
+function loadManual(){
+  const box=document.getElementById("manualList");
+  box.innerHTML='<div class="skeleton" style="height:56px;margin:8px 0"></div><div class="skeleton" style="height:56px;margin:8px 0"></div>';
+  jget("/api/manualimport").then(d=>{
+    const items=d.items||[];
+    if(d.error)document.getElementById("manualHint").textContent="⚠️ "+d.error;
+    if(!items.length){ box.innerHTML='<div class="empty"><div class="big">🗂️</div>没有待整理的下载项<br><span class="muted">下载完成且已被 *arr 自动导入的不会出现在列表</span></div>'; return; }
+    document.getElementById("manualHint").textContent="共 "+items.length+" 项待整理";
+    manualItems=items;
+    let h="";
+    items.forEach((it,idx)=>{
+      const name=(it.relativePath||it.path||"?").split("/").pop();
+      const svc=it.service==="sonarr"?"📺 剧集":"🎬 电影";
+      h+='<div class="card card-hover" style="flex-direction:row;align-items:center;padding:12px 14px;margin:8px 0;gap:12px">'
+        +'<div style="flex:1;min-width:0"><div style="color:var(--text);font-weight:600">'+esc(name)+'</div>'
+        +'<div class="muted">'+svc+' · '+esc(it.path||"")+'</div></div>'
+        +'<button class="btn" onclick="manualImport('+idx+')">导入</button></div>';
+    });
+    box.innerHTML=h;
+  }).catch(e=>{ box.innerHTML='<div class="errcard"><div class="t">加载失败</div><div>'+esc(e)+'</div></div>'; });
+}
+function manualImport(i){
+  const it=manualItems[i]; if(!it)return;
+  jpost("/api/manualimport",it).then(d=>{ if(d.ok){ toast("✅ 已触发导入","ok"); loadManual(); } else toast("❌ "+(d.error||"导入失败"),"err"); })
+   .catch(e=>toast("❌ "+e,"err"));
+}
+
+// ===== 下载过滤规则（前端预检，localStorage） =====
+const RULE_KEY="dl_filter_rules_v1";
+function getRules(){ try{return JSON.parse(localStorage.getItem(RULE_KEY)||"[]");}catch(e){return[];} }
+function setRules(a){ localStorage.setItem(RULE_KEY,JSON.stringify(a)); }
+function renderRules(){
+  const a=getRules(); const box=document.getElementById("ruleList");
+  if(!a.length){ box.innerHTML='<div class="empty"><div class="big">🧰</div>还没有过滤规则<br><span class="muted">点击「＋ 新增规则」添加关键词黑名单 / 大小下限等</span></div>'; return; }
+  let h='<table style="width:100%;border-collapse:collapse"><tr><th>类型</th><th>条件</th><th>动作</th><th></th></tr>';
+  a.forEach((r,i)=>{
+    h+='<tr><td>'+esc(r.type||"")+'</td><td>'+esc(String(r.value))+(r.op?(" "+r.op):"")+'</td><td>'+(r.action==="block"?"🚫 拦截":"⚠️ 提示")+'</td>'
+      +'<td><button class="btn ghost" onclick="ruleDel('+i+')">删除</button></td></tr>';
+  });
+  h+='</table>';
+  box.innerHTML=h;
+}
+function ruleAdd(){
+  const type=prompt("规则类型：\n1=关键词黑名单\n2=最小大小(MB)\n3=排除语言\n4=最大含广告标记","");
+  if(!type)return;
+  let r={type:"关键词黑名单",value:"",op:"",action:"block"};
+  if(type==="2"){r.type="最小大小(MB)";r.value=prompt("最小大小(MB)，小于此值不下：","200")||"200";r.op="≥";}
+  else if(type==="3"){r.type="排除语言";r.value=prompt("排除的语言（如 德语）：","")||"";}
+  else if(type==="4"){r.type="最大含广告标记";r.value=prompt("含广告标记超过该比例(0-1)则拦截，如 0.3：","0.3")||"0.3";r.op="≤";}
+  else {r.type="关键词黑名单";r.value=prompt("命中的关键词（含此词不下）：","Sample")||"Sample";}
+  const a=getRules(); a.push(r); setRules(a); renderRules(); toast("已添加规则","ok");
+}
+function ruleDel(i){ const a=getRules(); a.splice(i,1); setRules(a); renderRules(); }
+
+// ===== 通知（配置 + 记录） =====
+function loadNotify(){
+  jget("/api/webhook").then(d=>{
+    const cfg=document.getElementById("notifyCfg");
+    if(d.configured){ cfg.innerHTML='✅ 通知已配置：<code style="color:var(--info)">'+esc(d.url||"")+'</code>'; }
+    else { cfg.innerHTML='⚠️ 未配置通知 Webhook（在「配置」页填写 AUTOPILOT_WEBHOOK_URL）'; }
+    let h='<div class="muted" style="font-size:12px">最近发送：'+(d.last?esc(JSON.stringify(d.last)):"无")+'</div>';
+    h+='<div class="muted" style="font-size:12px">累计发送：'+(d.sent||0)+' 次</div>';
+    document.getElementById("notifyLog").innerHTML=h;
+    document.getElementById("notifyHint").textContent="";
+  }).catch(e=>{ document.getElementById("notifyHint").textContent="加载失败"; });
+}
 
 function escAttr(s){ return (s||"").replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
@@ -4985,9 +5253,11 @@ function apTestWebhook(){
 
 // init
 loadProfiles();loadRootFolders();loadSystem();loadQueue();
-setInterval(()=>{if(document.querySelector(".tab.active").dataset.p==="queue")loadQueue();},5000);
+setInterval(()=>{if(CUR==="queue")loadQueue();},5000);
 setInterval(()=>{loadSystem();},30000);
 document.getElementById("term").addEventListener("keydown",e=>{if(e.key==="Enter")doSearch();});
+const _gs=document.getElementById("gsearch");
+if(_gs)_gs.addEventListener("keydown",e=>{if(e.key==="Enter"){const v=e.target.value.trim();switchTo("search");if(v)document.getElementById("term").value=v;doSearch();}});
 document.querySelectorAll(".mbtn").forEach(b=>{
   b.onclick=()=>setMode(b.dataset.m);
 });
@@ -5133,6 +5403,12 @@ class H(BaseHTTPRequestHandler):
                 elif base.startswith("/api/webhook"):
                     self._send(200, {"configured": bool(WEBHOOK_URL), "url": WEBHOOK_URL,
                                     "sent": _WEBHOOK_SENT, "last": _WEBHOOK_LAST})
+                elif base == "/api/manualimport":
+                    try:
+                        self._send(200, {"items": manual_import_list()})
+                    except Exception as e:
+                        self._send(200, {"items": [], "error": str(e)[:200]})
+                    return
                 elif base == "/api/config":
                     self._send(200, config_get()); return
                 elif base == "/api/config_test":
@@ -5349,6 +5625,15 @@ class H(BaseHTTPRequestHandler):
             ok = _fire_webhook({"event": "test", "title": "影视下载台 测试通知",
                                "message": "如果你收到这条消息，说明 webhook 配置正确"})
             self._send(200, {"ok": ok}); return
+        if p == "/api/manualimport":
+            d = self._read_json()
+            if "__error__" in d:
+                self._send(400, {"ok": False, "error": "请求体解析失败: " + d["__error__"]}); return
+            try:
+                res = manual_import_do(d)
+                self._send(200, {"ok": True, "result": res})
+            except Exception as e:
+                self._send(400, {"ok": False, "error": str(e)[:200]}); return
         if p == "/api/search":
             d = self._read_json()
             term = (d.get("term") or "").strip()
