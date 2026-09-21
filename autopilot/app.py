@@ -2047,6 +2047,96 @@ def qbit_set_save_path(path):
     return True, "已设置 qB 下载目录为 " + path
 
 
+def qbit_login():
+    """登录 qB，返回带 Cookie / X-Csrftoken 的 headers dict；失败返回 None。供偏好读写复用。"""
+    try:
+        data = urlencode({"username": QBIT_USER, "password": QBIT_PASS}).encode()
+        req = Request(QBIT_URL + "/api/v2/auth/login", data=data,
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urlopen(req, timeout=10, context=SSL_CTX) as r:
+            ck = r.headers.get("Set-Cookie", "")
+        m = re.search(r"(QBT_SID_\d+=[^;]+)", ck) or re.search(r"(SID=[^;]+)", ck)
+        if not m:
+            return None
+        cm = re.search(r"(csrftoken=[^;]+)", ck)
+        hdrs = {"Cookie": m.group(1) + ("; " + cm.group(1) if cm else ""),
+                "Content-Type": "application/x-www-form-urlencoded"}
+        if cm:
+            hdrs["X-Csrftoken"] = cm.group(1).split("=", 1)[1]
+        return hdrs
+    except Exception:
+        return None
+
+
+def qbit_get_prefs():
+    """读取 qB 全部偏好（dict）；不可达/未登录返回 {}。"""
+    hdrs = qbit_login()
+    if not hdrs:
+        return {}
+    try:
+        with urlopen(Request(QBIT_URL + "/api/v2/app/preferences", headers=hdrs),
+                     timeout=10, context=SSL_CTX) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return {}
+
+
+def qbit_set_prefs(d):
+    """经 Web API 写入 qB 偏好子集（dict）；成功返回 True。qB 会自行回写 conf 持久化。"""
+    hdrs = qbit_login()
+    if not hdrs:
+        return False
+    body = urlencode({"json": json.dumps(d)}).encode()
+    try:
+        with urlopen(Request(QBIT_URL + "/api/v2/app/setPreferences", data=body, headers=hdrs),
+                     timeout=10, context=SSL_CTX) as r:
+            r.read()
+        return True
+    except Exception:
+        return False
+
+
+def _qb_ensure_prefs():
+    """qB 队列配额 + 监听端口的幂等自愈（设计先于急救：全新安装不再复发）。
+
+    早期这些值是手工写进 qBittorrent.conf 的，容器重建即丢、全新安装必回到镜像默认
+    （max_active_torrents=5 等），导致 stalled 做种占满活动槽 -> 新种子永远排队 0%、下不动。
+    用 Web API 在启动自愈里幂等纠正（qB 会把偏好回写 conf，天然持久化，无需手改 conf）。
+    upnp / random_port 一并锁定：端口映射由用户在路由器侧管理，qB 不应自作主张改端口或碰 UPnP。
+    """
+    want = {
+        "max_active_downloads": 8,
+        "max_active_torrents": 15,
+        "dont_count_slow_torrents": True,
+        "listen_port": 6881,
+        "upnp": False,
+        "random_port": False,
+    }
+    last = ""
+    for _ in range(30):
+        prefs = qbit_get_prefs()
+        if not prefs:
+            last = "prefs 读取失败/API 不可达"
+            time.sleep(5)
+            continue
+        # 只纠正与目标不一致的键，避免无谓写盘
+        diff = {k: v for k, v in want.items() if prefs.get(k) != v}
+        if not diff:
+            print("[autopilot] qB 队列/端口偏好已就位", flush=True)
+            return
+        if qbit_set_prefs(diff):
+            after = qbit_get_prefs() or {}
+            still = {k: v for k, v in want.items() if after.get(k) != v}
+            if not still:
+                print("[autopilot] qB 队列/端口偏好已修正: %s" % diff, flush=True)
+                return
+            last = "设置后仍有差异: %s" % still
+        else:
+            last = "setPreferences 调用失败"
+        time.sleep(5)
+    print("[autopilot] qB 队列/端口偏好自愈失败（%s）；请检查 qB 是否在运行" % last, flush=True)
+
+
 def radarr_ensure_rootfolder(path):
     """尽力在 Radarr 注册根目录；已存在则视为已注册，容器内路径不存在则明确报错（不静默吞掉）。"""
     try:
@@ -2809,6 +2899,7 @@ def _arr_bootstrap():
     # qB 下载目录自愈：必须落在 ${DATA_DIR}:/data 挂载内。镜像默认 /downloads 不在任何卷里，
     # 会造成「文件写进容器可写层 + *arr 看不到 → 100% 却永远导不进媒体库」。
     _qb_ensure_save_path()
+    _qb_ensure_prefs()  # 队列配额 + 监听端口（设计先于急救：防止全新安装回到镜像默认导致卡 0%）
     for service in ("radarr", "sonarr", "prowlarr"):
         for _ in range(90):
             try:
