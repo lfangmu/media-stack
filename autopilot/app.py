@@ -3604,6 +3604,7 @@ PAGE = r"""<!doctype html>
     background-size:400% 100%;animation:sh 1.4s ease infinite;border-radius:var(--r-sm)}
   @keyframes sh{0%{background-position:100% 0}100%{background-position:-100% 0}}
   @media(prefers-reduced-motion:reduce){.skeleton{animation:none}}
+  .poster .poster-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:38px;opacity:.5}
   .empty{border:1px dashed var(--border-strong);border-radius:var(--r-md);padding:48px;text-align:center;color:var(--text-3)}
   .empty .big{font-size:34px;margin-bottom:8px}
   .empty .btn{margin-top:14px}
@@ -4671,7 +4672,7 @@ function loadDiscover(append, refresh){
       if(it.source==="douban") card.setAttribute("data-name",it.title||"");
       frag.appendChild(card);
     });
-    if(g)g.appendChild(frag);
+    if(g){if(!append)g.innerHTML="";g.appendChild(frag);}
     if(more){
       more.innerHTML="";
       if(discPage<discTotal){
