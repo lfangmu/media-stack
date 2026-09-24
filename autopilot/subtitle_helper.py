@@ -50,7 +50,7 @@ def _host_ok(url):
         return False
 
 
-def _http_get(url, ua=None, timeout=20, binary=False):
+def _http_get(url, ua=None, timeout=10, binary=False, retries=2):
     hdrs = {"User-Agent": ua or _UA, "Accept": "*/*", "Accept-Language": "zh-CN,zh;q=0.9"}
     handlers = []
     if _PROXY_URL:
@@ -58,7 +58,7 @@ def _http_get(url, ua=None, timeout=20, binary=False):
     opener = _ureq.build_opener(*handlers)
     req = _ureq.Request(url, headers=hdrs)
     last = ""
-    for attempt in range(1, 4):
+    for attempt in range(1, retries + 1):
         try:
             with opener.open(req, timeout=timeout) as r:
                 data = r.read() if binary else r.read()
@@ -69,9 +69,9 @@ def _http_get(url, ua=None, timeout=20, binary=False):
             return None, "字幕源 HTTP %s: %s" % (ex.code, ex.reason)
         except Exception as e:
             last = str(e)
-            if attempt < 3:
+            if attempt < retries:
                 time.sleep(0.6)
-    return None, "字幕源请求失败（重试 3 次）：%s" % last
+    return None, "字幕源请求失败（重试 %d 次）：%s" % (retries, last)
 
 
 def guess_lang(name):
@@ -87,8 +87,10 @@ def guess_lang(name):
     return ""
 
 
-def search_subtitlecat(query, limit=8):
-    """列表页 -> 每项详情页解析 download_sub -> 扁平候选（含直链）。返回 (items, err)。"""
+def search_subtitlecat(query, limit=8, budget=15):
+    """列表页 -> 每项详情页解析 download_sub -> 扁平候选（含直链）。返回 (items, err)。
+    budget: 整体耗时预算（秒），到时即停止继续拉详情页（返回已拿到的部分结果，防慢源卡死请求）。"""
+    deadline = time.monotonic() + budget
     url = "%s/index.php?searchin=1&searchword=%s" % (_SITE, _quote(query))
     raw, err = _http_get(url)
     if err:
@@ -101,6 +103,8 @@ def search_subtitlecat(query, limit=8):
     items_meta = items_meta[:limit]
     items = []
     for sub_id, slug in items_meta:
+        if time.monotonic() >= deadline:
+            break
         detail_url = "%s/subs/%s/%s" % (_SITE, sub_id, slug)
         draw, derr = _http_get(detail_url)
         if derr or not draw:

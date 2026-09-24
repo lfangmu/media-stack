@@ -4107,8 +4107,8 @@ PAGE = r"""<!doctype html>
 <script>
 let TOKEN=new URLSearchParams(location.search).get("token")||"";
 function authHdr(){return TOKEN?{Authorization:"Bearer "+TOKEN}:{}}
-function jget(u){return fetch(u,{headers:authHdr()}).then(r=>r.json())}
-function jpost(u,b){return fetch(u,{method:"POST",headers:Object.assign({"Content-Type":"application/json"},authHdr()),body:JSON.stringify(b)}).then(r=>r.json())}
+function jget(u,timeout){const c=new AbortController();const t=timeout?setTimeout(()=>c.abort(),timeout):null;return fetch(u,{headers:authHdr(),signal:c.signal}).then(r=>r.json()).finally(()=>{if(t)clearTimeout(t);});}
+function jpost(u,b,timeout){const c=new AbortController();const t=timeout?setTimeout(()=>c.abort(),timeout):null;return fetch(u,{method:"POST",headers:Object.assign({"Content-Type":"application/json"},authHdr()),body:JSON.stringify(b),signal:c.signal}).then(r=>r.json()).finally(()=>{if(t)clearTimeout(t);});}
 function toast(t,cls){const e=document.getElementById("toast");e.textContent=t;e.className="toast show"+(cls?" "+cls:"");setTimeout(()=>e.className="toast",2200)}
 function setStatus(t,cls){const s=document.getElementById("status");s.className=cls||"";s.textContent=t||""}
 function posterFail(img){try{var d=document.createElement("div");d.className="poster-fallback";d.textContent="🎞";img.parentNode.replaceChild(d,img);}catch(e){}}
@@ -4732,26 +4732,43 @@ function openDetail(kind,tmdbId){
     };
     const subBtn=document.getElementById("detailSub");
     if(subBtn){
-      subBtn.onclick=()=>{
-        subBtn.disabled=true;subBtn.textContent="搜索字幕…";
+      const doSubSearch=()=>{
         const q=encodeURIComponent(d.title||"");
-        jget("/api/subtitle?kind="+kind+"&tmdbId="+encodeURIComponent(tmdbId)+"&name="+q).then(r=>{
+        const old=document.getElementById("detailSubBox");
+        if(old)old.remove();
+        const box=document.createElement("div");
+        box.id="detailSubBox";box.className="detail-section";
+        box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="skeleton" style="height:40px;margin:8px 0"></div>';
+        body.appendChild(box);
+        subBtn.disabled=true;subBtn.textContent="搜索字幕…";
+        jget("/api/subtitle?kind="+kind+"&tmdbId="+encodeURIComponent(tmdbId)+"&name="+q,18000).then(r=>{
           subBtn.disabled=false;subBtn.textContent="下载字幕";
-          if(!r||!r.ok){toast("字幕："+(r&&r.error||"无结果"),"err");return;}
-          const box=document.createElement("div");
-          box.className="detail-section";
-          box.innerHTML='<div class="detail-h">💬 字幕候选</div>';
-          (r.items||[]).slice(0,15).forEach(it=>{
+          if(!r||!r.ok){
+            box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="errcard"><div class="t">未找到字幕</div><div>'+(r&&r.error?esc(r.error):"暂无结果")+'</div><button class="btn" style="margin-top:10px" onclick="__retrySub()">重试</button></div>';
+            return;
+          }
+          const items=(r.items||[]).slice(0,15);
+          if(!items.length){
+            box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="empty"><div class="big">💬</div>未找到字幕<br><span class="muted">SubtitleCat 无匹配，可换片名或加季集重试</span></div>';
+            return;
+          }
+          box.innerHTML='<div class="detail-h">💬 字幕候选（'+items.length+'）</div>';
+          items.forEach(it=>{
             const b=document.createElement("button");
             b.className="btn ghost";b.style.margin="4px";
-            b.textContent=(it.lang||"?")+" · "+(it.source||"")+" · "+((it.title||"").slice(0,40));
-            b.onclick=()=>{window.location="/api/subtitle/download?url="+encodeURIComponent(it.url)+"&source="+encodeURIComponent(it.source)+"&name="+encodeURIComponent(it.title||"subtitle");};
+            b.textContent=(it.lang||"?")+" · "+(it.source||"")+" · "+esc((it.title||"").slice(0,40));
+            b.onclick=()=>{ window.location="/api/subtitle/download?url="+encodeURIComponent(it.url)+"&source="+encodeURIComponent(it.source)+"&name="+encodeURIComponent(it.title||"subtitle"); };
             box.appendChild(b);
           });
-          (r.warns||[]).forEach(w=>{const wd=document.createElement("div");wd.className="muted";wd.style.margin="6px 0";wd.textContent="⚠️ "+w;box.appendChild(wd);});
-          body.appendChild(box);
-        }).catch(e=>{subBtn.disabled=false;subBtn.textContent="下载字幕";toast("❌ "+e,"err");});
+          (r.warns||[]).forEach(w=>{ const wd=document.createElement("div");wd.className="muted";wd.style.margin="6px 0";wd.textContent="⚠️ "+w;box.appendChild(wd); });
+        }).catch(e=>{
+          subBtn.disabled=false;subBtn.textContent="下载字幕";
+          const to=(e&&e.name==="AbortError");
+          box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="errcard"><div class="t">'+(to?"字幕源响应慢":"字幕搜索失败")+'</div><div>'+(to?"SubtitleCat 未及时返回，请稍后重试或换片名。":"错误："+esc(""+e))+'</div><button class="btn" style="margin-top:10px" onclick="__retrySub()">重试</button></div>';
+        });
       };
+      subBtn.onclick=doSubSearch;
+      window.__retrySub=doSubSearch;
     }
     body.querySelectorAll('[data-sim]').forEach(el=>{
       el.onclick=()=>{ const p=el.getAttribute('data-sim').split(':'); closeDetail(); openDetail(p[0],p[1]); };
