@@ -4114,7 +4114,7 @@ function setStatus(t,cls){const s=document.getElementById("status");s.className=
 function posterFail(img){try{var d=document.createElement("div");d.className="poster-fallback";d.textContent="🎞";img.parentNode.replaceChild(d,img);}catch(e){}}
 // 图片统一走后端代理：/api/img 带白名单 + 落盘缓存，避免直连 CDN 抖动/被墙
 function imgSrc(u){if(!u)return "";if(u.indexOf("data:")===0||u.indexOf("/api/img")===0)return u;return "/api/img?url="+encodeURIComponent(u)+(TOKEN?("&token="+encodeURIComponent(TOKEN)):"");}
-function posterHTML(p,title){if(p)return '<div class="poster"><img src="'+imgSrc(p)+'" loading="lazy" onerror="posterFail(this)"></div>';return '<div class="poster poster-fallback">🎞</div>';}
+function posterHTML(p,title){if(p)return '<div class="poster"><img src="'+imgSrc(p)+'" loading="lazy" onerror="posterFail(this)" onload="if(!this.naturalWidth)posterFail(this)"></div>';return '<div class="poster poster-fallback">🎞</div>';}
 // 统一卡片构造器：搜索下载 / 发现 / 媒体库 / 剧集库 全部复用，保证视觉一致
 // o: {poster, title, kind("movie"|"tv"|null), sub(已转义HTML串), extra(额外行HTML), badges([HTML]), acts(按钮HTML)}
 function kindBadge(kind){return kind==="tv"?"📺 ":((kind==="movie")?"🎬 ":"");}
@@ -5703,8 +5703,15 @@ class H(BaseHTTPRequestHandler):
                         self.send_header("Cache-Control", "public, max-age=1209600")
                         self.end_headers()
                         self.wfile.write(idata)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        # 并发 socket 写异常（BrokenPipe/上游抖动）绝不可静默吞：静默丢响应头已发 200 但 body 缺失，
+                        # 客户端拿到「空 200」不触发 onerror 会白图；记录并强制关闭连接，避免半截响应被 keep-alive 复用污染后续请求
+                        try:
+                            import sys as _sys
+                            _sys.stderr.write("img-proxy write fail: %r\n" % (_e,))
+                        except Exception:
+                            pass
+                        self.close_connection = True
                     return
 
                 elif base == "/api/douban":
