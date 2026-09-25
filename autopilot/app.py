@@ -4389,6 +4389,7 @@ const DOUBAN_CATS={"movie":[["popular","🔥 热门"],["top_rated","⭐ 豆瓣�
 let discKind="all", discCat="popular", discPage=1, discTotal=1, discSource="tmdb";
 let discGenres=[], discCountry="", discYear="", discRating="", discRuntime="", discSort="pop";
 let discReqToken=0; // 请求令牌：丢弃过期响应，防快速切筛选时旧结果覆盖新结果
+let discLoading=false; // 无限滚动节流：正在加载下一页时为 true，防止滚动事件并发翻页
 
 function _genreList(){ return discKind==="tv"?GENRE_TV:GENRE_MOVIE; }
 function _catVisible(c){ if(c==="on_the_air"&&discKind==="movie")return false; if(c==="upcoming"&&discKind==="tv")return false; return true; }
@@ -4565,8 +4566,6 @@ function bindDiscEvents(){
         syncDiscControls(); markDiscDirty(); return; }
       if(e.target.closest("#clearAll")){ discGenres=[];discCountry="";discYear="";discRating="";discRuntime="";discSort="pop";
         discPage=1; syncDiscControls(); renderActiveChips(); clearDiscDirty(); loadDiscover(); return; }
-      const moreBtn=e.target.closest("#discMore button");
-      if(moreBtn){ discPage++; loadDiscover(true); return; }
       const addBtn=e.target.closest("button[data-add]");
       if(addBtn){ discAddClick(addBtn); return; }
       const card=e.target.closest(".card[data-detail]");
@@ -4643,19 +4642,20 @@ function loadDiscover(append, refresh){
     ? ("/api/douban?kind="+discKind+"&cat="+discCat+"&page="+discPage+flt)
     : ("/api/discover?kind="+discKind+"&cat="+discCat+"&page="+discPage+flt+(refresh?"&refresh=1":""));
   const my=++discReqToken;
+  discLoading=true;
   jget(qs).then(d=>{
     if(my!==discReqToken)return; // 过期响应丢弃，防快速切筛选时旧结果覆盖新结果
     if(d.configured===false){
       st.className="err";
       st.innerHTML='⚠️ 未配置 TMDB_API_KEY。请在「配置」页的 <code>TMDB API Key</code> 一栏填写'
         +'（免费，在 themoviedb.org 申请），保存后即时生效。';
-      if(g)g.innerHTML='<div class="errcard"><div class="t">需要先配置 TMDB API Key</div><div>配置后即可浏览发现墙与详情。</div></div>';if(more)more.innerHTML="";return;
+      if(g)g.innerHTML='<div class="errcard"><div class="t">需要先配置 TMDB API Key</div><div>配置后即可浏览发现墙与详情。</div></div>';if(more)more.innerHTML="";discLoading=false;return;
     }
-    if(!d.ok){st.className="err";st.textContent="❌ "+(d.error||"拉取失败");if(g)g.innerHTML='<div class="errcard"><div class="t">加载失败</div><div>'+esc(d.error||"拉取失败")+'</div><button class="btn" style="margin-top:10px" onclick="loadDiscover(false,true)">重试</button></div>';if(more)more.innerHTML="";return;}
+    if(!d.ok){st.className="err";st.textContent="❌ "+(d.error||"拉取失败");if(g)g.innerHTML='<div class="errcard"><div class="t">加载失败</div><div>'+esc(d.error||"拉取失败")+'</div><button class="btn" style="margin-top:10px" onclick="loadDiscover(false,true)">重试</button></div>';if(more)more.innerHTML="";discLoading=false;return;}
     const items=d.items||[];
     discPage=d.page||discPage;
     discTotal=d.totalPages||1;
-    if(!items.length){if(!append){st.textContent="暂无内容";if(g)g.innerHTML='<div class="empty"><div class="big">🔍</div>没有匹配的内容<br><span class="muted">换一组筛选条件，或清除当前筛选试试</span><br><button class="btn" style="margin-top:14px" onclick="clearDiscFilters()">清除筛选条件</button></div>';}if(more)more.innerHTML="";return;}
+    if(!items.length){if(!append){st.textContent="暂无内容";if(g)g.innerHTML='<div class="empty"><div class="big">🔍</div>没有匹配的内容<br><span class="muted">换一组筛选条件，或清除当前筛选试试</span><br><button class="btn" style="margin-top:14px" onclick="clearDiscFilters()">清除筛选条件</button></div>';}if(more)more.innerHTML="";discLoading=false;return;}
     const loaded=(append?(g?g.querySelectorAll(".card").length:0):0)+items.length;
     st.textContent="已加载 "+loaded+" 个"+(d.totalResults?(" · 共 "+d.totalResults+" 个"):"")+(fparts.length?(" · "+fparts.join(" · ")):"")+" · 点「添加下载」即加入队列";
     // 卡片批量构建 + 一次性 append（DocumentFragment）；事件由面板委托统一处理
@@ -4676,10 +4676,10 @@ function loadDiscover(append, refresh){
     if(more){
       more.innerHTML="";
       if(discPage<discTotal){
-        const mb=document.createElement("button");
-        mb.className="btn";mb.textContent="加载更多";
-        mb.style.width="100%";mb.style.margin="14px 0";
-        more.appendChild(mb);
+        const tip=document.createElement("div");
+        tip.className="muted";tip.style.textAlign="center";tip.style.margin="12px 0";
+        tip.textContent="下滑自动加载更多…";
+        more.appendChild(tip);
       }else if(discTotal>1){
         const tip=document.createElement("div");
         tip.className="muted";tip.style.textAlign="center";tip.style.margin="12px 0";
@@ -4687,8 +4687,23 @@ function loadDiscover(append, refresh){
         more.appendChild(tip);
       }
     }
-  }).catch(e=>{if(my!==discReqToken)return;st.className="err";st.textContent="❌ 请求失败: "+e;if(g)g.innerHTML='<div class="errcard"><div class="t">请求失败</div><div>'+esc(""+e)+'</div><button class="btn" style="margin-top:10px" onclick="loadDiscover(false,true)">重试</button></div>';if(more)more.innerHTML="";});
+    discLoading=false; discMaybeMore();
+  }).catch(e=>{if(my!==discReqToken)return;st.className="err";st.textContent="❌ 请求失败: "+e;if(g)g.innerHTML='<div class="errcard"><div class="t">请求失败</div><div>'+esc(""+e)+'</div><button class="btn" style="margin-top:10px" onclick="loadDiscover(false,true)">重试</button></div>';if(more)more.innerHTML="";discLoading=false;});
 }
+
+// 无限滚动：哨兵进入视口（提前 400px 预加载）即续拉下一页；加载后仍落在视口内则递归填满当前屏
+function discMaybeMore(){
+  if(discLoading)return;
+  if(discPage>=discTotal)return;
+  const more=document.getElementById("discMore");
+  if(!more)return;
+  const vh=(window.innerHeight||document.documentElement.clientHeight);
+  const rect=more.getBoundingClientRect();
+  if(rect.top>vh+300)return; // 哨兵离视口底部还远，等用户滚动再触发，避免一次拉空
+  discPage++; loadDiscover(true);
+}
+const discIO=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting)discMaybeMore();});},{rootMargin:"400px 0px"});
+discIO.observe(document.getElementById("discMore"));
 
 function openDetail(kind,tmdbId){
   const m=document.getElementById("discDetail"), body=document.getElementById("detailBody");
