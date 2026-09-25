@@ -4791,6 +4791,44 @@ function openDetail(kind,tmdbId){
     });
   }).catch(e=>{body.innerHTML='<div class="err" style="padding:24px">❌ 请求失败: '+esc(""+e)+'</div>';});
 }
+// 媒体库轻字幕弹窗：复用详情弹窗容器，只用片名查字幕（后端 search_subtitles 实际只用 name）
+function openSubtitle(kind, name){
+  const m=document.getElementById("discDetail"), body=document.getElementById("detailBody");
+  m.style.display="flex"; document.body.style.overflow="hidden";
+  body.innerHTML='<div class="detail-head"><div class="detail-title">💬 字幕 · '+esc(name||"")+'</div></div>'+
+    '<div class="detail-section"><div class="detail-h">字幕候选</div><div class="skeleton" style="height:40px;margin:8px 0"></div></div>';
+  const box=body.querySelector(".detail-section");
+  const q=encodeURIComponent(name||"");
+  const doSearch=()=>{
+    box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="skeleton" style="height:40px;margin:8px 0"></div>';
+    jget("/api/subtitle?kind="+kind+"&name="+q,18000).then(r=>{
+      if(!r||!r.ok){
+        box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="errcard"><div class="t">未找到字幕</div><div>'+(r&&r.error?esc(r.error):"暂无结果")+'</div><button class="btn" style="margin-top:10px" onclick="__retrySub()">重试</button></div>';
+        return;
+      }
+      const items=(r.items||[]).slice(0,15);
+      if(!items.length){
+        box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="empty"><div class="big">💬</div>未找到字幕<br><span class="muted">SubtitleCat 无匹配，可换片名或加季集重试</span></div>';
+        return;
+      }
+      box.innerHTML='<div class="detail-h">💬 字幕候选（'+items.length+'）</div>';
+      items.forEach(it=>{
+        const b=document.createElement("button");
+        b.className="btn ghost"; b.style.margin="4px";
+        b.textContent=(it.lang||"?")+" · "+(it.source||"")+" · "+esc((it.title||"").slice(0,40));
+        b.onclick=()=>{ window.location="/api/subtitle/download?url="+encodeURIComponent(it.url)+"&source="+encodeURIComponent(it.source)+"&name="+encodeURIComponent(it.title||"subtitle"); };
+        box.appendChild(b);
+      });
+      (r.warns||[]).forEach(w=>{ const wd=document.createElement("div"); wd.className="muted"; wd.style.margin="6px 0"; wd.textContent="⚠️ "+w; box.appendChild(wd); });
+    }).catch(e=>{
+      const to=(e&&e.name==="AbortError");
+      box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="errcard"><div class="t">'+(to?"字幕源响应慢":"字幕搜索失败")+'</div><div>'+(to?"SubtitleCat 未及时返回，请稍后重试或换片名。":"错误："+esc(""+e))+'</div><button class="btn" style="margin-top:10px" onclick="__retrySub()">重试</button></div>';
+    });
+  };
+  window.__retrySub=doSearch;
+  doSearch();
+}
+
 function closeDetail(){
   const m=document.getElementById("discDetail");
   if(m)m.style.display="none";
@@ -5019,11 +5057,12 @@ function renderLib(){
     else if(st==="waiting") badge='<span class="badge wait">⏳ 待源</span>';
     else badge='<span class="badge off">未监控</span>';
     const resBtn = st!=="downloaded" ? '<button class="btn ghost" data-res="'+m.id+'">重新搜索</button>' : "";
+    const subBtn='<button class="btn ghost" data-sub="movie" data-name="'+escAttr(m.title||"")+'">下载字幕</button>';
     return buildCard({
       poster:m.poster, title:m.title, kind:"movie",
       sub:(m.year||"")+(m.quality?' · '+m.quality:""),
       badges:[badge],
-      acts:'<button class="btn danger" data-del="'+m.id+'">移除</button>'+resBtn
+      acts:'<button class="btn danger" data-del="'+m.id+'">移除</button>'+resBtn+subBtn
     });
   }).join("");
   box.querySelectorAll("button[data-del]").forEach(b=>{
@@ -5045,6 +5084,9 @@ function renderLib(){
         setTimeout(()=>{loadLibrary();},1500);
       }).catch(()=>{b.disabled=false;b.textContent="重新搜索";});
     };
+  });
+  box.querySelectorAll("button[data-sub]").forEach(b=>{
+    b.onclick=function(){ openSubtitle(b.getAttribute("data-sub"), b.getAttribute("data-name")); };
   });
   const moreBox=document.getElementById("libMore");
   if(items.length>_libPage){
@@ -5105,12 +5147,13 @@ function renderSeries(){
     else if(st==="waiting")badge='<span class="badge wait">⏳ 待源</span>';
     else badge='<span class="badge off">未监控</span>';
     const resBtn=st!=="downloaded"?'<button class="btn ghost" data-res="'+m.id+'">重新搜索</button>':"";
+    const subBtn='<button class="btn ghost" data-sub="tv" data-name="'+escAttr(m.title||"")+'">下载字幕</button>';
     const ep=m.totalEpisodeCount?((m.episodeFileCount||0)+"/"+m.totalEpisodeCount+" 集"):"";
     return buildCard({
       poster:m.poster, title:m.title, kind:"tv",
       sub:(m.year||"")+(ep?' · '+ep:"")+(m.network?' · '+esc(m.network):""),
       badges:[badge],
-      acts:'<button class="btn danger" data-del="'+m.id+'">移除</button>'+resBtn
+      acts:'<button class="btn danger" data-del="'+m.id+'">移除</button>'+resBtn+subBtn
     });
   }).join("");
   box.querySelectorAll("button[data-del]").forEach(b=>{
@@ -5132,6 +5175,9 @@ function renderSeries(){
         setTimeout(()=>{loadSeriesLibrary();},1500);
       }).catch(()=>{b.disabled=false;b.textContent="重新搜索";});
     };
+  });
+  box.querySelectorAll("button[data-sub]").forEach(b=>{
+    b.onclick=function(){ openSubtitle(b.getAttribute("data-sub"), b.getAttribute("data-name")); };
   });
   const moreBox=document.getElementById("libMore");
   if(items.length>_tvPage){
