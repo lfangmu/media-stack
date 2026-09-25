@@ -894,6 +894,25 @@ def _resolve_tmdb_by_title(kind, title):
     return res[0].get("id")
 
 
+def _subtitle_en_name(kind, name):
+    """中文片名经 TMDB 解析英文原名，用于 SubtitleCat 搜英文字幕。
+    华语片 original 仍是中文则返回 None（SubtitleCat 无中文资源，留待 assrt 等中文源）。"""
+    if not TMDB_KEY or not name:
+        return None
+    if not re.search(r'[\u4e00-\u9fff]', name):
+        return None
+    tid = _resolve_tmdb_by_title(kind, name)
+    if not tid:
+        return None
+    d = tmdb_detail(kind, tid)
+    if not d or not d.get("ok"):
+        return None
+    en = d.get("originalTitle") if kind != "tv" else d.get("originalName")
+    if en and en != name and re.search(r'[a-zA-Z]', en):
+        return en
+    return None
+
+
 def discover_add(kind="movie", tmdb_id=None, name=None, profile=None, root_folder=None, season_mode="all"):
     """发现墙一键添加：电影直接走 add_movie；剧集先取 tvdbId 再走 add_series。
     tmdb_id 优先；缺省时用 name 经 TMDB 搜索解析（豆瓣卡片走此路）。"""
@@ -5811,6 +5830,18 @@ class H(BaseHTTPRequestHandler):
                                                   season=(sseason or None), episode=(sepisode or None), lang="zh")
                     except Exception as e:
                         self._send(200, {"ok": False, "error": str(e)}); return
+                    # 中文名兜底：SubtitleCat 无中文资源，经 TMDB 映射英文原名再搜一次（好莱坞译名片可用）
+                    if (not res.get("ok") or not res.get("items")) and re.search(r'[\u4e00-\u9fff]', sname or ""):
+                        en = _subtitle_en_name(skind, sname)
+                        if en:
+                            try:
+                                res2 = _sh.search_subtitles(name=en, tmdbId=None,
+                                                          season=(sseason or None), episode=(sepisode or None), lang="zh")
+                            except Exception:
+                                res2 = None
+                            if res2 and res2.get("items"):
+                                res = res2
+                                res.setdefault("warns", []).append("已用英文名「%s」在 SubtitleCat 检索（该站无中文资源）" % en)
                     self._send(200, res); return
                 elif base == "/api/subtitle/download":
                     surl = (_qs.get("url") or [""])[0]
