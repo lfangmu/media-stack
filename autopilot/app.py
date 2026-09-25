@@ -5202,6 +5202,7 @@ function renderCalendar(){
   const hd=document.querySelector(".cal-head");if(hd)hd.style.display="";
   const wk=document.querySelector(".cal-week");if(wk)wk.style.display="";
   const box=document.getElementById("calGrid");
+  box.style.display=""; /* 恢复 7 列降级网格（FC 模式会临时改成 block） */
   document.getElementById("calTitle").textContent=_calY+"年"+(_calM+1)+"月";
   const firstDow=(new Date(_calY,_calM,1).getDay()+6)%7;
   const days=new Date(_calY,_calM+1,0).getDate();
@@ -5244,6 +5245,7 @@ function renderCalendarFC(){
   const toEv=(date,e)=>({title:(e.kind==="tv"?"📺 ":"🎬 ")+e.title,date:date,kind:e.kind,
     tmdbId:e.tmdbId, color:e.kind==="tv"?"var(--warn-strong)":"var(--accent)"});
   if(_fcInst){try{_fcInst.destroy();}catch(e){}_fcInst=null;}
+  box.style.display="block"; /* calGrid 默认 7 列降级网格，FC 容器会被当成首个 grid item 限成 1 列宽 */
   box.innerHTML="";
   const el=document.createElement("div");box.appendChild(el);
   _fcInst=new FullCalendar.Calendar(el,{
