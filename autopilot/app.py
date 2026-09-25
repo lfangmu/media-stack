@@ -3731,6 +3731,9 @@ PAGE = r"""<!doctype html>
   .mbtn{padding:5px 13px;border-radius:6px;background:transparent;border:none;color:var(--text-2);
         cursor:pointer;font-size:13px;font-weight:600;font-family:inherit}
   .mbtn.active{background:var(--accent);color:var(--on-accent)}
+  .ltbtn{padding:5px 13px;border-radius:6px;background:transparent;border:none;color:var(--text-2);
+        cursor:pointer;font-size:13px;font-weight:600;font-family:inherit}
+  .ltbtn.active{background:var(--accent);color:var(--on-accent)}
   .sdot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:middle}
   .sdot.ok{background:var(--ok-text)}
   .sdot.err{background:var(--err-text)}
@@ -3945,8 +3948,9 @@ PAGE = r"""<!doctype html>
   <!-- 媒体库 -->
   <div class="panel" id="p-library">
     <div class="filters" id="libMode" style="margin-bottom:12px">
-      <button class="mbtn active" data-m="movie">🎬 电影</button>
-      <button class="mbtn" data-m="tv">📺 剧集</button>
+      <button class="ltbtn active" data-t="all">📚 全部</button>
+      <button class="ltbtn" data-t="movie">🎬 电影</button>
+      <button class="ltbtn" data-t="tv">📺 剧集</button>
     </div>
     <div class="row">
       <button class="btn ghost" onclick="loadLibrary()">刷新</button>
@@ -4159,15 +4163,10 @@ function setMode(m){
   MODE=m;
   document.querySelectorAll(".mbtn").forEach(x=>x.classList.toggle("active",x.dataset.m===m));
   document.getElementById("term").placeholder=PH[m];
-  const libTab=document.querySelector('.tab[data-p="library"]');
-  if(libTab)libTab.textContent=(m==="tv"?"📺 剧集库":"🎞️ 媒体库");
   document.getElementById("seasonMode").style.display=(m==="tv"?"":"none");
   document.getElementById("cands").innerHTML="";
   setStatus("");
   loadProfiles();loadRootFolders();loadQueue();
-  if(CUR==="library"){
-    if(m==="tv")loadSeriesLibrary();else loadLibrary();
-  }
 }
 
 // tabs
@@ -4183,7 +4182,7 @@ function switchTo(p){
   const g=NAV_GROUP(p),n=NAV_NAME(p);
   document.getElementById("crumb").innerHTML=g+' <span style="opacity:.5">›</span> <b>'+n+'</b>';
   if(p==="queue")loadQueue();
-  else if(p==="library"){ if(MODE==="tv")loadSeriesLibrary(); else loadLibrary(); }
+  else if(p==="library"){ loadLibrary(); }
   else if(p==="status"){loadSystem();}
   else if(p==="history"){loadHistory();}
   else if(p==="indexers"){loadIndexers();}
@@ -4200,7 +4199,7 @@ document.getElementById("bell").onclick=()=>{ switchTo("notify"); };
 
 // 顶栏刷新：重跑当前页加载器
 function topRefresh(){
-  const m={queue:loadQueue,library:()=>MODE==="tv"?loadSeriesLibrary():loadLibrary(),status:loadSystem,
+  const m={queue:loadQueue,library:()=>loadLibrary(),status:loadSystem,
     history:loadHistory,indexers:loadIndexers,calendar:loadCalendar,discover:()=>loadDiscover(),
     config:apLoadConfig,dashboard:loadDashboard,manual:loadManual,rules:renderRules,notify:loadNotify,search:()=>{}};
   (m[CUR]||function(){})();
@@ -5053,9 +5052,10 @@ function watchAdded(title){
   _watchTimer=setInterval(tick,4000);
 }
 
-let _libItems=[];
-let _libFilter="all";
-const LIB_PAGE=60; let _libPage=LIB_PAGE; let _tvPage=LIB_PAGE;
+let _libItems=[];          // 合并：电影 + 剧集，每项带 kind 字段
+let _libType="all";        // 类型筛选：all / movie / tv
+let _libFilter="all";      // 状态筛选：all / downloaded / downloading / waiting / off
+const LIB_PAGE=60; let _libPage=LIB_PAGE;
 function libState(m){
   if(m.downloaded)return "downloaded";
   if(m.downloading)return "downloading";
@@ -5064,40 +5064,51 @@ function libState(m){
 }
 function renderLib(){
   const box=document.getElementById("lib");
-  const items=_libItems.filter(m=>_libFilter==="all"||libState(m)===_libFilter);
-  if(!_libItems.length){box.innerHTML='<div class="muted">媒体库为空。</div>';return;}
-  if(!items.length){box.innerHTML='<div class="muted">该筛选下没有影片。</div>';return;}
+  const items=_libItems.filter(m=>(_libType==="all"||m.kind===_libType)&&(_libFilter==="all"||libState(m)===_libFilter));
+  if(!_libItems.length){box.innerHTML='<div class="muted">媒体库为空。去「🔍 搜索下载」添加影片或剧集。</div>';return;}
+  if(!items.length){box.innerHTML='<div class="muted">该筛选下没有内容。</div>';return;}
   const shown=items.slice(0,_libPage);
   box.innerHTML=shown.map(m=>{
     const st=libState(m);
+    const k=m.kind;
     let badge="";
     if(st==="downloaded") badge='<span class="badge ok">已下载</span>';
     else if(st==="downloading") badge='<span class="badge dl">⬇️ 下载中</span>';
     else if(st==="waiting") badge='<span class="badge wait">⏳ 待源</span>';
     else badge='<span class="badge off">未监控</span>';
-    const resBtn = st!=="downloaded" ? '<button class="btn ghost" data-res="'+m.id+'">重新搜索</button>' : "";
-    const subBtn='<button class="btn ghost" data-sub="movie" data-name="'+escAttr(m.title||"")+'">下载字幕</button>';
+    const resBtn = st!=="downloaded" ? '<button class="btn ghost" data-res="'+m.id+'" data-kind="'+k+'">重新搜索</button>' : "";
+    const subBtn='<button class="btn ghost" data-sub="'+k+'" data-name="'+escAttr(m.title||"")+'">下载字幕</button>';
+    let sub=(m.year||"");
+    if(k==="tv"){
+      const ep=m.totalEpisodeCount?((m.episodeFileCount||0)+"/"+m.totalEpisodeCount+" 集"):"";
+      sub+=(ep?' · '+ep:"")+(m.network?' · '+esc(m.network):"");
+    }else{
+      sub+=(m.quality?' · '+m.quality:"");
+    }
     return buildCard({
-      poster:m.poster, title:m.title, kind:"movie",
-      sub:(m.year||"")+(m.quality?' · '+m.quality:""),
+      poster:m.poster, title:m.title, kind:k,
+      sub:sub,
       badges:[badge],
-      acts:'<button class="btn danger" data-del="'+m.id+'">移除</button>'+resBtn+subBtn
+      acts:'<button class="btn danger" data-del="'+m.id+'" data-kind="'+k+'">移除</button>'+resBtn+subBtn
     });
   }).join("");
   box.querySelectorAll("button[data-del]").forEach(b=>{
     b.onclick=function(){
       const id=b.getAttribute("data-del");
+      const k=b.getAttribute("data-kind");
       const t=b.closest(".card").querySelector(".t").textContent;
-      if(confirm("移除《"+t+"》？")){
-        fetch("/api/movie/"+id,{method:"DELETE",headers:authHdr()}).then(()=>{toast("已移除");loadLibrary();});
+      const warn=k==="tv"?"该剧已下载的文件也会一并删除。":"";
+      if(confirm("移除《"+t+"》？"+warn)){
+        fetch("/api/"+k+"/"+id,{method:"DELETE",headers:authHdr()}).then(()=>{toast("已移除");loadLibrary();});
       }
     };
   });
   box.querySelectorAll("button[data-res]").forEach(b=>{
     b.onclick=function(){
       const id=b.getAttribute("data-res");
+      const k=b.getAttribute("data-kind");
       b.disabled=true;b.textContent="搜索中…";
-      fetch("/api/movie/"+id+"/search",{method:"POST",headers:authHdr()}).then(()=>{
+      fetch("/api/"+k+"/"+id+"/search",{method:"POST",headers:authHdr()}).then(()=>{
         toast("已触发重新搜索，稍后看队列/媒体库更新","ok");
         b.textContent="✓ 已触发";
         setTimeout(()=>{loadLibrary();},1500);
@@ -5114,20 +5125,19 @@ function renderLib(){
   }else moreBox.innerHTML="";
 }
 function loadLibrary(){
-  jget("/api/movies").then(d=>{
-    _libItems=d.movies||[];
+  Promise.all([jget("/api/movies"), jget("/api/series")]).then(([mv, tv])=>{
+    const movies=(mv.movies||[]).map(x=>Object.assign({},x,{kind:"movie"}));
+    const series=(tv.series||[]).map(x=>Object.assign({},x,{kind:"tv"}));
+    _libItems=movies.concat(series);
     _libPage=LIB_PAGE;
     renderLib();
   }).catch(e=>{document.getElementById("lib").innerHTML='<div class="err">加载失败: '+e+'</div>';});
 }
 
-// 批量重新搜索：对所有「待源（已监控但未下载）」条目触发一次搜索
+// 批量重新搜索：对所有「待源（已监控但未下载）」条目触发一次搜索（电影+剧集统一）
 function bulkRescan(){
   const btn=document.getElementById("bulkRescan");
-  const isTv=MODE==="tv";
-  const items=isTv?_tvItems:_libItems;
-  const stFn=isTv?tvState:libState;
-  const waiting=items.filter(m=>stFn(m)==="waiting");
+  const waiting=_libItems.filter(m=>libState(m)==="waiting");
   if(!waiting.length){toast("没有待源条目需要重搜","ok");return;}
   if(!confirm("对 "+waiting.length+" 个待源条目批量重新搜索？"))return;
   if(btn){btn.disabled=true;btn.textContent="重搜中…";}
@@ -5135,82 +5145,13 @@ function bulkRescan(){
   const finish=()=>{ if(done+fail===total){
     if(btn){btn.disabled=false;btn.textContent="批量重搜";}
     toast("批量重搜：成功 "+done+" / 失败 "+fail,"ok");
-    setTimeout(()=>{ if(MODE==="tv")loadSeriesLibrary();else loadLibrary(); },1500);
+    setTimeout(()=>{loadLibrary();},1500);
   }};
   waiting.forEach(m=>{
-    const url=isTv?("/api/series/"+m.id+"/search"):("/api/movie/"+m.id+"/search");
-    fetch(url,{method:"POST",headers:authHdr()}).then(()=>{done++;}).catch(()=>{fail++;}).finally(finish);
+    fetch("/api/"+m.kind+"/"+m.id+"/search",{method:"POST",headers:authHdr()}).then(()=>{done++;}).catch(()=>{fail++;}).finally(finish);
   });
 }
 
-// ---- 剧集库（Sonarr） ----
-let _tvItems=[];
-let _tvFilter="all";
-function tvState(m){
-  if(m.downloaded)return "downloaded";
-  if(m.downloading)return "downloading";
-  if(m.monitored)return "waiting";
-  return "off";
-}
-function renderSeries(){
-  const box=document.getElementById("lib");
-  const items=_tvItems.filter(m=>_tvFilter==="all"||tvState(m)===_tvFilter);
-  if(!_tvItems.length){box.innerHTML='<div class="muted">剧集库为空。切到「🔍 搜索下载」，用顶部「📺 剧集」模式添加即可。</div>';return;}
-  if(!items.length){box.innerHTML='<div class="muted">该筛选下没有剧集。</div>';return;}
-  const shown=items.slice(0,_tvPage);
-  box.innerHTML=shown.map(m=>{
-    const st=tvState(m);
-    let badge="";
-    if(st==="downloaded")badge='<span class="badge ok">已下载</span>';
-    else if(st==="downloading")badge='<span class="badge dl">⬇️ 下载中</span>';
-    else if(st==="waiting")badge='<span class="badge wait">⏳ 待源</span>';
-    else badge='<span class="badge off">未监控</span>';
-    const resBtn=st!=="downloaded"?'<button class="btn ghost" data-res="'+m.id+'">重新搜索</button>':"";
-    const subBtn='<button class="btn ghost" data-sub="tv" data-name="'+escAttr(m.title||"")+'">下载字幕</button>';
-    const ep=m.totalEpisodeCount?((m.episodeFileCount||0)+"/"+m.totalEpisodeCount+" 集"):"";
-    return buildCard({
-      poster:m.poster, title:m.title, kind:"tv",
-      sub:(m.year||"")+(ep?' · '+ep:"")+(m.network?' · '+esc(m.network):""),
-      badges:[badge],
-      acts:'<button class="btn danger" data-del="'+m.id+'">移除</button>'+resBtn+subBtn
-    });
-  }).join("");
-  box.querySelectorAll("button[data-del]").forEach(b=>{
-    b.onclick=function(){
-      const id=b.getAttribute("data-del");
-      const t=b.closest(".card").querySelector(".t").textContent;
-      if(confirm("移除《"+t+"》？该剧已下载的文件也会一并删除。")){
-        fetch("/api/series/"+id,{method:"DELETE",headers:authHdr()}).then(()=>{toast("已移除");loadSeriesLibrary();});
-      }
-    };
-  });
-  box.querySelectorAll("button[data-res]").forEach(b=>{
-    b.onclick=function(){
-      const id=b.getAttribute("data-res");
-      b.disabled=true;b.textContent="搜索中…";
-      fetch("/api/series/"+id+"/search",{method:"POST",headers:authHdr()}).then(()=>{
-        toast("已触发重新搜索，稍后看队列/剧集库更新","ok");
-        b.textContent="✓ 已触发";
-        setTimeout(()=>{loadSeriesLibrary();},1500);
-      }).catch(()=>{b.disabled=false;b.textContent="重新搜索";});
-    };
-  });
-  box.querySelectorAll("button[data-sub]").forEach(b=>{
-    b.onclick=function(){ openSubtitle(b.getAttribute("data-sub"), b.getAttribute("data-name")); };
-  });
-  const moreBox=document.getElementById("libMore");
-  if(items.length>_tvPage){
-    moreBox.innerHTML='<button class="btn ghost" id="libMoreBtn">显示更多（剩余 '+(items.length-_tvPage)+'）</button>';
-    document.getElementById("libMoreBtn").onclick=()=>{_tvPage+=LIB_PAGE;renderSeries();};
-  }else moreBox.innerHTML="";
-}
-function loadSeriesLibrary(){
-  jget("/api/series").then(d=>{
-    _tvItems=d.series||[];
-    _tvPage=LIB_PAGE;
-    renderSeries();
-  }).catch(e=>{document.getElementById("lib").innerHTML='<div class="err">加载失败（Sonarr 未就绪？）: '+e+'</div>';});
-}
 
 // 各服务的对外端口（用于生成直达链接），与 docker-compose 保持一致
 const SVC_PORTS={radarr:7878,sonarr:8989,prowlarr:9696,qbittorrent:8085,flaresolverr:8191};
@@ -5618,9 +5559,18 @@ document.querySelectorAll("#libFilters .fbtn").forEach(b=>{
   b.onclick=()=>{
     document.querySelectorAll("#libFilters .fbtn").forEach(x=>x.classList.remove("active"));
     b.classList.add("active");
-    _libFilter=_tvFilter=b.getAttribute("data-f");
-    _libPage=_tvPage=LIB_PAGE;
-    if(MODE==="tv")renderSeries();else renderLib();
+    _libFilter=b.getAttribute("data-f");
+    _libPage=LIB_PAGE;
+    renderLib();
+  };
+});
+document.querySelectorAll("#libMode .ltbtn").forEach(b=>{
+  b.onclick=()=>{
+    document.querySelectorAll("#libMode .ltbtn").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active");
+    _libType=b.getAttribute("data-t");
+    _libPage=LIB_PAGE;
+    renderLib();
   };
 });
 </script>
