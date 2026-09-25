@@ -87,11 +87,25 @@ def guess_lang(name):
     return ""
 
 
+_SUBTITLE_BLOCKLIST = ("jav", "whisperjav", "uncensored", "mosaic", "censored",
+                       "hentai", "porn", "xxx", "fc2", "caribbean", "heyzo",
+                       "1pon", "paco", "muramura", "javbus", "erodu",
+                       "redtub", "xham", "xnxx", "youporn", "pornhub",
+                       "blowjob", "fuck", "cock", "pussy", "nude", "naked", "erotic")
+
+
+def _is_adult(title):
+    """站点的搜索结果混入大量 JAV/色情字幕，按文件名黑名单过滤。"""
+    t = (title or "").lower()
+    return any(k in t for k in _SUBTITLE_BLOCKLIST)
+
+
 def search_subtitlecat(query, limit=8, budget=15):
     """列表页 -> 每项详情页解析 download_sub -> 扁平候选（含直链）。返回 (items, err)。
-    budget: 整体耗时预算（秒），到时即停止继续拉详情页（返回已拿到的部分结果，防慢源卡死请求）。"""
+    budget: 整体耗时预算（秒），到时即停止继续拉详情页（返回已拿到的部分结果，防慢源卡死请求）。
+    注意：正确搜索参数是 ?search=，旧的 searchin/searchword 已被站点忽略（永远返回首页默认列表）。"""
     deadline = time.monotonic() + budget
-    url = "%s/index.php?searchin=1&searchword=%s" % (_SITE, _quote(query))
+    url = "%s/index.php?search=%s" % (_SITE, _quote(query))
     raw, err = _http_get(url)
     if err:
         return [], err
@@ -115,6 +129,8 @@ def search_subtitlecat(query, limit=8, budget=15):
             lang_code = dm.group(1)
             fname = dm.group(2)
             ddir = dm.group(3)
+            if _is_adult(fname):
+                continue
             direct = "%s%s%s" % (_SITE, ddir, fname)
             items.append({
                 "source": "subtitlecat",
