@@ -2141,6 +2141,111 @@ def _ver_of(rq, path):
         return False, str(e)[:90]
 
 
+def _qb_session():
+    """qBittorrent v5 会话：Cookie 名为 QBT_SID_<port>，返回带 Cookie/CSRF 的请求头。
+
+    失败返回 None。登录逻辑在多个调用点复用，避免各自复制一份。
+    """
+    try:
+        data = urlencode({"username": QBIT_USER, "password": QBIT_PASS}).encode()
+        req = Request(QBIT_URL + "/api/v2/auth/login", data=data,
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urlopen(req, timeout=10, context=SSL_CTX) as r:
+            ck = r.headers.get("Set-Cookie", "")
+    except Exception:
+        return None
+    m = re.search(r"(QBT_SID_\d+=[^;]+)", ck or "") or re.search(r"(SID=[^;]+)", ck or "")
+    if not m:
+        return None
+    cm = re.search(r"(csrftoken=[^;]+)", ck or "")
+    hdrs = {"Cookie": m.group(1) + ("; " + cm.group(1) if cm else "")}
+    if cm:
+        hdrs["X-Csrftoken"] = cm.group(1).split("=", 1)[1]
+    return hdrs
+
+
+def _qb_get(path, timeout=15):
+    """带会话头 GET 一个 qB API 路径，返回解析后的 JSON；失败返回 None。"""
+    hdrs = _qb_session()
+    if not hdrs:
+        return None
+    try:
+        with urlopen(Request(QBIT_URL + path, headers=hdrs),
+                     timeout=timeout, context=SSL_CTX) as r:
+            return json.loads(r.read().decode() or "null")
+    except Exception:
+        return None
+
+
+# ---- 做种率报告（冷门资源一眼可见） ----
+_SEED_CACHE = {"t": 0.0, "data": None}
+
+
+def _gb(n):
+    try:
+        return float(n or 0) / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def seed_report(force=False):
+    """拉 qB 全量种子，算做种人数分布与冷门清单。单次 torrents/info 即可，无需逐 hash 拉 peers。"""
+    now = time.time()
+    if (not force) and _SEED_CACHE["data"] and (now - _SEED_CACHE["t"]) < 60:
+        return _SEED_CACHE["data"]
+    try:
+        lst = _qb_get("/api/v2/torrents/info", timeout=20) or []
+    except Exception as e:
+        return {"rows": [], "summary": {}, "error": "qBittorrent 不可达: %s" % str(e)[:120]}
+    if not isinstance(lst, list):
+        return {"rows": [], "summary": {}, "error": "qBittorrent 返回异常"}
+
+    rows = []
+    for t in lst:
+        seeds = int(t.get("num_seeds") or 0)
+        leechers = int(t.get("num_leechers") or 0)
+        progress = float(t.get("progress") or 0)
+        done = progress >= 0.999
+        rows.append({
+            "hash": t.get("hash") or "",
+            "name": t.get("name") or "(未命名)",
+            "seeds": seeds,
+            "leechers": leechers,
+            "progress": round(progress * 100, 1),
+            "done": done,
+            "state": t.get("state") or "",
+            "ratio": round(float(t.get("ratio") or 0), 2),
+            "size": round(_gb(t.get("size")), 2),
+            "category": t.get("category") or "",
+            "added": int(t.get("added_on") or 0),
+            "cold": bool(done and seeds <= 1 and leechers == 0),
+            "noseed": bool(done and seeds == 0),
+        })
+    # 默认视图：最冷门优先（种子少 → 加入早）
+    rows.sort(key=lambda r: (r["seeds"], r["added"]))
+    seeding = [r for r in rows if r["done"]]
+    cold = [r for r in seeding if r["cold"]]
+    noseed = [r for r in seeding if r["noseed"]]
+    tot_seeds = sum(r["seeds"] for r in seeding)
+    summary = {
+        "total": len(rows),
+        "done": len(seeding),
+        "downloading": len(rows) - len(seeding),
+        "cold": len(cold),
+        "noseed": len(noseed),
+        "avgSeeds": round(tot_seeds / len(seeding), 2) if seeding else 0.0,
+        "sumSeeds": tot_seeds,
+        "zeroSeed": sum(1 for r in seeding if r["seeds"] == 0),
+        "coldSize": round(sum(r["size"] for r in cold), 2),
+        "seedingSize": round(sum(r["size"] for r in seeding), 2),
+        "wall": int(time.time()),
+    }
+    out = {"rows": rows, "summary": summary}
+    _SEED_CACHE["data"] = out
+    _SEED_CACHE["t"] = now
+    return out
+
+
 def _qbit_status():
     """qBittorrent：v5 会话 Cookie 名为 QBT_SID_<port>，POST 需 CSRF。"""
     try:
@@ -3981,6 +4086,8 @@ PAGE = r"""<!doctype html>
   .queue-item .top{display:flex;justify-content:space-between;gap:10px;align-items:center}
   .queue-item .top b{font-size:14px}
   .queue-item .sub{color:var(--text-3);font-size:12px;margin-top:4px;display:flex;gap:14px;flex-wrap:wrap}
+  /* 做种报告：无人做种的冷门资源，边框标黄，扫一眼就知道该不该删 */
+  .queue-item.cold{border-color:var(--warn-border)}
   .bar{height:7px;background:var(--border-2);border-radius:4px;overflow:hidden;margin-top:8px}
   .bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--ok-text));transition:width .5s}
   .cal-head{display:flex;align-items:center;gap:12px;margin-bottom:10px}
@@ -4094,6 +4201,7 @@ PAGE = r"""<!doctype html>
     <div class="navgrp">概览</div>
     <div class="navitem" data-p="dashboard"><span class="ic">📈</span><span class="lb">仪表盘</span><span class="tag-new">新</span></div>
     <div class="navitem" data-p="history"><span class="ic">📜</span><span class="lb">抓取历史</span></div>
+    <div class="navitem" data-p="seeds"><span class="ic">🌱</span><span class="lb">做种报告</span><span class="tag-new">新</span></div>
     <div class="navgrp">系统</div>
     <div class="navitem" data-p="notify"><span class="ic">🔔</span><span class="lb">通知</span><span class="tag-new">新</span></div>
     <div class="navitem" data-p="indexers"><span class="ic">🛰️</span><span class="lb">索引器</span></div>
@@ -4221,6 +4329,32 @@ PAGE = r"""<!doctype html>
     <div class="row"><button class="btn ghost" onclick="loadHistory()">刷新</button>
       <span class="muted">最近抓取 / 入库 / 失败记录（电影与剧集合并，按时间倒序）</span></div>
     <div id="history"></div>
+  </div>
+
+  <!-- 做种报告（qB 真实做种人数 / 冷门资源） -->
+  <div class="panel" id="p-seeds">
+    <div class="section-title">做种报告 <span class="sub">直接读 qBittorrent 种子列表，按真实做种人数排序，冷门资源一眼可见</span></div>
+    <div id="seedSummary"></div>
+    <div class="row" style="margin:10px 0">
+      <button class="btn ghost" onclick="loadSeedReport(true)">强制刷新</button>
+      <button class="btn ghost" onclick="loadSeedReport()">刷新</button>
+      <span class="muted" id="seedAt"></span>
+    </div>
+    <div class="filters" id="seedFilters">
+      <span class="muted" style="align-self:center">筛选：</span>
+      <button class="fbtn" data-f="all">全部</button>
+      <button class="fbtn" data-f="cold">🥶 无人做种</button>
+      <button class="fbtn" data-f="down">⬇️ 下载中</button>
+      <button class="fbtn" data-f="done">✅ 已下载完</button>
+    </div>
+    <div class="filters" style="margin-top:6px" id="seedSorts">
+      <span class="muted" style="align-self:center">排序：</span>
+      <button class="fbtn" data-s="seeds">最冷门优先</button>
+      <button class="fbtn" data-s="ratio">分享率最低</button>
+      <button class="fbtn" data-s="new">最近加入</button>
+      <button class="fbtn" data-s="size">体积最大</button>
+    </div>
+    <div id="seedList" style="margin-top:12px"></div>
   </div>
 
   <!-- 索引器只读健康 -->
@@ -4424,8 +4558,8 @@ function setMode(m){
 }
 
 // tabs
-function NAV_GROUP(p){return ({discover:"影视获取",search:"影视获取",calendar:"影视获取",library:"内容管理",queue:"内容管理",manual:"内容管理",rules:"内容管理",dashboard:"概览",history:"概览",notify:"系统",indexers:"系统",status:"系统",config:"系统"})[p]||"";}
-function NAV_NAME(p){return ({discover:"发现",search:"搜索下载",calendar:"日历",library:"媒体库",queue:"下载队列",manual:"手动整理",rules:"下载过滤规则",dashboard:"仪表盘",history:"抓取历史",notify:"通知",indexers:"索引器",status:"系统状态",config:"配置"})[p]||p;}
+function NAV_GROUP(p){return ({discover:"影视获取",search:"影视获取",calendar:"影视获取",library:"内容管理",queue:"内容管理",manual:"内容管理",rules:"内容管理",dashboard:"概览",history:"概览",seeds:"概览",notify:"系统",indexers:"系统",status:"系统",config:"系统"})[p]||"";}
+function NAV_NAME(p){return ({discover:"发现",search:"搜索下载",calendar:"日历",library:"媒体库",queue:"下载队列",manual:"手动整理",rules:"下载过滤规则",dashboard:"仪表盘",history:"抓取历史",seeds:"做种报告",notify:"通知",indexers:"索引器",status:"系统状态",config:"配置"})[p]||p;}
 let CUR="search";
 function switchTo(p){
   CUR=p;
@@ -4439,6 +4573,7 @@ function switchTo(p){
   else if(p==="library"){ loadLibrary(); }
   else if(p==="status"){loadSystem();}
   else if(p==="history"){loadHistory();}
+  else if(p==="seeds"){loadSeedReport();}
   else if(p==="indexers"){loadIndexers();}
   else if(p==="calendar"){loadCalendar();}
   else if(p==="discover"){ renderDiscChips(); clearDiscDirty(); loadDiscover(); }
@@ -4454,7 +4589,7 @@ document.getElementById("bell").onclick=()=>{ switchTo("notify"); };
 // 顶栏刷新：重跑当前页加载器
 function topRefresh(){
   const m={queue:loadQueue,library:()=>loadLibrary(),status:loadSystem,
-    history:loadHistory,indexers:loadIndexers,calendar:loadCalendar,discover:()=>loadDiscover(),
+    history:loadHistory,indexers:loadIndexers,calendar:loadCalendar,discover:()=>loadDiscover(),seeds:loadSeedReport,
     config:apLoadConfig,dashboard:loadDashboard,manual:loadManual,rules:loadRules,notify:loadNotify,search:()=>{}};
   (m[CUR]||function(){})();
   if(CUR!=="search")toast("已刷新");
@@ -5748,6 +5883,82 @@ function enableAllIndexers(){
     });
   }).catch(()=>{toast("❌ 读取索引器失败","err");if(btn){btn.disabled=false;btn.textContent="全部重启用失效索引器";}});
 }
+// ===== 做种报告：qB 真实做种人数 / 冷门资源 =====
+let _seedRows=[],_seedFilter="all",_seedSort="seeds",_seedAll=false;
+function _ago(sec){ if(!sec)return "—"; const d=Date.now()/1000-sec;
+  if(d<3600)return Math.max(1,Math.round(d/60))+" 分钟前";
+  if(d<86400)return Math.round(d/3600)+" 小时前";
+  return Math.round(d/86400)+" 天前"; }
+function loadSeedReport(force){
+  const box=document.getElementById("seedList"), sum=document.getElementById("seedSummary");
+  if(sum)sum.innerHTML='<div class="stat-grid">'+[1,2,3,4].map(i=>'<div class="skeleton" style="height:76px"></div>').join("")+'</div>';
+  jget("/api/seedreport"+(force?"?refresh=1":"")).then(d=>{
+    if(d.error){
+      sum.innerHTML='<div class="errcard"><div class="t">读取失败</div><div>'+esc(d.error)+'</div></div>';
+      if(box)box.innerHTML=""; return;
+    }
+    _seedRows=d.rows||[]; _seedAll=false;
+    const s=d.summary||{};
+    document.getElementById("seedSummary").innerHTML=seedCards(s);
+    const at=document.getElementById("seedAt");
+    if(at)at.textContent="采样于 "+new Date((s.wall||Date.now()/1000)*1000).toLocaleString("zh-CN")+
+      " · 共 "+(s.total||0)+" 颗种子"+(force?"（强制）":"（服务端 60 秒内缓存）");
+    seedBind(); renderSeeds();
+  }).catch(e=>{
+    if(sum)sum.innerHTML='<div class="errcard"><div class="t">加载失败</div><div>'+esc(e)+'</div></div>';
+  });
+}
+function seedCards(s){
+  const c=[["种子总数",s.total,""],["已下载完",s.done,""],
+    ["🥶 无人做种",s.cold,s.cold?"err":""],["下载中",s.downloading,"warn"],
+    ["平均做种人数",s.avgSeeds,""],["冷门占用 (GB)",s.coldSize,s.coldSize?"warn":""]];
+  return '<div class="stat-grid">'+c.map(x=>'<div class="stat-card"><div class="k">'+x[0]+
+    '</div><div class="v'+(x[2]?" "+x[2]:"")+'">'+x[1]+'</div></div>').join("")+'</div>';
+}
+function seedBind(){
+  document.querySelectorAll("#seedFilters .fbtn").forEach(b=>{
+    b.onclick=()=>{_seedFilter=b.getAttribute("data-f");_seedAll=false;seedMark();renderSeeds();};});
+  document.querySelectorAll("#seedSorts .fbtn").forEach(b=>{
+    b.onclick=()=>{_seedSort=b.getAttribute("data-s");_seedAll=false;seedMark();renderSeeds();};});
+  seedMark();
+}
+function seedMark(){
+  document.querySelectorAll("#seedFilters .fbtn").forEach(b=>
+    b.classList.toggle("active",b.getAttribute("data-f")===_seedFilter));
+  document.querySelectorAll("#seedSorts .fbtn").forEach(b=>
+    b.classList.toggle("active",b.getAttribute("data-s")===_seedSort));
+}
+function renderSeeds(){
+  const box=document.getElementById("seedList"); if(!box||!_seedRows.length){if(box)box.innerHTML='<div class="muted">暂无种子。</div>';return;}
+  let rows=_seedRows.slice();
+  if(_seedFilter==="cold")rows=rows.filter(r=>r.cold);
+  else if(_seedFilter==="down")rows=rows.filter(r=>!r.done);
+  else if(_seedFilter==="done")rows=rows.filter(r=>r.done);
+  const SORT={
+    seeds:(a,b)=>(a.seeds-b.seeds)||(a.added-b.added),
+    ratio:(a,b)=>((a.ratio||0)-(b.ratio||0))||(a.seeds-b.seeds),
+    "new":(a,b)=>b.added-a.added,
+    size:(a,b)=>b.size-a.size
+  };
+  rows.sort(SORT[_seedSort]||SORT.seeds);
+  const lim=_seedAll?rows.length:60, view=rows.slice(0,lim);
+  let h=rows.length!==_seedRows.length?'<div class="muted" style="margin-bottom:8px">命中 '+rows.length+' 颗</div>':"";
+  h+=view.map(r=>{
+    const sc=r.seeds===0?"off":(r.seeds===1?"warn":"ok");
+    return '<div class="queue-item'+(r.cold?" cold":"")+'"><div class="top"><b>'+esc(r.name)+
+      '</b><span class="tag '+sc+'">🌱 '+r.seeds+'</span><span class="tag off">👤 '+r.leechers+
+      '</span><span class="tag">'+r.progress+'%</span></div>'+
+      '<div class="sub"><span>分享率 '+r.ratio+'</span><span>'+r.size+' GB</span>'+
+      (r.category?'<span>'+esc(r.category)+'</span>':"")+
+      '<span>'+_ago(r.added)+'</span>'+
+      (r.cold?'<span class="tag warn">无人做种</span>':"")+'</div>'+
+      (r.done?"":'<div class="bar"><i style="width:'+Math.max(2,r.progress)+'%"></i></div>')+'</div>';
+  }).join("");
+  if(rows.length>lim)h+='<div class="row" style="margin-top:8px"><button class="btn ghost" '+
+    'onclick="_seedAll=true;renderSeeds()">显示全部 '+rows.length+' 颗</button></div>';
+  box.innerHTML=h||'<div class="muted">没有符合条件的种子。</div>';
+}
+
 function loadIndexers(){
   jget("/api/indexers").then(d=>{
     const box=document.getElementById("indexers");
@@ -6130,6 +6341,12 @@ class H(BaseHTTPRequestHandler):
                         self._send(200, history_series(int(sd or 14)))
                     except Exception as e:
                         self._send(200, {"days": [], "error": str(e)[:200]})
+                elif base.startswith("/api/seedreport"):
+                    try:
+                        sr = (_qs.get("refresh") or [""])[0] == "1"
+                        self._send(200, seed_report(force=sr))
+                    except Exception as e:
+                        self._send(200, {"rows": [], "summary": {}, "error": str(e)[:200]})
                 elif base == "/api/indexers/trend":
                     self._send(200, {"days": _idx_trend_load(), "path": IDX_TREND_PATH})
                 elif base == "/api/indexers/seed":
