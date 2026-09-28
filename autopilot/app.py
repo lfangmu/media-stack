@@ -512,6 +512,12 @@ def save_rules(rules):
         tmp = RULES_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(list(rules), f, ensure_ascii=False, indent=2)
+        # 显式给 0644：某些文件系统上 tmp+replace 会留下 000 权限，
+        # 容器一旦不是 root 就会读不到规则（当前 root 运行看不出问题）。
+        try:
+            os.chmod(tmp, 0o644)
+        except Exception:
+            pass
         os.replace(tmp, RULES_PATH)
         return True
     except Exception:
