@@ -38,7 +38,7 @@ import json
 import socket
 import time
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import xml.etree.ElementTree as ET
 from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
 import urllib.error
@@ -1521,6 +1521,59 @@ def recent_history(kind="all", limit=20, offset=0):
         out += _history_records(s_req, "tv", limit, offset)
     out.sort(key=lambda x: x.get("date") or "", reverse=True)
     return out[:limit]
+
+
+_HIST_S_CACHE = {"t": 0.0, "data": None}
+
+
+def history_series(days=14):
+    """近 N 天「导入完成」趋势：拉 Radarr+Sonarr 各 1000 条 history 按自然日计数。
+    结果缓存 5 分钟（图表只看趋势，不必实时）。"""
+    now = time.time()
+    if _HIST_S_CACHE["data"] is not None and now - _HIST_S_CACHE["t"] < 300:
+        return _HIST_S_CACHE["data"]
+    try:
+        days = max(7, min(90, int(days)))
+    except Exception:
+        days = 14
+    today = datetime.now().date()
+    start = today - timedelta(days=days - 1)
+    buckets = {}
+    for rq, label in ((r_req, "movie"), (s_req, "tv")):
+        try:
+            h = rq("GET", "/api/v3/history?pageSize=1000&sortDirection=descending"
+                   "&sortKey=date") or {}
+        except Exception:
+            h = {}
+        for it in (h or {}).get("records", []) or []:
+            et = (it.get("eventType") or "")
+            # ⚠️ *arr 事件类型是大写开头的 downloadFolderImported / episodeFileImported，
+            #    直接 "imported" in et 大小写敏感 → 永远匹配不上，趋势图恒 0。必须 lower()。
+            if "imported" not in et.lower():
+                continue
+            try:
+                d = datetime.strptime((it.get("date") or "")[:10], "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if d < start or d > today:
+                continue
+            b = buckets.setdefault(d, {"movie": 0, "tv": 0})
+            b["movie" if label == "movie" else "tv"] += 1
+    day_out = []
+    for i in range(days):
+        d = start + timedelta(days=i)
+        b = buckets.get(d, {"movie": 0, "tv": 0})
+        day_out.append({"date": d.strftime("%Y-%m-%d"), "movie": b["movie"],
+                        "tv": b["tv"], "total": b["movie"] + b["tv"]})
+    out = {"days": day_out,
+           "total": sum(x["total"] for x in day_out),
+           "movie": sum(x["movie"] for x in day_out),
+           "tv": sum(x["tv"] for x in day_out),
+           "from": start.strftime("%Y-%m-%d"),
+           "to": today.strftime("%Y-%m-%d")}
+    _HIST_S_CACHE["t"] = now
+    _HIST_S_CACHE["data"] = out
+    return out
 
 
 # ---------- 抓取完成 webhook 通知（F8） ----------
@@ -4212,6 +4265,12 @@ PAGE = r"""<!doctype html>
           <div class="dw-body muted" id="dashFail">加载中…</div>
         </div>
       </div>
+      <div class="grid-stack-item" gs-id="trend" gs-x="0" gs-y="12" gs-w="12" gs-h="6">
+        <div class="grid-stack-item-content dash-widget">
+          <div class="dw-head gs-handle"><span>近 14 天入库趋势</span><span class="dw-grip">⠿</span></div>
+          <div class="dw-body" id="dashTrend">加载中…</div>
+        </div>
+      </div>
       <div class="grid-stack-item" gs-id="manual" gs-x="0" gs-y="12" gs-w="12" gs-h="3">
         <div class="grid-stack-item-content dash-widget">
           <div class="dw-head gs-handle"><span>待手动整理</span><span class="dw-grip">⠿</span></div>
@@ -4339,7 +4398,7 @@ function ensureDashGrid(){
     if(!ok){el.classList.add("fallback");return;}
     el.classList.remove("fallback");
     _dashGrid=GridStack.init({column:12,cellHeight:64,margin:8,float:true,draggable:{handle:".gs-handle"},resizable:{handles:"se,sw"}},el);
-    _dashGrid.on("resizestop",()=>{try{if(_dashPie)_dashPie.render();if(_dashDisk)_dashDisk.render();}catch(e){}});
+    _dashGrid.on("resizestop",()=>{try{if(_dashPie)_dashPie.render();if(_dashDisk)_dashDisk.render();if(_dashTrend)_dashTrend.render();}catch(e){}});
     _dashGrid.on("change",()=>{try{localStorage.setItem("dashLayout",JSON.stringify(_dashGrid.save(false)));}catch(e){}});
     try{const saved=JSON.parse(localStorage.getItem("dashLayout")||"null");
       if(saved&&saved.length){saved.forEach(n=>{const it=el.querySelector('[gs-id="'+n.id+'"]');if(it)_dashGrid.update(it,{x:n.x,y:n.y,w:n.w,h:n.h});});}
@@ -4353,10 +4412,19 @@ function loadDashboard(){
   const ds=document.getElementById("dashStats"); if(ds)ds.innerHTML='<div class="skeleton" style="height:78px"></div><div class="skeleton" style="height:78px"></div><div class="skeleton" style="height:78px"></div><div class="skeleton" style="height:78px"></div>';
   const dp=document.getElementById("dashPie"); if(dp)dp.innerHTML=sk;
   const dk=document.getElementById("dashDisk"); if(dk)dk.innerHTML=sk;
+  const dtr=document.getElementById("dashTrend"); if(dtr)dtr.innerHTML=sk;
   const dq=document.getElementById("dashQueue"); if(dq)dq.innerHTML='加载中…';
   const df=document.getElementById("dashFail"); if(df)df.innerHTML='加载中…';
   const dm=document.getElementById("dashManual"); if(dm)dm.innerHTML='加载中…';
   ensureDashGrid();
+  /* 入库趋势独立懒加载：要拉两个 *arr 各 1000 条 history 聚合，慢于首屏，主卡片不等它 */
+  jget("/api/stats/series?days=14").then(td=>{
+    if(window.ApexCharts)renderDashTrend(td);
+    else ensureApex().then(()=>renderDashTrend(td));
+  }).catch(()=>{
+    if(dtr)dtr.innerHTML='<div class="errcard"><div class="t">趋势加载失败</div>'
+      +'<div><button class="btn ghost" onclick="loadDashboard()">重试</button></div></div>';
+  });
   /* 待整理(manualimport)独立懒渲染：*arr manualImport 要扫目录 7s+，
      若放进 Promise.all 会拖死整个仪表盘首屏。主卡片不等它。 */
   const sd={queue:null,okc:0,fail:0,mi:null};
@@ -4384,9 +4452,14 @@ function loadDashboard(){
       const mv=queue.filter(x=>x.kind!=="tv").length, tvN=queue.length-mv;
       const pie=[["队列·电影",mv,cssv('--accent')],["队列·剧集",tvN,cssv('--warn-strong')],["入库成功",sd.okc,cssv('--ok-strong')],["失败",sd.fail,cssv('--err')],["待整理",sd.mi||0,cssv('--chart-pend')]];
       ensureApex().then(ok=>{ if(ok){ renderDashPie(pie); renderDashDisk(s.disks||[]); } });
-    }).catch(()=>{});
+    }).catch(()=>{
+      /* 别静默吞异常：之前 bare .catch(()=>{}) 让仪表盘无声卡死，这里给明确状态 + 重试 */
+      if(dp)dp.innerHTML='<span class="muted">图表加载失败</span>';
+      if(dk)dk.innerHTML='<span class="muted">图表加载失败</span>';
+    });
   }).catch(e=>{
-    if(ds)ds.innerHTML='<div class="errcard" style="grid-column:1/-1"><div class="t">仪表盘加载失败</div><div>'+esc(e)+'</div></div>';
+    if(ds)ds.innerHTML='<div class="errcard" style="grid-column:1/-1"><div class="t">仪表盘加载失败</div><div>'+esc(e)+'</div>'
+      +'<div style="margin-top:8px"><button class="btn ghost" onclick="loadDashboard()">重试</button></div></div>';
   });
 }
 
@@ -4436,6 +4509,30 @@ function renderDashDisk(disks){
     tooltip:{y:{formatter:v=>v+"% 已用"}}
   });
   _dashDisk.render();
+}
+let _dashTrend=null;
+function renderDashTrend(data){
+  const box=document.getElementById("dashTrend"); if(!box)return;
+  const days=(data&&data.days)?data.days:[];
+  if(!days.length){ box.innerHTML='<div class="muted">'+(data&&data.error?('⚠️ '+data.error):'这段时间内暂无入库记录')+'</div>'; return; }
+  if(!window.ApexCharts){ box.innerHTML='<div class="muted">图表库未加载</div>'; return; }
+  if(_dashTrend&&_dashTrend.destroy)_dashTrend.destroy();
+  box.innerHTML='<div id="trendCanvas"></div><div class="muted" style="margin-top:6px;font-size:12px">'
+    +esc(data.from||"")+' ~ '+esc(data.to||"")+' · 共入库 '+esc(String(data.total==null?0:data.total))+' 项（🎬 '
+    +esc(String(data.movie||0))+' · 📺 '+esc(String(data.tv||0))+'）</div>';
+  _dashTrend=new ApexCharts(document.querySelector("#trendCanvas"),{
+    chart:{type:"bar",height:230,background:"transparent",toolbar:{show:false},stacked:true},
+    theme:{mode:"dark"},
+    plotOptions:{bar:{borderRadius:3,columnWidth:"62%"}},
+    colors:[cssv('--accent'),cssv('--warn-strong')],
+    series:[{name:"🎬 电影",data:days.map(x=>x.movie||0)},{name:"📺 剧集",data:days.map(x=>x.tv||0)}],
+    xaxis:{categories:days.map(x=>(x.date||"").slice(5)),labels:{style:{colors:cssv('--chart-label')}}},
+    yaxis:{labels:{style:{colors:cssv('--chart-label')}}},
+    legend:{position:"top",labels:{colors:cssv('--chart-label')}},
+    dataLabels:{enabled:false},
+    tooltip:{shared:true,intersect:false}
+  });
+  _dashTrend.render();
 }
 
 // ===== 手动整理（/api/manualimport） =====
@@ -5373,12 +5470,18 @@ let _calY=0,_calM=0,_calMap={};
 function loadCalendar(){
   const now=new Date();
   if(!_calY){_calY=now.getFullYear();_calM=now.getMonth();}
+  /* 首帧先画纯日期网格：FullCalendar 走 CDN 实测 3~8s，原先这段时间只有星期表头 */
+  if(window.FullCalendar)renderCalendarFC(); else renderCalendar();
+  const fcReady=ensureFullCalendar();
   const start=ymd(_calY,_calM,1), end=ymd(_calY,_calM+1,1);
   jget("/api/calendar?start="+start+"&end="+end).then(d=>{
     _calMap={};
     (d.events||[]).forEach(e=>{ (_calMap[e.date]=_calMap[e.date]||[]).push(e); });
-    ensureFullCalendar().then(ok=>{ if(ok)renderCalendarFC(); else renderCalendar(); });
-  }).catch(e=>{document.getElementById("calGrid").innerHTML='<div class="err">加载失败: '+e+'</div>';});
+    fcReady.then(ok=>{ if(ok)renderCalendarFC(); else renderCalendar(); });
+  }).catch(e=>{
+    const g=document.getElementById("calGrid");
+    if(g)g.innerHTML='<div class="err">加载失败: '+esc(e)+'</div>';
+  });
 }
 function renderCalendar(){
   const hd=document.querySelector(".cal-head");if(hd)hd.style.display="";
@@ -5864,6 +5967,12 @@ class H(BaseHTTPRequestHandler):
                         hoff = 0
                     self._send(200, {"history": recent_history(hkind, hlimit, hoff),
                                      "limit": hlimit, "offset": hoff})
+                elif base.startswith("/api/stats/series"):
+                    try:
+                        sd = (_qs.get("days") or ["14"])[0]
+                        self._send(200, history_series(int(sd or 14)))
+                    except Exception as e:
+                        self._send(200, {"days": [], "error": str(e)[:200]})
                 elif base == "/api/indexers/seed":
                     self._send(200, dict(_seed_state)); return
                 elif base.startswith("/api/indexers"):
