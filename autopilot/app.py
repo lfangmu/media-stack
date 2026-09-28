@@ -1772,7 +1772,86 @@ def indexer_health():
     order = {"autoDisabled": 0, "hadFailure": 1, "disabled": 2, "healthy": 3}
     rows.sort(key=lambda r: (order.get(r["status"], 9), not r["enable"], r["name"] or ""))
     out["indexers"] = rows
+    # 趋势采样只是附属信息：任何异常都不能影响上面这份健康结果
+    try:
+        indexer_trend_record(rows)
+    except Exception:
+        pass
     return out
+
+
+# ---------- 索引器健康趋势（每日一个快照，落盘留 60 天） ----------
+# Prowlarr 自己不存历史，只能我们每天记一次：同一自然日覆盖，最多留 60 天。
+# 写盘节流 10 分钟，避免页面反复刷新打爆小文件 IO。
+IDX_TREND_PATH = ("/data/idx_health_trend.json" if os.path.isdir("/data")
+                  else os.path.join(DATA_DIR, "idx_health_trend.json"))
+_IDX_TREND_LOCK = threading.Lock()
+_IDX_TREND_LAST = 0.0
+_IDX_TREND_KEEP = 60
+_IDX_TREND_MIN_GAP = 600.0
+
+
+def _idx_trend_load():
+    """读历史快照；文件缺失/损坏一律返回空列表（趋势是加分项，别让它拖累页面）。"""
+    try:
+        with open(IDX_TREND_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("days"), list):
+            return [x for x in d["days"] if isinstance(x, dict) and x.get("date")]
+    except Exception:
+        pass
+    return []
+
+
+def indexer_trend_record(rows, force=False):
+    """把当前健康快照并入今日点。同一天覆盖（当日多次打开只留最新），
+    顺序按日期，超出 60 天丢弃最旧的。全程 try 包住，失败静默。"""
+    global _IDX_TREND_LAST
+    now = time.time()
+    if not force and (now - _IDX_TREND_LAST) < _IDX_TREND_MIN_GAP:
+        return
+    with _IDX_TREND_LOCK:
+        try:
+            point = {
+                "date": time.strftime("%Y-%m-%d"),
+                "total": len(rows),
+                "enabled": sum(1 for r in rows if r.get("enable")),
+                "healthy": sum(1 for r in rows if r.get("status") == "healthy"),
+                "hadFailure": sum(1 for r in rows if r.get("status") == "hadFailure"),
+                "autoDisabled": sum(1 for r in rows if r.get("status") == "autoDisabled"),
+            }
+            # status=disabled 就是 enable=false，与 enabled 是互补的两半
+            point["disabled"] = point["total"] - point["enabled"]
+            days = [d for d in _idx_trend_load() if d.get("date") != point["date"]]
+            days.append(point)
+            days.sort(key=lambda d: str(d.get("date")))
+            days = days[-_IDX_TREND_KEEP:]
+            d = os.path.dirname(IDX_TREND_PATH)
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            tmp = IDX_TREND_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"days": days}, f, ensure_ascii=False)
+            try:
+                os.chmod(tmp, 0o644)
+            except Exception:
+                pass
+            os.replace(tmp, IDX_TREND_PATH)
+            _IDX_TREND_LAST = now
+        except Exception:
+            pass
+
+
+def idx_trend_loop(every=1800):
+    """后台采样：30 分钟调一次 indexer_health()，它内部会顺手记一个日快照。
+    不指望用户天天打开索引器页——趋势天数靠这个线程自然累积。
+    （indexer_health 本身会顺带拉 Prowlarr 两次请求，56 个索引器成本可忽略。）"""
+    while True:
+        time.sleep(every)
+        try:
+            indexer_health()
+        except Exception:
+            pass
 
 
 def enable_indexer(name):
@@ -3910,7 +3989,14 @@ PAGE = r"""<!doctype html>
   .cal-week{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-bottom:4px}
   .cal-week span{text-align:center;font-size:12px;color:var(--text-3)}
   .cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
-  .cal-cell{background:var(--bg-surface);border:1px solid var(--border-3);border-radius:8px;min-height:74px;padding:5px}
+  /* 月切换动画：往回翻从左侧淡入，往后翻从右侧淡入；尊重系统「减少动态效果」设置 */
+  @keyframes calInRight{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
+  @keyframes calInLeft{from{opacity:0;transform:translateX(-16px)}to{opacity:1;transform:none}}
+  .cal-in-r{animation:calInRight .28s cubic-bezier(.22,.61,.36,1) both}
+  .cal-in-l{animation:calInLeft .28s cubic-bezier(.22,.61,.36,1) both}
+  @keyframes calCellIn{from{opacity:0;transform:translateY(6px) scale(.98)}to{opacity:1;transform:none}}
+  .cal-cell{background:var(--bg-surface);border:1px solid var(--border-3);border-radius:8px;min-height:74px;padding:5px;animation:calCellIn .26s cubic-bezier(.22,.61,.36,1) both;animation-delay:calc(var(--i,0)*8ms)}
+  @media (prefers-reduced-motion:reduce){.cal-in-r,.cal-in-l,.cal-cell{animation:none}}
   .cal-cell.cal-empty{background:transparent;border:none}
   .cal-cell.cal-today{border-color:var(--accent)}
   .cal-d{font-size:12px;color:var(--text-3);margin-bottom:3px}
@@ -5466,7 +5552,7 @@ function loadSystem(){
 
 // 日历视图（F9）：Radarr 电影上映 + Sonarr 剧集播出，按月网格展示
 function ymd(y,m,d){return y+"-"+String(m+1).padStart(2,"0")+"-"+String(d).padStart(2,"0");}
-let _calY=0,_calM=0,_calMap={};
+let _calY=0,_calM=0,_calMap={},_calDir=1;
 function loadCalendar(){
   const now=new Date();
   if(!_calY){_calY=now.getFullYear();_calM=now.getMonth();}
@@ -5492,8 +5578,9 @@ function renderCalendar(){
   const firstDow=(new Date(_calY,_calM,1).getDay()+6)%7;
   const days=new Date(_calY,_calM+1,0).getDate();
   let cells="";
-  for(let i=0;i<firstDow;i++)cells+='<div class="cal-cell cal-empty"></div>';
+  for(let i=0;i<firstDow;i++)cells+='<div class="cal-cell cal-empty" style="--i:0"></div>';
   const tToday=ymd(new Date().getFullYear(),new Date().getMonth(),new Date().getDate());
+  let _ci=0;
   for(let d=1;d<=days;d++){
     const ds=ymd(_calY,_calM,d);
     const evs=_calMap[ds]||[];
@@ -5503,10 +5590,21 @@ function renderCalendar(){
       chips+='<div class="cal-chip '+(e.kind==="tv"?"tv":"mv")+'" data-title="'+esc(e.title)+'" data-kind="'+e.kind+'" data-tmdb="'+(e.tmdbId?e.tmdbId:"")+'" title="'+esc(e.title)+(e.sub?(" · "+esc(e.sub)):"")+'">'+ic+esc((e.title||"").slice(0,8))+'</div>';
     });
     if(evs.length>3)chips+='<div class="cal-more">+'+(evs.length-3)+'</div>';
-    cells+='<div class="cal-cell'+(ds===tToday?" cal-today":"")+'"><div class="cal-d">'+d+'</div>'+chips+'</div>';
+    cells+='<div class="cal-cell'+(ds===tToday?" cal-today":"")+'" style="--i:'+(_ci<40?_ci++:39)+'"><div class="cal-d">'+d+'</div>'+chips+'</div>';
   }
   box.innerHTML=cells;
   box.querySelectorAll(".cal-chip").forEach(ch=>{ ch.onclick=()=>calOpen(ch.getAttribute("data-kind"),ch.getAttribute("data-tmdb")||"",ch.getAttribute("data-title")); });
+  calAnimate();
+}
+/* 月切换淡入：_calDir=1 往后翻(右进) / -1 往前翻(左进)；
+   必须先 remove class + 强制重排，否则连续翻两次同一方向时动画不会重播。*/
+function calAnimate(){
+  const box=document.getElementById("calGrid");
+  if(!box)return;
+  const cls=(_calDir||1)<0?"cal-in-l":"cal-in-r";
+  box.classList.remove("cal-in-l","cal-in-r");
+  void box.offsetWidth;
+  box.classList.add(cls);
 }
 let _fcLoading=null,_fcInst=null;
 function ensureFullCalendar(){
@@ -5548,9 +5646,10 @@ function renderCalendarFC(){
     eventClick:function(info){ const k=info.event.extendedProps.kind,t=info.event.extendedProps.tmdbId; if(t){openDetail(k,t);} else {calAdd(info.event.title.replace(/^📺 |^🎬 /,""),k);} }
   });
   _fcInst.render();
+  calAnimate();   /* FC 自带切换动画，容器再淡入一次即可，别重复加位移 */
 }
-function prevMonth(){ if(!_calY){_calY=new Date().getFullYear();_calM=new Date().getMonth();} _calM--; if(_calM<0){_calM=11;_calY--;} loadCalendar(); }
-function nextMonth(){ if(!_calY){_calY=new Date().getFullYear();_calM=new Date().getMonth();} _calM++; if(_calM>11){_calM=0;_calY++;} loadCalendar(); }
+function prevMonth(){ if(!_calY){_calY=new Date().getFullYear();_calM=new Date().getMonth();} _calM--; if(_calM<0){_calM=11;_calY--;} _calDir=-1; loadCalendar(); }
+function nextMonth(){ if(!_calY){_calY=new Date().getFullYear();_calM=new Date().getMonth();} _calM++; if(_calM>11){_calM=0;_calY++;} _calDir=1; loadCalendar(); }
 function calAdd(title,kind){
   if(!title)return;
   if(!confirm("添加《"+title+"》？\n将在 "+(kind==="tv"?"剧集":"电影")+" 中搜索并下载。"))return;
@@ -5663,6 +5762,10 @@ function loadIndexers(){
     const anyDown=rows.some(r=>r.status==="autoDisabled"||r.status==="hadFailure");
     let h='<div class="muted" style="margin:2px 0 8px">资源库 '+d.enabled+'/'+d.total+' 启用'+
       (anyDown?' · <button class="btn ghost" id="enableAllIdx">全部重启用失效索引器</button>':"")+'</div>';
+    /* 健康趋势：Prowlarr 自己不存历史，后端每天记一个快照，这里只负责画 */
+    h+='<div style="background:var(--bg-surface);border:1px solid var(--border-3);border-radius:10px;padding:12px 14px;margin-bottom:10px">'+
+       '<div class="muted" id="idxTrendTip" style="margin:2px 0 6px">健康趋势…</div>'+
+       '<div id="idxTrend"></div></div>';
     h+=rows.map(r=>{
       const st=ST[r.status]||{t:(r.status||"?"),c:"off"};
       const proto=r.protocol==="torrent"?"BT":(r.protocol==="usenet"?"Usenet":(r.protocol||""));
@@ -5681,7 +5784,54 @@ function loadIndexers(){
     box.querySelectorAll("button[data-en]").forEach(b=>{b.onclick=()=>enableIndexer(b.getAttribute("data-en"),b);});
     const ea=document.getElementById("enableAllIdx");
     if(ea)ea.onclick=enableAllIndexers;
+    ensureApex().then(ok=>{
+      if(ok)renderIdxTrend();
+      else{const t=document.getElementById("idxTrendTip");if(t)t.textContent="图表库未加载（CDN 被墙？）";}
+    });
   }).catch(e=>{document.getElementById("indexers").innerHTML='<div class="err">加载失败: '+e+'</div>';});
+}
+
+let _idxTrendChart=null;
+function renderIdxTrend(){
+  const box=document.getElementById("idxTrend"); if(!box)return;
+  const tip=document.getElementById("idxTrendTip");
+  if(!window.ApexCharts){ if(tip)tip.textContent="图表库未加载"; return; }
+  jget("/api/indexers/trend").then(d=>{
+    const days=(d.days||[]).slice(-30);
+    if(days.length<2){
+      box.innerHTML='<div class="muted" style="padding:14px 0">📈 趋势需要至少两个采样点。每打开一次本页记录一个日快照（同一天覆盖），明后天再来就能看到曲线。</div>';
+      if(tip)tip.textContent="健康趋势（采样中…）";
+      return;
+    }
+    const NAME={healthy:"正常",hadFailure:"曾失败",autoDisabled:"已停用",disabled:"未启用"};
+    const KEYS=["healthy","hadFailure","autoDisabled","disabled"];
+    const COLORS=[cssv("--ok-text")||"#5fd38a",cssv("--warn-strong")||"#c98a2b",
+                  cssv("--err-text")||"#ff6b6b",cssv("--text-3")||"#8a8f98"];
+    if(tip){
+      const first=days[0].date, last=days[days.length-1].date;
+      tip.textContent="健康趋势 "+first+" → "+last+"（共 "+days.length+" 个采样点，同一天覆盖、保留最近 30 天）";
+    }
+    if(_idxTrendChart&&_idxTrendChart.destroy)_idxTrendChart.destroy();
+    box.innerHTML='<div id="idxTrendCanvas"></div>';
+    _idxTrendChart=new ApexCharts(document.querySelector("#idxTrendCanvas"),{
+      chart:{type:"stackedBar",height:210,background:"transparent",toolbar:{show:false},
+             fontFamily:"inherit",animations:{enabled:true,speed:320}},
+      theme:{mode:"dark"},
+      series:KEYS.map(k=>({name:NAME[k],data:days.map(x=>Number(x[k]||0))})),
+      colors:COLORS,
+      dataLabels:{enabled:false},
+      plotOptions:{bar:{columnWidth:"55%",borderRadius:3,dataLabels:{position:"top"}}},
+      stroke:{show:true,width:2,colors:["transparent"]},
+      legend:{position:"top",labels:{colors:cssv("--text-3")||"#8a8f98"},markers:{size:4}},
+      xaxis:{categories:days.map(x=>String(x.date).slice(5)),labels:{style:{colors:cssv("--text-3")}},tooltip:{enabled:false}},
+      yaxis:{labels:{style:{colors:cssv("--text-3")}},min:0,forceNiceScale:true},
+      grid:{borderColor:cssv("--border-3")||"#252a35",strokeDashArray:3},
+      tooltip:{shared:true,intersect:false,y:{formatter:v=>v+" 个"}}
+    });
+    _idxTrendChart.render();
+  }).catch(e=>{
+    box.innerHTML='<div class="muted">趋势加载失败: '+esc(e)+'</div>';
+  });
 }
 
 
@@ -5864,13 +6014,20 @@ class H(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        # 客户端（浏览器）提前断开是常态：慢响应如 /api/manualimport 最容易撞上。
+        # 不吞掉的话每次都会刷一屏 Traceback，把真正的启动/运行错误淹掉。
+        try:
+            body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception:
+            raise
 
     def _auth_ok(self):
         if not TOKEN:
@@ -5973,6 +6130,8 @@ class H(BaseHTTPRequestHandler):
                         self._send(200, history_series(int(sd or 14)))
                     except Exception as e:
                         self._send(200, {"days": [], "error": str(e)[:200]})
+                elif base == "/api/indexers/trend":
+                    self._send(200, {"days": _idx_trend_load(), "path": IDX_TREND_PATH})
                 elif base == "/api/indexers/seed":
                     self._send(200, dict(_seed_state)); return
                 elif base.startswith("/api/indexers"):
@@ -6612,6 +6771,8 @@ def main():
     print("[autopilot] indexer seeder -> 后台幂等补齐 SEED_INDEXER_NAMES 中的公共索引器", flush=True)
     threading.Thread(target=_arr_bootstrap, daemon=True).start()
     print("[autopilot] *arr 账号初始化（后台）：自动建管理员账号 + 设 BaseUrl=/p/<svc>", flush=True)
+    threading.Thread(target=idx_trend_loop, daemon=True).start()
+    print("[autopilot] indexer trend sampler -> 后台每 30min 采一次健康快照（趋势图靠它攒天数）", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), H)
     print("[autopilot] listening on :%d  RADARR_URL=%s" % (LISTEN_PORT, RADARR_URL))
     server.serve_forever()
