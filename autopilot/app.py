@@ -3889,6 +3889,13 @@ PAGE = r"""<!doctype html>
     line-height:1.7;color:var(--text-2);font-size:14px;white-space:pre-wrap}
   .detail-acts{margin-top:18px;display:flex;gap:10px;justify-content:flex-end}
   .detail-acts .btn{width:auto;padding:9px 22px}
+  .detail-tabs{display:flex;gap:2px;margin:16px 2px 0;border-bottom:1px solid var(--border-5);flex-wrap:wrap}
+  .detail-tab{padding:8px 15px;border:none;border-bottom:2px solid transparent;background:none;color:var(--text-3);
+              font-size:13px;cursor:pointer;line-height:1.4;white-space:nowrap;border-radius:6px 6px 0 0;margin-bottom:-1px}
+  .detail-tab:hover{color:var(--text-2);background:var(--bg-elev)}
+  .detail-tab.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+  .detail-pane{display:none;padding-top:14px}
+  .detail-pane.active{display:block}
   .chip-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
   .chip{padding:6px 12px;border-radius:8px;background:var(--bg-surface);border:1px solid var(--border);color:var(--text-2);cursor:pointer;font-size:13px;user-select:none;line-height:1.4;white-space:nowrap}
   .chip:hover{background:var(--bg-elev);border-color:var(--border-strong)}
@@ -4850,6 +4857,15 @@ function openDetail(kind,tmdbId){
       ? '<div class="s">'+[d.seasons?("全 "+d.seasons+" 季"):null,d.episodes?("共 "+d.episodes+" 集"):null].filter(Boolean).join(" · ")+'</div>' : "";
     const ov=(d.overview?('<div class="detail-overview">'+esc(d.overview)+'</div>'):'<div class="muted">暂无简介。</div>');
     const tag=(d.tagline?'<div class="detail-tagline">'+esc(d.tagline)+'</div>':"");
+    const castBlock=(d.cast&&d.cast.length)
+      ? '<div class="detail-section"><div class="detail-h">🎭 演职表</div><div class="cast-row">'+d.cast.map(c=>'<div class="cast"><img src="'+(c.profile?escAttr(imgSrc(c.profile)):"")+'" onerror="this.style.visibility=\'hidden\'"/><span>'+esc(c.name||"")+'</span><span class="muted">'+esc(c.character||"")+'</span></div>').join("")+'</div></div>'
+      : "";
+    const simBlock=(d.similar&&d.similar.length)
+      ? '<div class="detail-section"><div class="detail-h">🔗 相似推荐</div><div class="grid sm">'+d.similar.map(ss=>'<div class="card sm" data-sim="'+escAttr((ss.kind||"movie")+":"+ss.tmdbId)+'"><img src="'+(ss.poster?escAttr(imgSrc(ss.poster)):"")+'" onerror="this.style.visibility=\'hidden\'"/><div class="meta"><div class="t">'+esc(ss.title||"")+'</div><div class="s">'+(ss.year||"")+(ss.rating?(" · ★ "+Math.round(ss.rating)):"")+'</div></div></div>').join("")+'</div></div>'
+      : "";
+    const hasCast=!!(d.cast&&d.cast.length), hasSim=!!(d.similar&&d.similar.length);
+    const tabOf=(k,label,on)=>'<button class="detail-tab'+(on?" active":"")+'" data-tab="'+k+'">'+label+'</button>';
+    const paneOf=(k,inner,on)=>'<div class="detail-pane'+(on?" active":"")+'" data-pane="'+k+'">'+(inner||'<div class="muted" style="padding:6px 0">暂无内容</div>')+'</div>';
     body.innerHTML=
       (d.backdrop?'<img class="detail-backdrop" src="'+escAttr(imgSrc(d.backdrop))+'" alt=""/>':'')
       +'<div class="detail-head">'
@@ -4862,11 +4878,18 @@ function openDetail(kind,tmdbId){
       +extra
       +tag
       +'</div>'
-      +ov
-      +(d.cast&&d.cast.length?('<div class="detail-section"><div class="detail-h">🎭 演职表</div><div class="cast-row">'+d.cast.map(c=>'<div class="cast"><img src="'+(c.profile?escAttr(imgSrc(c.profile)):"")+'" onerror="this.style.visibility=\'hidden\'"/><span>'+esc(c.name||"")+'</span><span class="muted">'+esc(c.character||"")+'</span></div>').join("")+'</div></div>'):"")
-      +(d.similar&&d.similar.length?('<div class="detail-section"><div class="detail-h">🔗 相似推荐</div><div class="grid sm">'+d.similar.map(ss=>'<div class="card sm" data-sim="'+escAttr((ss.kind||"movie")+":"+ss.tmdbId)+'"><img src="'+(ss.poster?escAttr(imgSrc(ss.poster)):"")+'" onerror="this.style.visibility=\'hidden\'"/><div class="meta"><div class="t">'+esc(ss.title||"")+'</div><div class="s">'+(ss.year||"")+(ss.rating?(" · ★ "+Math.round(ss.rating)):"")+'</div></div></div>').join("")+'</div></div>'):"")
+      +'<div class="detail-tabs">'
+      +tabOf("overview","📖 概述",true)
+      +(hasCast?tabOf("cast","🎭 演职表",false):"")
+      +(hasSim?tabOf("similar","🔗 相似",false):"")
+      +tabOf("sub","💬 字幕",false)
+      +'</div>'
+      +paneOf("overview",ov,true)
+      +paneOf("cast",castBlock,false)
+      +paneOf("similar",simBlock,false)
+      +paneOf("sub",'<div class="detail-section"><div class="detail-h">💬 字幕候选</div><div class="muted" style="padding:10px 0;text-align:center">切到「💬 字幕」标签页即自动搜索</div></div>',false)
       +'<div class="detail-acts"><button class="btn" id="detailAdd">添加下载</button>'
-      +'<button class="btn ghost" id="detailSub">下载字幕</button></div>';
+      +'<button class="btn ghost" id="detailSub">💬 字幕</button></div>';
     const ab=document.getElementById("detailAdd");
     ab.onclick=()=>{
       ab.disabled=true;ab.textContent="添加中…";
@@ -4877,17 +4900,16 @@ function openDetail(kind,tmdbId){
     };
     const subBtn=document.getElementById("detailSub");
     if(subBtn){
+      const subPane=body.querySelector('[data-pane="sub"] .detail-section');
       const doSubSearch=()=>{
+        if(subBtn.disabled||!subPane)return;
+        window.__detailSubLoaded=true;
+        const box=subPane;
         const q=encodeURIComponent(d.title||"");
-        const old=document.getElementById("detailSubBox");
-        if(old)old.remove();
-        const box=document.createElement("div");
-        box.id="detailSubBox";box.className="detail-section";
         box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="skeleton" style="height:40px;margin:8px 0"></div>';
-        body.appendChild(box);
-        subBtn.disabled=true;subBtn.textContent="搜索字幕…";
+        subBtn.disabled=true;subBtn.textContent="搜索中…";
         jget("/api/subtitle?kind="+kind+"&tmdbId="+encodeURIComponent(tmdbId)+"&name="+q,18000).then(r=>{
-          subBtn.disabled=false;subBtn.textContent="下载字幕";
+          subBtn.disabled=false;subBtn.textContent="💬 字幕";
           if(!r||!r.ok){
             box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="errcard"><div class="t">未找到字幕</div><div>'+(r&&r.error?esc(r.error):"暂无结果")+'</div><button class="btn" style="margin-top:10px" onclick="__retrySub()">重试</button></div>';
             return;
@@ -4907,18 +4929,37 @@ function openDetail(kind,tmdbId){
           });
           (r.warns||[]).forEach(w=>{ const wd=document.createElement("div");wd.className="muted";wd.style.margin="6px 0";wd.textContent="⚠️ "+w;box.appendChild(wd); });
         }).catch(e=>{
-          subBtn.disabled=false;subBtn.textContent="下载字幕";
+          subBtn.disabled=false;subBtn.textContent="💬 字幕";
           const to=(e&&e.name==="AbortError");
           box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="errcard"><div class="t">'+(to?"字幕源响应慢":"字幕搜索失败")+'</div><div>'+(to?"SubtitleCat 未及时返回，请稍后重试或换片名。":"错误："+esc(""+e))+'</div><button class="btn" style="margin-top:10px" onclick="__retrySub()">重试</button></div>';
         });
       };
-      subBtn.onclick=doSubSearch;
+      window.__detailSubLoaded=false;
+      subBtn.onclick=()=>switchDetailTab("sub");
       window.__retrySub=doSubSearch;
+      window.__runDetailSub=doSubSearch;
+      body.querySelectorAll(".detail-tab").forEach(b=>{
+        b.onclick=()=>switchDetailTab(b.getAttribute("data-tab"));
+      });
     }
     body.querySelectorAll('[data-sim]').forEach(el=>{
       el.onclick=()=>{ const p=el.getAttribute('data-sim').split(':'); closeDetail(); openDetail(p[0],p[1]); };
     });
   }).catch(e=>{body.innerHTML='<div class="err" style="padding:24px">❌ 请求失败: '+esc(""+e)+'</div>';});
+}
+// 详情弹窗 tab 切换：概述 / 演职表 / 相似 / 字幕。字幕页首次切到才发请求，来回切不重复打
+function switchDetailTab(name){
+  const body=document.getElementById("detailBody");
+  if(!body)return;
+  body.querySelectorAll(".detail-tab").forEach(b=>{
+    b.classList.toggle("active",b.getAttribute("data-tab")===name);
+  });
+  body.querySelectorAll(".detail-pane").forEach(p=>{
+    p.classList.toggle("active",p.getAttribute("data-pane")===name);
+  });
+  if(name!=="sub")return;
+  if(window.__detailSubLoaded)return;
+  if(typeof window.__runDetailSub==="function")window.__runDetailSub();
 }
 // 媒体库轻字幕弹窗：复用详情弹窗容器，只用片名查字幕（后端 search_subtitles 实际只用 name）
 function openSubtitle(kind, name, tmdbId){
