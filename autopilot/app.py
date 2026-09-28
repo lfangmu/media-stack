@@ -483,7 +483,87 @@ def search_candidates(term):
             "poster": _poster_of(r),
             "inLibrary": lib.get(r.get("tmdbId")),
         })
-    return {"ok": True, "candidates": out}
+    return {"ok": True, "candidates": _flag_rules(out)}
+
+
+# ---------- 下载过滤规则（服务端强制 + 自愈写盘） ----------
+# 落盘在容器 /data 内（= 宿主 ${DATA_DIR}），与图片缓存同一套「宿主可见」约定；
+# 写盘用 tmp + os.replace 原子替换，避免写一半崩留下损坏文件。
+RULES_PATH = ("/data/dl_filter_rules.json" if os.path.isdir("/data")
+              else os.path.join(DATA_DIR, "dl_filter_rules.json"))
+
+
+def load_rules():
+    """读规则；文件缺失/损坏一律返回 []（宁可不拦，绝不误伤）。"""
+    try:
+        with open(RULES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_rules(rules):
+    """原子写盘：先写 tmp 再 os.replace。返回是否成功。"""
+    try:
+        d = os.path.dirname(RULES_PATH)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        tmp = RULES_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(rules), f, ensure_ascii=False, indent=2)
+        os.replace(tmp, RULES_PATH)
+        return True
+    except Exception:
+        return False
+
+
+def rule_check(title="", size_bytes=None, lang=None):
+    """规则判定：返回 (是否拦截, 原因)。无规则直接放行。
+    支持三类：关键词黑名单 / 最小大小(MB) / 排除语言。
+    「最大含广告标记」需要种子层面的广告率，本地无从判定，跳过。"""
+    rules = load_rules()
+    if not rules:
+        return False, ""
+    t = str(title or "")
+    for r in rules:
+        try:
+            typ = str(r.get("type") or "").strip()
+            raw_val = r.get("value")
+            val = "" if raw_val is None else str(raw_val).strip()
+            action = str(r.get("action") or "").strip()
+            hard = (action != "提示")
+            if typ == "关键词黑名单" and val and t and val.lower() in t.lower():
+                if hard:
+                    return True, "命中关键词「%s」" % val
+            elif typ == "最小大小(MB)" and size_bytes:
+                need = float(val)
+                mb = float(size_bytes) / 1048576.0
+                if mb < need and hard:
+                    return True, "体积 %.0f MB < 下限 %s MB" % (mb, need)
+            elif typ == "排除语言" and lang and val:
+                banned = [x.strip().lower() for x in val.replace(",", " ").split() if x.strip()]
+                lg = str(lang).strip().lower()
+                if banned and lg and lg in banned and hard:
+                    return True, "命中排除语言「%s」" % lang
+        except Exception:
+            continue
+    return False, ""
+
+
+def _flag_rules(items):
+    """给候选打拦截标记，前端只管显示与禁用 add。"""
+    out = []
+    for it in items:
+        try:
+            blocked, reason = rule_check(title=it.get("title"))
+        except Exception:
+            blocked, reason = False, ""
+        it2 = dict(it)
+        it2["blocked"] = blocked
+        it2["blockReason"] = reason
+        out.append(it2)
+    return out
 
 
 # ---------- 发现墙（TMDB 热门/热映/即将上映/高分） ----------
@@ -1132,6 +1212,7 @@ def list_movies():
             "id": mid, "title": m.get("title"), "year": m.get("year"),
             "downloaded": has, "monitored": m.get("monitored"),
             "downloading": (mid in downloading_ids) and (not has),
+            "tmdbId": m.get("tmdbId"),
             "poster": _poster_of(m), "sizeOnDisk": m.get("sizeOnDisk"),
             "quality": (mf.get("quality") or {}).get("quality", {}).get("name", ""),
         })
@@ -1222,7 +1303,7 @@ def search_series_candidates(term):
             "status": r.get("status"),
             "seasons": sum(1 for s in seasons if s.get("seasonNumber", 0) > 0),
         })
-    return {"ok": True, "candidates": out}
+    return {"ok": True, "candidates": _flag_rules(out)}
 
 
 def search_all(term):
@@ -1273,7 +1354,7 @@ def search_all(term):
             "status": r.get("status"),
             "seasons": sum(1 for s in seasons if s.get("seasonNumber", 0) > 0),
         })
-    return {"ok": True, "candidates": out}
+    return {"ok": True, "candidates": _flag_rules(out)}
 
 
 def add_series(name=None, tvdb_id=None, profile=None, season_mode="all",
@@ -1379,7 +1460,7 @@ def list_series():
             "monitored": s.get("monitored"), "downloaded": has,
             "downloading": (s.get("id") in downloading_ids) and (not has),
             "episodeFileCount": epf, "totalEpisodeCount": eps,
-            "poster": _poster_of(s), "network": s.get("network"),
+            "tmdbId": s.get("tmdbId"), "poster": _poster_of(s), "network": s.get("network"),
             "status": s.get("status"), "sizeOnDisk": s.get("sizeOnDisk"),
         })
     return out
@@ -4059,11 +4140,15 @@ PAGE = r"""<!doctype html>
   <div class="panel" id="p-rules">
     <div class="section-title">下载过滤规则 <span class="sub">自动抓取与手动添加前的预检（本端管理，保存于浏览器）</span></div>
     <div class="errcard" style="border-color:var(--warn-border);background:var(--warn-soft)">
-      <div class="t" style="color:var(--warn)">⚠️ 当前为前端预检版</div>
-      <div>规则在「添加前」做本地提示 / 拦截建议；真正的服务端强制拦截将在后续版本接入自愈写盘。规则保存在本机浏览器（localStorage），换设备需重新设置。</div>
+      <div class="t" style="color:var(--warn)">✅ 服务端强制拦截已生效</div>
+      <div>规则存于服务端 <code id="ruleSrc" class="muted"></code>（容器内 /data 目录，宿主可见、重启不丢）。候选阶段即打标记，添加接口二次校验；「⚠️ 提示」类只提示不阻断。「最大含广告标记」需 *arr 质控，本地不判定。</div>
     </div>
     <div class="row"><button class="btn" onclick="ruleAdd()">＋ 新增规则</button>
-      <span class="muted">支持：关键词黑名单 / 最小大小(MB) / 排除语言 / 最大含广告标记</span></div>
+      <span class="muted">支持：关键词黑名单 / 最小大小(MB) / 排除语言</span></div>
+    <div class="row" style="margin-top:8px">
+      <input id="ruleTestInput" placeholder="输入片名测试规则命中情况…" style="flex:1;min-width:220px;padding:8px">
+      <button class="btn ghost" onclick="ruleTest()">测试规则</button></div>
+    <div id="ruleTestOut" style="margin-top:6px;font-size:13px"></div>
     <div id="ruleList"></div>
   </div>
 
@@ -4191,7 +4276,7 @@ function switchTo(p){
   else if(p==="config"){apLoadConfig();}
   else if(p==="dashboard"){loadDashboard();}
   else if(p==="manual"){loadManual();}
-  else if(p==="rules"){renderRules();}
+  else if(p==="rules"){loadRules();}
   else if(p==="notify"){loadNotify();}
 }
 document.querySelectorAll(".navitem").forEach(t=>t.onclick=()=>{ switchTo(t.dataset.p); });
@@ -4201,7 +4286,7 @@ document.getElementById("bell").onclick=()=>{ switchTo("notify"); };
 function topRefresh(){
   const m={queue:loadQueue,library:()=>loadLibrary(),status:loadSystem,
     history:loadHistory,indexers:loadIndexers,calendar:loadCalendar,discover:()=>loadDiscover(),
-    config:apLoadConfig,dashboard:loadDashboard,manual:loadManual,rules:renderRules,notify:loadNotify,search:()=>{}};
+    config:apLoadConfig,dashboard:loadDashboard,manual:loadManual,rules:loadRules,notify:loadNotify,search:()=>{}};
   (m[CUR]||function(){})();
   if(CUR!=="search")toast("已刷新");
 }
@@ -4347,32 +4432,52 @@ function manualImport(i){
    .catch(e=>toast("❌ "+e,"err"));
 }
 
-// ===== 下载过滤规则（前端预检，localStorage） =====
-const RULE_KEY="dl_filter_rules_v1";
-function getRules(){ try{return JSON.parse(localStorage.getItem(RULE_KEY)||"[]");}catch(e){return[];} }
-function setRules(a){ localStorage.setItem(RULE_KEY,JSON.stringify(a)); }
+// ===== 下载过滤规则（服务端强制，落盘 /data/dl_filter_rules.json） =====
+let _rules=[]; let _rulePath="";
+function loadRules(){
+  jget("/api/rules").then(d=>{ _rules=d.rules||[]; _rulePath=d.path||""; renderRules(); })
+    .catch(()=>{});
+}
+function saveRulesNow(){
+  return jpost("/api/rules",{rules:_rules},10000).then(d=>{
+    _rules=d.rules||_rules; renderRules(); toast("规则已保存到服务端","ok"); return d;
+  });
+}
 function renderRules(){
-  const a=getRules(); const box=document.getElementById("ruleList");
-  if(!a.length){ box.innerHTML='<div class="empty"><div class="big">🧰</div>还没有过滤规则<br><span class="muted">点击「＋ 新增规则」添加关键词黑名单 / 大小下限等</span></div>'; return; }
+  const box=document.getElementById("ruleList"); if(!box)return;
+  const srcEl=document.getElementById("ruleSrc");
+  if(srcEl)srcEl.textContent=_rulePath?("规则文件 "+_rulePath):"";
+  if(!_rules.length){ box.innerHTML='<div class="empty"><div class="big">🧰</div>还没有过滤规则<br><span class="muted">添加后由服务端强制拦截（存于 /data 目录，重启不丢）</span></div>'; return; }
   let h='<table style="width:100%;border-collapse:collapse"><tr><th>类型</th><th>条件</th><th>动作</th><th></th></tr>';
-  a.forEach((r,i)=>{
-    h+='<tr><td>'+esc(r.type||"")+'</td><td>'+esc(String(r.value))+(r.op?(" "+r.op):"")+'</td><td>'+(r.action==="block"?"🚫 拦截":"⚠️ 提示")+'</td>'
+  _rules.forEach((r,i)=>{
+    h+='<tr><td>'+esc(r.type||"")+'</td><td>'+esc(String(r.value==null?"":r.value))+(r.op?(" "+esc(r.op)):"")+'</td><td>'+(r.action==="提示"?"⚠️ 提示":"🚫 拦截")+'</td>'
       +'<td><button class="btn ghost" onclick="ruleDel('+i+')">删除</button></td></tr>';
   });
   h+='</table>';
   box.innerHTML=h;
 }
 function ruleAdd(){
-  const type=prompt("规则类型：\n1=关键词黑名单\n2=最小大小(MB)\n3=排除语言\n4=最大含广告标记","");
+  const type=prompt("规则类型：\n1=关键词黑名单\n2=最小大小(MB)\n3=排除语言\n\n（最大含广告标记需 *arr 质控，本地不判定）","");
   if(!type)return;
   let r={type:"关键词黑名单",value:"",op:"",action:"block"};
   if(type==="2"){r.type="最小大小(MB)";r.value=prompt("最小大小(MB)，小于此值不下：","200")||"200";r.op="≥";}
   else if(type==="3"){r.type="排除语言";r.value=prompt("排除的语言（如 德语）：","")||"";}
-  else if(type==="4"){r.type="最大含广告标记";r.value=prompt("含广告标记超过该比例(0-1)则拦截，如 0.3：","0.3")||"0.3";r.op="≤";}
   else {r.type="关键词黑名单";r.value=prompt("命中的关键词（含此词不下）：","Sample")||"Sample";}
-  const a=getRules(); a.push(r); setRules(a); renderRules(); toast("已添加规则","ok");
+  if(r.type!=="排除语言" && String(r.value).trim()===""){ toast("条件不能为空","err"); return; }
+  _rules.push(r);
+  saveRulesNow().catch(e=>{ _rules.pop(); toast("❌ 保存失败: "+e,"err"); renderRules(); });
 }
-function ruleDel(i){ const a=getRules(); a.splice(i,1); setRules(a); renderRules(); }
+function ruleDel(i){ const bak=_rules.slice(); _rules.splice(i,1); saveRulesNow().catch(()=>{ _rules=bak; renderRules(); toast("❌ 保存失败","err"); }); }
+function ruleTest(){
+  const el=document.getElementById("ruleTestInput"); const t=el?el.value.trim():"";
+  if(!t){ toast("先输入要测试的片名","err"); return; }
+  jpost("/api/rules/test",{title:t},10000).then(d=>{
+    const o=document.getElementById("ruleTestOut"); if(!o)return;
+    o.innerHTML=d.blocked
+      ? '<span style="color:var(--err-text)">🚫 拦截：'+esc(d.reason||"")+'</span>'
+      : '<span style="color:var(--ok-text)">✅ 放行（未命中任何规则）</span>';
+  }).catch(e=>toast("❌ "+e,"err"));
+}
 
 // ===== 通知（配置 + 记录） =====
 function loadNotify(){
@@ -4810,16 +4915,18 @@ function openDetail(kind,tmdbId){
   }).catch(e=>{body.innerHTML='<div class="err" style="padding:24px">❌ 请求失败: '+esc(""+e)+'</div>';});
 }
 // 媒体库轻字幕弹窗：复用详情弹窗容器，只用片名查字幕（后端 search_subtitles 实际只用 name）
-function openSubtitle(kind, name){
+function openSubtitle(kind, name, tmdbId){
   const m=document.getElementById("discDetail"), body=document.getElementById("detailBody");
   m.style.display="flex"; document.body.style.overflow="hidden";
   body.innerHTML='<div class="detail-head"><div class="detail-title">💬 字幕 · '+esc(name||"")+'</div></div>'+
     '<div class="detail-section"><div class="detail-h">字幕候选</div><div class="skeleton" style="height:40px;margin:8px 0"></div></div>';
   const box=body.querySelector(".detail-section");
   const q=encodeURIComponent(name||"");
+  const _tm=String(tmdbId==null?"":tmdbId).trim();
+  const tqs=_tm?("&tmdbId="+encodeURIComponent(_tm)):"";
   const doSearch=()=>{
     box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="skeleton" style="height:40px;margin:8px 0"></div>';
-    jget("/api/subtitle?kind="+kind+"&name="+q,18000).then(r=>{
+    jget("/api/subtitle?kind="+kind+tqs+"&name="+q,18000).then(r=>{
       if(!r||!r.ok){
         box.innerHTML='<div class="detail-h">💬 字幕候选</div><div class="errcard"><div class="t">未找到字幕</div><div>'+(r&&r.error?esc(r.error):"暂无结果")+'</div><button class="btn" style="margin-top:10px" onclick="__retrySub()">重试</button></div>';
         return;
@@ -5077,7 +5184,7 @@ function renderLib(){
     else if(st==="waiting") badge='<span class="badge wait">⏳ 待源</span>';
     else badge='<span class="badge off">未监控</span>';
     const resBtn = st!=="downloaded" ? '<button class="btn ghost" data-res="'+m.id+'" data-kind="'+k+'">重新搜索</button>' : "";
-    const subBtn='<button class="btn ghost" data-sub="'+k+'" data-name="'+escAttr(m.title||"")+'">下载字幕</button>';
+    const subBtn='<button class="btn ghost" data-sub="'+k+'" data-tmdb="'+((m.tmdbId==null?"":m.tmdbId))+'" data-name="'+escAttr(m.title||"")+'">下载字幕</button>';
     let sub=(m.year||"");
     if(k==="tv"){
       const ep=m.totalEpisodeCount?((m.episodeFileCount||0)+"/"+m.totalEpisodeCount+" 集"):"";
@@ -5116,7 +5223,7 @@ function renderLib(){
     };
   });
   box.querySelectorAll("button[data-sub]").forEach(b=>{
-    b.onclick=function(){ openSubtitle(b.getAttribute("data-sub"), b.getAttribute("data-name")); };
+    b.onclick=function(){ openSubtitle(b.getAttribute("data-sub"), b.getAttribute("data-name"), b.getAttribute("data-tmdb")); };
   });
   const moreBox=document.getElementById("libMore");
   if(items.length>_libPage){
@@ -5698,6 +5805,8 @@ class H(BaseHTTPRequestHandler):
                 elif base.startswith("/api/webhook"):
                     self._send(200, {"configured": bool(WEBHOOK_URL), "url": WEBHOOK_URL,
                                     "sent": _WEBHOOK_SENT, "last": _WEBHOOK_LAST})
+                elif base == "/api/rules":
+                    self._send(200, {"ok": True, "rules": load_rules(), "path": RULES_PATH})
                 elif base == "/api/manualimport":
                     try:
                         self._send(200, {"items": manual_import_list()})
@@ -5924,6 +6033,9 @@ class H(BaseHTTPRequestHandler):
             imdb = d.get("imdbId")
             if not name and not tmdb and not imdb:
                 self._send(400, {"ok": False, "error": "缺少 name / tmdbId / imdbId"}); return
+            _rb, _rw = rule_check(title=name)
+            if _rb and not bool(d.get("dryRun")):
+                self._send(400, {"ok": False, "error": "被下载过滤规则拦截：%s" % _rw}); return
             try:
                 res = add_movie(name=name, tmdb_id=tmdb, imdb_id=d.get("imdbId"),
                                 profile=d.get("profile"),
@@ -5932,6 +6044,36 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(500, {"ok": False, "error": str(e)}); return
             self._send(200 if res.get("ok") else 400, res); return
+        if p == "/api/rules":
+            d = self._read_json()
+            if "__error__" in d:
+                self._send(400, {"ok": False, "error": "请求体解析失败: " + d["__error__"]}); return
+            raw = d.get("rules")
+            if not isinstance(raw, list):
+                self._send(400, {"ok": False, "error": "rules 必须是数组"}); return
+            clean = []
+            for r in raw:
+                if not isinstance(r, dict):
+                    continue
+                clean.append({
+                    "type": str(r.get("type") or "").strip(),
+                    "value": "" if r.get("value") is None else r.get("value"),
+                    "action": "提示" if str(r.get("action") or "").strip() == "提示" else "block",
+                })
+            ok = save_rules(clean)
+            self._send(200, {"ok": ok, "rules": load_rules(), "path": RULES_PATH}); return
+        if p == "/api/rules/test":
+            d = self._read_json()
+            if "__error__" in d:
+                self._send(400, {"ok": False, "error": "请求体解析失败: " + d["__error__"]}); return
+            try:
+                sz = d.get("sizeBytes")
+                sz = int(sz) if sz not in (None, "") else None
+            except Exception:
+                sz = None
+            blk, why = rule_check(title=(d.get("title") or ""), size_bytes=sz,
+                                  lang=d.get("lang"))
+            self._send(200, {"ok": True, "blocked": blk, "reason": why}); return
         if p == "/api/webhook/test":
             if not WEBHOOK_URL:
                 self._send(400, {"ok": False,
@@ -5975,6 +6117,9 @@ class H(BaseHTTPRequestHandler):
             season_mode = str(d.get("seasonMode") or "all").strip()
             if season_mode not in ("all", "latest", "first"):
                 season_mode = "all"
+            _rb, _rw = rule_check(title=name)
+            if _rb and not bool(d.get("dryRun")):
+                self._send(400, {"ok": False, "error": "被下载过滤规则拦截：%s" % _rw}); return
             try:
                 res = add_series(name=name, tvdb_id=tvdb, profile=d.get("profile"),
                                  season_mode=season_mode,
