@@ -2346,6 +2346,173 @@ def seed_report(force=False):
     return out
 
 
+# ---- Tracker / Announce 健康（回答「无人做种是真冷门还是 announce 挂了」） ----
+# tracker 状态来自 qB sync/maindata?rid=0 的 `trackers` 字段，一次拿全量，无需逐 hash 拉。
+_TRK_CACHE = {"t": 0.0, "data": None}
+# qB /api/v2/torrents/trackers 的 status 枚举（qB 5.x 实际会返回 5、6）
+_TRK_STATUS = {
+    0: "tracker 故障",
+    1: "正常",
+    2: "更新中",
+    3: "上次 Announce 警告",
+    4: "上次 Announce 失败",
+    5: "上次 Announce 超时",
+    6: "从未 contact",
+}
+
+
+def _trk_class(status):
+    """把 qB tracker status 归成 ok / warn / upd / err 四桶。"""
+    try:
+        s = int(status or 0)
+    except Exception:
+        s = 0
+    if s == 1:
+        return "ok"
+    if s == 3:
+        return "warn"
+    if s == 2:
+        return "upd"
+    return "err"          # 0 故障 / 4 失败 / 5 超时 / 6 从未 contact
+
+
+def _trk_host(url):
+    try:
+        return (urlparse(url or "").hostname or (url or "")) or "(未知)"
+    except Exception:
+        return (url or "(未知)")
+
+
+_TRK_HDRS = {"t": 0.0, "h": None}
+
+
+def _trk_hdrs():
+    """逐 hash 拉 tracker 会打很多次登录接口，这里 15 分钟内复用同一个 qB 会话。"""
+    now = time.time()
+    if _TRK_HDRS["h"] and now - _TRK_HDRS["t"] < 900:
+        return _TRK_HDRS["h"]
+    hh = _qb_session()
+    _TRK_HDRS["h"] = hh
+    _TRK_HDRS["t"] = now
+    return hh
+
+
+def _qb_trackers(hsh, timeout=10):
+    """单颗种子的 tracker 列表：⚠️ 字段是 `url` 不是 `node`，且 status 含 5/6。"""
+    hh = _trk_hdrs()
+    if not hh:
+        return []
+    try:
+        with urlopen(Request(QBIT_URL + "/api/v2/torrents/trackers?hash=" + quote(hsh or ""),
+                             headers=hh), timeout=timeout, context=SSL_CTX) as r:
+            v = json.loads(r.read().decode() or "null")
+        return v if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
+def tracker_health(force=False):
+    """按 tracker 域名聚合 announce 状态，并对「已下载完却无人做种」的种子做归因。
+
+    状态口径（qB `torrents.tracker.status`）：0 故障 / 1 正常 / 2 更新中 /
+    3 上次 Announce 警告 / 4 上次 Announce 失败。
+    """
+    now = time.time()
+    # ⚠️ 这里刻意用 300s（不是 60s）：逐 hash 拉 tracker 实测要 ~10s，
+    #    而 announce 周期本来就是分钟级，手动点「刷新」没必要每次都付这笔时间。
+    if (not force) and _TRK_CACHE["data"] and (now - _TRK_CACHE["t"]) < 300:
+        return _TRK_CACHE["data"]
+    # 需要种子清单才知道要查哪些 hash。只查已下载完的做种族（最多 60 颗，这页本来也只看它们）。
+    try:
+        sr = seed_report() or {}
+    except Exception:
+        sr = {}
+    rows = sr.get("rows") or []
+    targets = [r for r in rows if r.get("done")][:60] or rows[:60]
+    if not targets:
+        return {"trackers": [], "coldRows": [], "summary": {},
+                "error": "qBittorrent 不可达 / 拿不到种子清单"}
+    per_hash = {}      # hash -> {host: status}
+    agg = {}           # host -> 计数
+    for r in targets:
+        hsh = (r.get("hash") or "").strip()
+        if not hsh:
+            continue
+        arr = _qb_trackers(hsh)
+        d = {}
+        for th in arr:
+            if not isinstance(th, dict):
+                continue
+            url = th.get("url") or ""
+            if "** [" in url:
+                # DHT / LSD / PeX 这类伪 tracker 不是 announce 目标，混进来会污染域名统计
+                continue
+            status = int(th.get("status") or 0)
+            host = _trk_host(url)
+            d.setdefault(host, status)
+            a = agg.setdefault(host, {"host": host, "total": 0, "ok": 0, "warn": 0,
+                                      "err": 0, "upd": 0, "seeds": 0, "peers": 0})
+            key = _trk_class(status)
+            a["total"] += 1
+            a[key] += 1
+            try:
+                # qB 对未知数量的 tracker 上报 -1，直接累加会算出「-7 个种子」
+                a["seeds"] += max(0, int(th.get("num_seeds") or 0))
+                a["peers"] += max(0, int(th.get("num_peers") or 0))
+            except Exception:
+                pass
+        per_hash[hsh] = d
+
+    # 归因：真正的「无人做种」种子里，有多少是 tracker 侧 announce 失败的
+    bad, genuine, unknown = [], [], []
+    for r in rows:
+        if not r.get("noseed"):      # 只看已下载完、做种人数为 0 的
+            continue
+        tr = per_hash.get((r.get("hash") or "").strip()) or {}
+        if not tr:
+            unknown.append(r)        # 没查到 tracker（纯 DHT / 无 tracker）
+            continue
+        sts = list(tr.values())
+        if any(s in (1, 3) for s in sts):
+            genuine.append(r)        # tracker 通（正常/警告）→ 那边就是没种子
+        elif all(s == 2 for s in sts):
+            unknown.append(r)        # 全在「更新中」，还没定论
+        else:
+            bad.append(r)            # 故障 / 失败 / 超时 / 从未 contact
+    bad.sort(key=lambda r: r.get("size") or 0, reverse=True)
+    trks = sorted(agg.values(),
+                  key=lambda a: (-a["err"], -a["total"]))
+    summary = {
+        "trackers": len(trks),
+        "badTrackers": sum(1 for a in trks if a["err"]),
+        "coldTotal": len(bad),
+        "coldGenuine": len(genuine),
+        "coldUnknown": len(unknown),
+        "coldBadSize": round(sum(r.get("size") or 0 for r in bad), 2),
+        "wall": int(now),
+    }
+    if not bad:
+        verdict = "✅ 未发现 announce 失败导致的冷门种子；无人做种基本是资源本身冷门。"
+    else:
+        verdict = ("⚠️ %d 颗已下载完却无人做种的种子，其 tracker 处于故障/Announce 失败状态"
+                   "（约 %s GB）。这批不是 nobody 做种，而是 announce 没通——修好后做种数会自己回来。"
+                   % (len(bad), summary["coldBadSize"]))
+    out = {
+        "trackers": trks,
+        "coldRows": [{"name": r.get("name"), "size": r.get("size"),
+                      "hosts": sorted((per_hash.get((r.get("hash") or "").strip()) or {}).keys()),
+                      "status": [_TRK_STATUS.get(v, "未知") for v in
+                                 (per_hash.get((r.get("hash") or "").strip()) or {}).values()]}
+                     for r in bad[:20]],
+        "checked": len(targets),
+        "verdict": verdict,
+        "summary": summary,
+    }
+    _TRK_CACHE["data"] = out
+    _TRK_CACHE["t"] = now
+    return out
+
+
 def _qbit_status():
     """qBittorrent：v5 会话 Cookie 名为 QBT_SID_<port>，POST 需 CSRF。"""
     try:
@@ -4455,6 +4622,13 @@ PAGE = r"""<!doctype html>
       <button class="fbtn" data-s="size">体积最大</button>
     </div>
     <div id="seedList" style="margin-top:12px"></div>
+    <div class="section-title" style="margin-top:18px">Tracker 与 Announce 健康 <span class="sub">「无人做种」到底是资源本身冷门，还是 announce 没通</span></div>
+    <div class="row" style="margin:8px 0">
+      <button class="btn ghost" onclick="loadTrackerHealth(true)">强制刷新</button>
+      <button class="btn ghost" onclick="loadTrackerHealth()">刷新</button>
+      <span class="muted" id="trkAt"></span>
+    </div>
+    <div id="trackerBox"></div>
   </div>
 
   <!-- 索引器只读健康 -->
@@ -6064,6 +6238,8 @@ function loadSeedReport(force){
     if(at)at.textContent="采样于 "+new Date((s.wall||Date.now()/1000)*1000).toLocaleString("zh-CN")+
       " · 共 "+(s.total||0)+" 颗种子"+(force?"（强制）":"（服务端 60 秒内缓存）");
     seedBind(); renderSeeds();
+    /* tracker 健康随做种报告首次加载，之后只手动刷（两者同源会话，一次登录即可） */
+    if(!window.__trkLoaded){ window.__trkLoaded=true; loadTrackerHealth(); }
   }).catch(e=>{
     if(sum)sum.innerHTML='<div class="errcard"><div class="t">加载失败</div><div>'+esc(e)+'</div></div>';
   });
@@ -6117,6 +6293,51 @@ function renderSeeds(){
   if(rows.length>lim)h+='<div class="row" style="margin-top:8px"><button class="btn ghost" '+
     'onclick="_seedAll=true;renderSeeds()">显示全部 '+rows.length+' 颗</button></div>';
   box.innerHTML=h||'<div class="muted">没有符合条件的种子。</div>';
+}
+function loadTrackerHealth(force){
+  const box=document.getElementById("trackerBox"); if(!box)return;
+  box.innerHTML='<div class="muted">读取 qBittorrent tracker announce 状态…</div>';
+  jget("/api/tracker"+(force?"?refresh=1":"")).then(d=>{
+    if(d.error){
+      box.innerHTML='<div class="errcard"><div class="t">读取失败</div><div>'+esc(d.error)+'</div></div>';
+      return;
+    }
+    const s=d.summary||{};
+    const at=document.getElementById("trkAt");
+    if(at)at.textContent="采样于 "+new Date((s.wall||Date.now()/1000)*1000).toLocaleString("zh-CN")+
+      " · 逐颗种子查 tracker 较慢，服务端 5 分钟内缓存";
+    const cards=[["Tracker 总数",s.trackers,""],
+      ["异常 Tracker",s.badTrackers,s.badTrackers?"err":"ok"],
+      ["announce 失败导致的无人做种",s.coldTotal,s.coldTotal?"err":"ok"],
+      ["真·资源冷门（tracker 是通的）",s.coldGenuine,"warn"]];
+    let h='<div class="muted" style="line-height:1.65;margin-bottom:10px">'+esc(d.verdict||"")+
+      '<br>本次逐颗核查了 '+(d.checked||0)+' 颗已下载完的种子（qB 端点是 torrents/trackers?hash=，逐 hash 取）。</div>';
+    h+='<div class="stat-grid">'+cards.map(x=>'<div class="stat-card"><div class="k">'+x[0]+
+      '</div><div class="v'+(x[2]?" "+x[2]:"")+'">'+x[1]+'</div></div>').join("")+'</div>';
+    h+=trackerRows(d.trackers||[]);
+    const cr=d.coldRows||[];
+    if(cr.length){
+      h+='<div class="section-title" style="margin-top:16px">受影响最明显的种子 <span class="sub">按体积降序，前 10</span></div>'+
+        cr.slice(0,10).map(r=>'<div class="queue-item cold"><div class="top"><b>'+esc(r.name)+
+          '</b><span class="tag err">'+r.size+' GB</span></div><div class="sub"><span>'+
+          ((r.hosts||[]).map(esc).join("、")||"(无 tracker)")+'</span><span class="tag err">'+
+          ((r.status||[]).map(esc).join("、")||"无状态")+'</span></div></div>').join("");
+    }
+    box.innerHTML=h;
+  }).catch(e=>{
+    box.innerHTML='<div class="errcard"><div class="t">加载失败</div><div>'+esc(e)+'</div></div>';
+  });
+}
+function trackerRows(trks){
+  if(!trks.length)return '<div class="muted" style="margin-top:10px">qB 没有返回任何 tracker 记录——这些种子可能全走 DHT，没有 tracker 可通告。</div>';
+  return '<div style="margin-top:12px">'+trks.map(t=>{
+    const bad=t.err>0;
+    return '<div class="queue-item'+(bad?" cold":"")+'"><div class="top"><b>'+esc(t.host)+
+      '</b><span class="tag">🌐 '+t.total+'</span><span class="tag ok">正常 '+t.ok+'</span>'+
+      '<span class="tag warn">警告 '+t.warn+'</span><span class="tag '+(t.err?"err":"off")+
+      '">失败 '+t.err+'</span></div><div class="sub"><span>该 tracker 上报 🌱 '+t.seeds+
+      ' 个种子 / 👤 '+t.peers+' 个 peer</span></div></div>';
+  }).join("")+'</div>';
 }
 
 function loadIndexers(){
@@ -6513,6 +6734,13 @@ class H(BaseHTTPRequestHandler):
                         self._send(200, seed_report(force=sr))
                     except Exception as e:
                         self._send(200, {"rows": [], "summary": {}, "error": str(e)[:200]})
+                elif base.startswith("/api/tracker"):
+                    try:
+                        tf = (_qs.get("refresh") or [""])[0] == "1"
+                        self._send(200, tracker_health(force=tf))
+                    except Exception as e:
+                        self._send(200, {"trackers": [], "summary": {},
+                                         "error": str(e)[:200]})
                 elif base == "/api/indexers/trend":
                     self._send(200, {"days": _idx_trend_load(), "path": IDX_TREND_PATH})
                 elif base == "/api/indexers/seed":
