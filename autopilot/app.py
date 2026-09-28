@@ -2676,9 +2676,18 @@ def _qb_set_language():
     raise RuntimeError("qB 界面语言设置超时（API 持续不可达）")
 
 
-def manual_import_list():
+_MI_CACHE = {"t": 0.0, "data": None}
+
+
+def manual_import_list(fresh=False):
     """合并 Radarr/Sonarr 的 manualImport，给「手动整理」页用。
-    返回未自动导入的下载项（已完成但 *arr 没匹配/没落库），前端可逐条触发导入。"""
+    返回未自动导入的下载项（已完成但 *arr 没匹配/没落库），前端可逐条触发导入。
+    ⚠️ *arr 的 manualImport 端点要扫整个下载目录逐文件解析质量，实测 7s+；
+       加 30s TTL 缓存（仪表盘轮询共用，避免重复重扫）；fresh=True 强制刷新。"""
+    now = time.monotonic()
+    if (not fresh and _MI_CACHE["data"] is not None
+            and now - _MI_CACHE["t"] < 30):
+        return _MI_CACHE["data"]
     folder = (QB_SAVE_PATH or "/data/downloads").strip() or "/data/downloads"
     out = []
     for svc, req in (("radarr", r_req), ("sonarr", s_req)):
@@ -2692,6 +2701,8 @@ def manual_import_list():
             it = dict(it)
             it["service"] = svc
             out.append(it)
+    _MI_CACHE["t"] = now
+    _MI_CACHE["data"] = out
     return out
 
 
@@ -4346,21 +4357,32 @@ function loadDashboard(){
   const df=document.getElementById("dashFail"); if(df)df.innerHTML='加载中…';
   const dm=document.getElementById("dashManual"); if(dm)dm.innerHTML='加载中…';
   ensureDashGrid();
+  /* 待整理(manualimport)独立懒渲染：*arr manualImport 要扫目录 7s+，
+     若放进 Promise.all 会拖死整个仪表盘首屏。主卡片不等它。 */
+  const sd={queue:null,okc:0,fail:0,mi:null};
+  function renderStats(){
+    if(!ds||sd.queue===null)return;
+    const stats=[["队列中",sd.queue.length,""],["入库成功",sd.okc,"ok"],["失败",sd.fail,sd.fail?"err":"ok"],["待整理",sd.mi===null?"…":sd.mi,sd.mi?"warn":""]];
+    ds.innerHTML=stats.map(r=>'<div class="stat-card"><div class="k">'+r[0]+'</div><div class="v '+r[2]+'">'+r[1]+'</div></div>').join("");
+  }
+  jget("/api/manualimport").then(md=>{
+    sd.mi=(md.items||[]).length;
+    renderStats();
+    if(dm)dm.innerHTML=sd.mi?('<span class="muted">'+sd.mi+' 项待整理 · </span><a onclick="switchTo(\'manual\')" style="cursor:pointer;color:var(--info)">去处理 →</a>'):'<span class="muted">无</span>';
+  }).catch(()=>{ if(dm)dm.innerHTML='<span class="muted">加载失败</span>'; });
   jget("/api/system").then(s=>{
-    Promise.all([jget("/api/queue?kind=all"),jget("/api/history?kind=all&limit=10"),jget("/api/manualimport")]).then(([qd,hd,md])=>{
-      const queue=qd.queue||[];
+    Promise.all([jget("/api/queue?kind=all"),jget("/api/history?kind=all&limit=10")]).then(([qd,hd])=>{
+      sd.queue=qd.queue||[];
       const hist=hd.history||[];
-      const fail=hist.filter(x=>x.status==="failed"||x.status==="error").length;
-      const okc=hist.filter(x=>x.status==="imported"||x.status==="grabbed").length;
-      const mi=(md.items||[]).length;
-      const stats=[["队列中",queue.length,""],["入库成功",okc,"ok"],["失败",fail,fail?"err":"ok"],["待整理",mi,mi?"warn":""]];
-      if(ds)ds.innerHTML=stats.map(r=>'<div class="stat-card"><div class="k">'+r[0]+'</div><div class="v '+r[2]+'">'+r[1]+'</div></div>').join("");
+      sd.fail=hist.filter(x=>x.status==="failed"||x.status==="error").length;
+      sd.okc=hist.filter(x=>x.status==="imported"||x.status==="grabbed").length;
+      renderStats();
+      const queue=sd.queue;
       if(dq)dq.innerHTML=queue.length?queue.slice(0,6).map(x=>'<div style="padding:3px 0">'+esc(x.name||"?")+' <span class="muted">· '+fmtSize(x.size||0)+'</span></div>').join(""):'<span class="muted">无活动下载</span>';
-      if(df)df.innerHTML=fail?hist.filter(x=>x.status==="failed"||x.status==="error").slice(0,6).map(x=>'<div style="padding:3px 0;color:var(--err)">'+esc(x.title||x.name||"?")+'</div>').join(""):'<span class="muted">无失败</span>';
-      if(dm)dm.innerHTML=mi?('<span class="muted">'+mi+' 项待整理 · </span><a onclick="switchTo(\'manual\')" style="cursor:pointer;color:var(--info)">去处理 →</a>'):'<span class="muted">无</span>';
-      updateBell(fail);
+      if(df)df.innerHTML=sd.fail?hist.filter(x=>x.status==="failed"||x.status==="error").slice(0,6).map(x=>'<div style="padding:3px 0;color:var(--err)">'+esc(x.title||x.name||"?")+'</div>').join(""):'<span class="muted">无失败</span>';
+      updateBell(sd.fail);
       const mv=queue.filter(x=>x.kind!=="tv").length, tvN=queue.length-mv;
-      const pie=[["队列·电影",mv,cssv('--accent')],["队列·剧集",tvN,cssv('--warn-strong')],["入库成功",okc,cssv('--ok-strong')],["失败",fail,cssv('--err')],["待整理",mi,cssv('--chart-pend')]];
+      const pie=[["队列·电影",mv,cssv('--accent')],["队列·剧集",tvN,cssv('--warn-strong')],["入库成功",sd.okc,cssv('--ok-strong')],["失败",sd.fail,cssv('--err')],["待整理",sd.mi||0,cssv('--chart-pend')]];
       ensureApex().then(ok=>{ if(ok){ renderDashPie(pie); renderDashDisk(s.disks||[]); } });
     }).catch(()=>{});
   }).catch(e=>{
@@ -4421,7 +4443,7 @@ let manualItems=[];
 function loadManual(){
   const box=document.getElementById("manualList");
   box.innerHTML='<div class="skeleton" style="height:56px;margin:8px 0"></div><div class="skeleton" style="height:56px;margin:8px 0"></div>';
-  jget("/api/manualimport").then(d=>{
+  jget("/api/manualimport?fresh=1").then(d=>{
     const items=d.items||[];
     if(d.error)document.getElementById("manualHint").textContent="⚠️ "+d.error;
     if(!items.length){ box.innerHTML='<div class="empty"><div class="big">🗂️</div>没有待整理的下载项<br><span class="muted">下载完成且已被 *arr 自动导入的不会出现在列表</span></div>'; return; }
@@ -5856,7 +5878,8 @@ class H(BaseHTTPRequestHandler):
                     self._send(200, {"ok": True, "rules": load_rules(), "path": RULES_PATH})
                 elif base == "/api/manualimport":
                     try:
-                        self._send(200, {"items": manual_import_list()})
+                        fresh = (self._q()[1].get("fresh") or [""])[0] == "1"
+                        self._send(200, {"items": manual_import_list(fresh=fresh)})
                     except Exception as e:
                         self._send(200, {"items": [], "error": str(e)[:200]})
                     return
