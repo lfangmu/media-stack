@@ -1523,15 +1523,32 @@ def recent_history(kind="all", limit=20, offset=0):
     return out[:limit]
 
 
-_HIST_S_CACHE = {"t": 0.0, "data": None}
+_HIST_RAW = {"t": 0.0, "data": None}
+
+
+def _pull_history_raw(page_size=1000):
+    """拉 Radarr+Sonarr 各 page_size 条 history 原始记录，缓存 5 分钟。
+    ⚠️ 入库趋势与抓取成功率共用这一份，别让两个端点各拉一次 1000 条。
+    返回 {"movie":[records], "tv":[records]}。"""
+    now = time.time()
+    if _HIST_RAW["data"] is not None and now - _HIST_RAW["t"] < 300:
+        return _HIST_RAW["data"]
+    raw = {}
+    for rq, label in ((r_req, "movie"), (s_req, "tv")):
+        try:
+            h = rq("GET", "/api/v3/history?pageSize=%d&sortDirection=descending"
+                   "&sortKey=date" % page_size) or {}
+            raw[label] = h.get("records") or []
+        except Exception:
+            raw[label] = []
+    _HIST_RAW["t"] = now
+    _HIST_RAW["data"] = raw
+    return raw
 
 
 def history_series(days=14):
-    """近 N 天「导入完成」趋势：拉 Radarr+Sonarr 各 1000 条 history 按自然日计数。
+    """近 N 天「导入完成」趋势：复用 _pull_history_raw（各 1000 条）按自然日计数。
     结果缓存 5 分钟（图表只看趋势，不必实时）。"""
-    now = time.time()
-    if _HIST_S_CACHE["data"] is not None and now - _HIST_S_CACHE["t"] < 300:
-        return _HIST_S_CACHE["data"]
     try:
         days = max(7, min(90, int(days)))
     except Exception:
@@ -1539,13 +1556,8 @@ def history_series(days=14):
     today = datetime.now().date()
     start = today - timedelta(days=days - 1)
     buckets = {}
-    for rq, label in ((r_req, "movie"), (s_req, "tv")):
-        try:
-            h = rq("GET", "/api/v3/history?pageSize=1000&sortDirection=descending"
-                   "&sortKey=date") or {}
-        except Exception:
-            h = {}
-        for it in (h or {}).get("records", []) or []:
+    for label in ("movie", "tv"):
+        for it in _pull_history_raw().get(label) or []:
             et = (it.get("eventType") or "")
             # ⚠️ *arr 事件类型是大写开头的 downloadFolderImported / episodeFileImported，
             #    直接 "imported" in et 大小写敏感 → 永远匹配不上，趋势图恒 0。必须 lower()。
@@ -1571,9 +1583,97 @@ def history_series(days=14):
            "tv": sum(x["tv"] for x in day_out),
            "from": start.strftime("%Y-%m-%d"),
            "to": today.strftime("%Y-%m-%d")}
-    _HIST_S_CACHE["t"] = now
-    _HIST_S_CACHE["data"] = out
     return out
+
+
+# ---------- 抓取成功率（历史反推「入库 / (入库+失败)」） ----------
+# ⚠️ *arr 事件类型一律 PascalCase：DownloadFailed / ImportFailed / MarkedAsFailed …
+#    匹配前必须 lower()，否则和之前 imported 那个坑一模一样，全量漏判。
+_FAIL_EVENTS = ("downloadfailed", "importfailed", "markenasfailed", "downloadfailedwarning")
+
+
+def _fail_message(it):
+    d = it.get("data") or {}
+    return (d.get("message") or d.get("reason") or d.get("sourceTitle") or "")
+
+
+_REASON_RULES = (
+    ("没找到源文件", ("could not find", "no files found", "file not found", "源文件")),
+    ("已存在/重复", ("already exists", "already imported", "duplicate", "已存在", "重复")),
+    ("下载失败", ("download failed", "timeout", "超时", "download failure")),
+    ("导入被拒", ("unable to import", "import failed", "failed to import", "无法导入")),
+    ("种子/源被删", ("removed", "deleted", "已删除")),
+)
+
+
+def _reason_of(msg):
+    m = (msg or "").strip()
+    low = m.lower()
+    for key, toks in _REASON_RULES:
+        for t in toks:
+            if t in low:
+                return key
+    return (m[:40] + ("…" if len(m) > 40 else "")) or "未知原因"
+
+
+def history_quality(days=30):
+    """近 N 天抓取质量：按事件类型反推成功率与失败原因 Top。
+    口径：成功率 = 入库成功 / (入库成功 + 失败)，失败含 DownloadFailed/ImportFailed/MarkedAsFailed。
+    """
+    try:
+        days = max(7, min(90, int(days)))
+    except Exception:
+        days = 30
+    today = datetime.now().date()
+    start = today - timedelta(days=days - 1)
+    buckets = {}
+    fails = []
+    reasons = {}
+    grabbed = 0
+    for label in ("movie", "tv"):
+        for it in _pull_history_raw().get(label) or []:
+            try:
+                d = datetime.strptime((it.get("date") or "")[:10], "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if d < start or d > today:
+                continue
+            et = (it.get("eventType") or "").lower()
+            b = buckets.setdefault(d, {"ok": 0, "fail": 0, "grabbed": 0})
+            if "imported" in et:
+                b["ok"] += 1
+            elif any(t in et for t in _FAIL_EVENTS):
+                b["fail"] += 1
+                rk = _reason_of(_fail_message(it))
+                reasons[rk] = reasons.get(rk, 0) + 1
+                if len(fails) < 40:
+                    fails.append({"kind": label, "event": it.get("eventType"),
+                                  "title": it.get("sourceTitle"),
+                                  "date": (it.get("date") or "")[:16].replace("T", " "),
+                                  "msg": _fail_message(it)[:120]})
+            elif et == "grabbed":
+                b["grabbed"] += 1
+                grabbed += 1
+    day_out = []
+    for i in range(days):
+        d = start + timedelta(days=i)
+        b = buckets.get(d, {"ok": 0, "fail": 0, "grabbed": 0})
+        tot = b["ok"] + b["fail"]
+        day_out.append({"date": d.strftime("%Y-%m-%d"), "ok": b["ok"], "fail": b["fail"],
+                        "grabbed": b["grabbed"],
+                        "rate": round(b["ok"] * 100.0 / tot, 1) if tot else None})
+    ok_all = sum(x["ok"] for x in day_out)
+    fail_all = sum(x["fail"] for x in day_out)
+    rate = round(ok_all * 100.0 / (ok_all + fail_all), 1) if (ok_all + fail_all) else None
+    reasons_out = sorted(({"k": k, "v": v} for k, v in reasons.items()),
+                         key=lambda x: x["v"], reverse=True)[:8]
+    fails.sort(key=lambda x: x["date"], reverse=True)
+    return {"days": day_out,
+            "summary": {"ok": ok_all, "fail": fail_all, "grabbed": grabbed, "rate": rate,
+                        "movie": sum(1 for x in fails if x["kind"] == "movie"),
+                        "tv": sum(1 for x in fails if x["kind"] == "tv"),
+                        "failEvents": fails[:20], "reasons": reasons_out},
+            "from": start.strftime("%Y-%m-%d"), "to": today.strftime("%Y-%m-%d")}
 
 
 # ---------- 抓取完成 webhook 通知（F8） ----------
@@ -4491,6 +4591,12 @@ PAGE = r"""<!doctype html>
           <div class="dw-body" id="dashTrend">加载中…</div>
         </div>
       </div>
+      <div class="grid-stack-item" gs-id="quality" gs-x="0" gs-y="18" gs-w="12" gs-h="7">
+        <div class="grid-stack-item-content dash-widget">
+          <div class="dw-head gs-handle"><span>🎯 抓取成功率</span><span id="qualBadge" class="tag">–</span><span class="dw-grip">⠿</span></div>
+          <div class="dw-body" id="dashQuality">加载中…</div>
+        </div>
+      </div>
       <div class="grid-stack-item" gs-id="manual" gs-x="0" gs-y="12" gs-w="12" gs-h="3">
         <div class="grid-stack-item-content dash-widget">
           <div class="dw-head gs-handle"><span>待手动整理</span><span class="dw-grip">⠿</span></div>
@@ -4619,7 +4725,7 @@ function ensureDashGrid(){
     if(!ok){el.classList.add("fallback");return;}
     el.classList.remove("fallback");
     _dashGrid=GridStack.init({column:12,cellHeight:64,margin:8,float:true,draggable:{handle:".gs-handle"},resizable:{handles:"se,sw"}},el);
-    _dashGrid.on("resizestop",()=>{try{if(_dashPie)_dashPie.render();if(_dashDisk)_dashDisk.render();if(_dashTrend)_dashTrend.render();}catch(e){}});
+    _dashGrid.on("resizestop",()=>{try{if(_dashPie)_dashPie.render();if(_dashDisk)_dashDisk.render();if(_dashTrend)_dashTrend.render();if(_dashQual)_dashQual.render();}catch(e){}});
     _dashGrid.on("change",()=>{try{localStorage.setItem("dashLayout",JSON.stringify(_dashGrid.save(false)));}catch(e){}});
     try{const saved=JSON.parse(localStorage.getItem("dashLayout")||"null");
       if(saved&&saved.length){saved.forEach(n=>{const it=el.querySelector('[gs-id="'+n.id+'"]');if(it)_dashGrid.update(it,{x:n.x,y:n.y,w:n.w,h:n.h});});}
@@ -4634,6 +4740,8 @@ function loadDashboard(){
   const dp=document.getElementById("dashPie"); if(dp)dp.innerHTML=sk;
   const dk=document.getElementById("dashDisk"); if(dk)dk.innerHTML=sk;
   const dtr=document.getElementById("dashTrend"); if(dtr)dtr.innerHTML=sk;
+  const dql=document.getElementById("dashQuality"); if(dql)dql.innerHTML=sk;
+  const qb=document.getElementById("qualBadge"); if(qb)qb.textContent="–";
   const dq=document.getElementById("dashQueue"); if(dq)dq.innerHTML='加载中…';
   const df=document.getElementById("dashFail"); if(df)df.innerHTML='加载中…';
   const dm=document.getElementById("dashManual"); if(dm)dm.innerHTML='加载中…';
@@ -4644,6 +4752,17 @@ function loadDashboard(){
     else ensureApex().then(()=>renderDashTrend(td));
   }).catch(()=>{
     if(dtr)dtr.innerHTML='<div class="errcard"><div class="t">趋势加载失败</div>'
+      +'<div><button class="btn ghost" onclick="loadDashboard()">重试</button></div></div>';
+  });
+  /* 抓取成功率同样独立懒加载：与入库趋势共用一次 history 拉取，别并进主链 */
+  jget("/api/stats/quality?days=30").then(qd=>{
+    const qbadge=document.getElementById("qualBadge");
+    if(qbadge&&qd&&qd.summary&&qd.summary.rate!=null)
+      qbadge.textContent=qd.summary.rate+"%";
+    if(window.ApexCharts)renderDashQuality(qd);
+    else ensureApex().then(()=>renderDashQuality(qd));
+  }).catch(()=>{
+    if(dql)dql.innerHTML='<div class="errcard"><div class="t">成功率加载失败</div>'
       +'<div><button class="btn ghost" onclick="loadDashboard()">重试</button></div></div>';
   });
   /* 待整理(manualimport)独立懒渲染：*arr manualImport 要扫目录 7s+，
@@ -4754,6 +4873,47 @@ function renderDashTrend(data){
     tooltip:{shared:true,intersect:false}
   });
   _dashTrend.render();
+}
+let _dashQual=null;
+function renderDashQuality(data){
+  const box=document.getElementById("dashQuality"); if(!box)return;
+  const days=(data&&data.days)?data.days:[];
+  const sm=(data&&data.summary)||{};
+  if(!days.length){
+    box.innerHTML='<div class="muted">'+(data&&data.error?('⚠️ '+data.error):'这段时间内暂无抓取记录')+'</div>';
+    return;
+  }
+  const r=sm.rate;
+  const reasons=sm.reasons||[], evs=sm.failEvents||[];
+  const rh=reasons.length?('<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">'
+    +reasons.map(x=>'<span class="tag" title="'+esc(String(x.v))+' 次">'+esc(x.k)+' ×'+esc(String(x.v))+'</span>').join("")+'</div>'):'';
+  const eh=evs.length?('<div style="margin-top:6px">'+evs.slice(0,5).map(x=>
+      '<div style="padding:3px 0;color:var(--err)">'+esc(x.title||"(无标题)")
+      +' <span class="muted">· '+esc(x.event||"")+' · '+esc(x.msg||"")+'</div>').join("")+'</div>'):'';
+  if(!window.ApexCharts){ box.innerHTML='<div class="muted">图表库未加载</div>'; return; }
+  if(_dashQual&&_dashQual.destroy)_dashQual.destroy();
+  box.innerHTML='<div id="qualCanvas"></div><div class="muted" style="margin-top:6px;font-size:12px">'
+    +esc(data.from||"")+' ~ '+esc(data.to||"")+' · 入库 '+esc(String(sm.ok||0))
+    +' · 失败 '+esc(String(sm.fail||0))+' · 抓取 '+esc(String(sm.grabbed||0))+'</div>'+rh+eh;
+  _dashQual=new ApexCharts(document.querySelector("#qualCanvas"),{
+    chart:{type:"line",height:220,background:"transparent",toolbar:{show:false},stacked:false,animations:{enabled:false}},
+    theme:{mode:"dark"},
+    plotOptions:{bar:{borderRadius:3,columnWidth:"62%"}},
+    stroke:{width:[0,0,3],curve:"smooth"},
+    markers:{size:[0,0,4],strokeWidth:0},
+    colors:[cssv('--ok-strong'),cssv('--err'),cssv('--accent')],
+    series:[{name:"✅ 入库",type:"column",data:days.map(x=>x.ok||0)},
+            {name:"❌ 失败",type:"column",data:days.map(x=>x.fail||0)},
+            {name:"成功率",type:"line",data:days.map(x=>x.rate==null?null:x.rate)}],
+    xaxis:{categories:days.map(x=>(x.date||"").slice(5)),labels:{style:{colors:cssv('--chart-label')}}},
+    yaxis:[{labels:{style:{colors:cssv('--chart-label')}}},
+           {opposite:true,min:0,max:100,tickAmount:4,labels:{style:{colors:cssv('--chart-label')},formatter:v=>v+"%"}}],
+    noData:{text:"这段时间内没有抓取记录",style:{color:cssv('--text-3')}},
+    legend:{position:"top",labels:{colors:cssv('--chart-label')}},
+    dataLabels:{enabled:false},
+    tooltip:{shared:true,intersect:false}
+  });
+  _dashQual.render();
 }
 
 // ===== 手动整理（/api/manualimport） =====
@@ -6339,6 +6499,12 @@ class H(BaseHTTPRequestHandler):
                     try:
                         sd = (_qs.get("days") or ["14"])[0]
                         self._send(200, history_series(int(sd or 14)))
+                    except Exception as e:
+                        self._send(200, {"days": [], "error": str(e)[:200]})
+                elif base.startswith("/api/stats/quality"):
+                    try:
+                        qd = (_qs.get("days") or ["30"])[0]
+                        self._send(200, history_quality(int(qd or 30)))
                     except Exception as e:
                         self._send(200, {"days": [], "error": str(e)[:200]})
                 elif base.startswith("/api/seedreport"):
